@@ -1,0 +1,15 @@
+// Root build file for system-design-interview
+// Each project (01-url-shortener, etc.) has its own build.gradle
+
+subprojects {
+    apply plugin: 'java'
+
+    java {
+        sourceCompatibility = JavaVersion.VERSION_21
+        targetCompatibility = JavaVersion.VERSION_21
+    }
+
+    repositories {
+        mavenCentral()
+    }
+}

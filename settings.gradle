@@ -1,0 +1,8 @@
+rootProject.name = 'system-design-interview'
+
+include '01-url-shortener'
+include '02-rate-limiter'
+include '03-notification-system'
+include '04-chat-system'
+include '05-social-media-feed'
+include '06-parking-lot'
