@@ -9,8 +9,8 @@
 | Category | Patterns | Purpose |
 |----------|----------|---------|
 | **Creational** | Builder, Factory, Singleton | How objects get **created** |
-| **Structural** | Repository (Enterprise/DDD), Composite | How objects are **composed** and connected |
-| **Behavioral** | Strategy, Observer, Template Method, Chain of Responsibility, Mediator, Command | How objects **communicate** and share responsibilities |
+| **Structural** | Repository (Enterprise/DDD), Composite, Facade, Proxy, Decorator, Flyweight | How objects are **composed** and connected |
+| **Behavioral** | Strategy, Observer, Template Method, Chain of Responsibility, Mediator, Command, State, Memento | How objects **communicate** and share responsibilities |
 | **Concurrency** | Producer-Consumer | How objects **coordinate** across threads |
 
 ```
@@ -24,11 +24,13 @@
      │ • Builder  │ │ •Repository│ │ • Strategy   │      │ • Producer- │
      │ • Factory  │ │  (DDD)     │ │ • Observer   │      │   Consumer  │
      │ • Singleton│ │ •Composite │ │ • Template   │      │             │
-     │            │ │            │ │   Method     │      │             │
-     │            │ │            │ │ • Chain of   │      │             │
-     │            │ │            │ │   Respons.   │      │             │
-     │            │ │            │ │ • Mediator   │      │             │
+     │            │ │ •Facade    │ │   Method     │      │             │
+     │            │ │ •Proxy     │ │ • Chain of   │      │             │
+     │            │ │ •Decorator │ │   Respons.   │      │             │
+     │            │ │ •Flyweight │ │ • Mediator   │      │             │
      │            │ │            │ │ • Command    │      │             │
+     │            │ │            │ │ • State      │      │             │
+     │            │ │            │ │ • Memento    │      │             │
      └────────────┘ └────────────┘ └──────────────┘      └─────────────┘
 ```
 
@@ -552,6 +554,359 @@ Decision logic:
   (3b) CELEBRITY → delegate to FanoutOnReadStrategy
   (4b) Read strategy does nothing — followers will pull at read time
 ```
+
+---
+
+## 13. Facade Pattern
+
+> "Provide a unified interface to a set of interfaces in a subsystem."
+
+**Category**: Structural | **Used in**: Parking Lot
+
+### Generic UML
+
+```
+┌──────────────────┐
+│     Client        │        ┌──────────────────────────┐
+│ (Controller)      │        │       Facade              │
+│──────────────────│        │   (Service class)         │
+│ + handleRequest() │───────▶│──────────────────────────│
+│   → facade        │        │ - subsystemA: InterfaceA  │
+│     .doWork()     │        │ - subsystemB: InterfaceB  │
+└──────────────────┘        │ - subsystemC: InterfaceC  │
+                             │──────────────────────────│
+       Client calls          │ + doWork()                │
+       ONE method            │   (1) subsystemA.step()   │
+                             │   (2) subsystemB.step()   │
+                             │   (3) subsystemC.step()   │
+                             │   → orchestrates all      │
+                             └──────────────────────────┘
+                                      │ │ │
+                          ┌───────────┘ │ └───────────┐
+                          ▼             ▼             ▼
+                   ┌────────────┐ ┌──────────┐ ┌──────────┐
+                   │ SubsystemA │ │SubsystemB│ │SubsystemC│
+                   └────────────┘ └──────────┘ └──────────┘
+
+Key insight: The Facade does NOT add new functionality.
+It just simplifies the interface by orchestrating existing subsystems.
+```
+
+### Parking Lot — ParkingService as Facade
+
+```
+┌──────────────────────┐
+│   ParkingController   │        ┌───────────────────────────────────┐
+│──────────────────────│        │        ParkingService (FACADE)     │
+│ - parkingService     │───────▶│───────────────────────────────────│
+│──────────────────────│        │ - parkingStrategy: ParkingStrategy │
+│ + handlePark()       │        │ - pricingStrategy: PricingStrategy │
+│   → parkingService   │        │ - paymentProcessor: PaymentProc.   │
+│     .parkVehicle()   │        │ - ticketRepository: TicketRepo     │
+│ + handleUnpark()     │        │ - displayBoard: DisplayBoard       │
+│   → parkingService   │        │───────────────────────────────────│
+│     .unparkVehicle() │        │ + parkVehicle(vehicle)             │
+└──────────────────────┘        │ + unparkVehicle(ticketId, method)  │
+                                └────────┬──────────────────────────┘
+                                         │
+                    ┌────────┬───────────┼───────────┬────────────┐
+                    ▼        ▼           ▼           ▼            ▼
+             ┌──────────┐┌──────────┐┌──────────┐┌──────────┐┌──────────┐
+             │ Parking  ││ Pricing  ││ Payment  ││  Ticket  ││ Display  │
+             │ Strategy ││ Strategy ││Processor ││   Repo   ││  Board   │
+             └──────────┘└──────────┘└──────────┘└──────────┘└──────────┘
+```
+
+### Numbered Sequence — Park Vehicle Flow
+
+```
+ParkingController        ParkingService(FACADE)      ParkingStrategy    TicketRepo    DisplayBoard
+      │                         │                         │                │              │
+      │ (1) handlePark(vehicle) │                         │                │              │
+      │────────────────────────▶│                         │                │              │
+      │                         │ (2) findSpot(vehicle)   │                │              │
+      │                         │────────────────────────▶│                │              │
+      │                         │ (3) return spot         │                │              │
+      │                         │◀────────────────────────│                │              │
+      │                         │                         │                │              │
+      │                         │ (4) spot.occupy(vehicle)│                │              │
+      │                         │   [State: AVAILABLE → OCCUPIED]         │              │
+      │                         │                         │                │              │
+      │                         │ (5) ParkingTicket.builder()             │              │
+      │                         │     .vehicle(v).spot(s).build()         │              │
+      │                         │                         │                │              │
+      │                         │ (6) ticketRepo.save(ticket)             │              │
+      │                         │────────────────────────────────────────▶│              │
+      │                         │                         │                │              │
+      │                         │ (7) displayBoard.update()│               │              │
+      │                         │───────────────────────────────────────────────────────▶│
+      │                         │                         │                │              │
+      │ (8) return ticket       │                         │                │              │
+      │◀────────────────────────│                         │                │              │
+
+Steps:
+  (1) Controller calls ONE method on the Facade
+  (2-3) Facade uses ParkingStrategy to find a spot
+  (4) Facade transitions spot state (State Pattern)
+  (5) Facade builds ticket (Builder Pattern)
+  (6) Facade persists ticket (Repository Pattern)
+  (7) Facade updates display board
+  (8) Controller gets back a ticket — knows nothing about the 5 subsystems
+```
+
+---
+
+## 15. Proxy Pattern
+
+> "Provide a surrogate or placeholder for another object to control access to it."
+
+**Category**: Structural | **Used in**: Distributed Cache
+
+### Generic UML
+
+```
+┌─────────────────────┐
+│      Client          │        ┌──────────────────────┐
+│─────────────────────│        │   <<interface>>       │
+│ - subject: Subject   │        │     Subject           │
+│─────────────────────│───────▶│──────────────────────│
+│ + doWork()           │        │ + request(): Result   │
+│   → subject.request()│       └──────────┬───────────┘
+└─────────────────────┘                   │
+                                ┌─────────┴──────────┐
+                                │                    │
+                          ┌─────▼──────┐    ┌────────▼───────────┐
+                          │ RealSubject│    │      Proxy          │
+                          │────────────│    │─────────────────────│
+                          │+request()  │    │ - realSubject:      │
+                          │ → do work  │    │   Subject (or many) │
+                          └────────────┘    │─────────────────────│
+                                            │ + request()          │
+                                            │   → intercept/route  │
+                                            │   → realSubject      │
+                                            │     .request()       │
+                                            └─────────────────────┘
+
+Key insight: Proxy implements the SAME interface as the real object.
+The client cannot tell if it is talking to the real object or a proxy.
+```
+
+### Distributed Cache — NodeAwareCacheStore as Proxy
+
+```
+┌──────────────────────┐
+│   CacheController     │        ┌───────────────────────────────────┐
+│──────────────────────│        │         <<interface>>               │
+│ - cacheService       │        │          CacheStore                │
+│──────────────────────│        │───────────────────────────────────│
+│ + handleGet(key)     │        │ + get(key): Optional<CacheEntry>   │
+│ + handlePut(key,val) │        │ + put(key, entry): void            │
+│                      │        │ + remove(key): void                │
+└──────────────────────┘        └──────────────┬────────────────────┘
+                                               │
+                                    ┌──────────┴──────────┐
+                                    │                     │
+                       ┌────────────▼──────────┐  ┌───────▼──────────────────┐
+                       │  InMemoryCacheStore   │  │  NodeAwareCacheStore     │
+                       │  (RealSubject)        │  │  (THE PROXY)             │
+                       │───────────────────────│  │──────────────────────────│
+                       │ - store:              │  │ - hashingStrategy:       │
+                       │   ConcurrentHashMap   │  │   HashingStrategy        │
+                       │───────────────────────│  │ - nodeStores:            │
+                       │ + get(key)            │  │   Map<String, CacheStore>│
+                       │ + put(key, entry)     │  │──────────────────────────│
+                       │ + remove(key)         │  │ + get(key)               │
+                       └───────────────────────┘  │   → hash key             │
+                              ▲                   │   → find node            │
+                              │                   │   → delegate to node's   │
+                              │  contained        │     InMemoryCacheStore   │
+                              │  inside           │ + put(key, entry)        │
+                              └───────────────────│ + remove(key)            │
+                                                  └──────────────────────────┘
+
+NodeAwareCacheStore implements CacheStore (same interface as InMemoryCacheStore)
+AND contains a Map of node → InMemoryCacheStore.
+It IS-A CacheStore. It HAS many CacheStores (one per node).
+```
+
+### Numbered Sequence — Proxy Routes get() to Correct Node
+
+```
+CacheController        CacheService          NodeAwareCacheStore(PROXY)    HashingStrategy    InMemoryCacheStore
+      │                      │                        │                        │               (node-2)
+      │ (1) get("user:42")   │                        │                        │                  │
+      │─────────────────────▶│                        │                        │                  │
+      │                      │ (2) store.get("user:42")                        │                  │
+      │                      │───────────────────────▶│                        │                  │
+      │                      │                        │ (3) hash("user:42")    │                  │
+      │                      │                        │───────────────────────▶│                  │
+      │                      │                        │ (4) return hashValue   │                  │
+      │                      │                        │◀───────────────────────│                  │
+      │                      │                        │                        │                  │
+      │                      │                        │ (5) look up node on                       │
+      │                      │                        │     consistent hash ring                  │
+      │                      │                        │     → "node-2"                            │
+      │                      │                        │                        │                  │
+      │                      │                        │ (6) nodeStores.get("node-2").get("user:42")
+      │                      │                        │─────────────────────────────────────────▶│
+      │                      │                        │                        │                  │
+      │                      │                        │ (7) return Optional<CacheEntry>           │
+      │                      │                        │◀─────────────────────────────────────────│
+      │                      │                        │                        │                  │
+      │                      │ (8) return result      │                        │                  │
+      │                      │◀───────────────────────│                        │                  │
+      │ (9) return to caller │                        │                        │                  │
+      │◀─────────────────────│                        │                        │                  │
+
+Steps:
+  (1) Client calls get("user:42") — does not know about nodes or hashing
+  (2) CacheService delegates to its CacheStore (which is actually the Proxy)
+  (3) Proxy hashes the key using the injected HashingStrategy
+  (4) Hash value returned
+  (5) Proxy looks up which node owns this hash on the consistent hash ring
+  (6) Proxy delegates to that specific node's InMemoryCacheStore
+  (7) Node's store returns the cached entry (or empty)
+  (8-9) Result flows back — caller never knew multiple nodes existed
+```
+
+### When to Use / When NOT to Use
+
+**Use when:**
+- You need to add a layer of indirection (routing, caching, access control, lazy loading) without changing the real object
+- The client should not know about the complexity behind the interface (e.g., distributed nodes, remote calls)
+- You want to intercept calls transparently (logging, metrics, security checks)
+
+**Do NOT use when:**
+- There is no additional behavior to add — direct access is simpler
+- The indirection layer would add latency with no benefit
+- A simple wrapper or decorator is sufficient (Proxy specifically controls *access*, not just adds behavior)
+
+### Interview One-Liner
+
+> "NodeAwareCacheStore is a Proxy — it implements CacheStore like the real store, but transparently hashes the key, finds the correct node on the consistent hash ring, and delegates to that node's store. The caller never knows it is talking to a distributed system."
+
+---
+
+## 16. Decorator Pattern
+
+> "Attach additional responsibilities to an object dynamically. Decorators provide a flexible alternative to subclassing for extending functionality."
+
+**Category**: Structural | **Used in**: Ride-Sharing
+
+### Generic UML
+
+```
+┌─────────────────────┐
+│      Client          │        ┌──────────────────────┐
+│─────────────────────│        │   <<interface>>       │
+│ - component:        │        │     Component         │
+│   Component         │───────▶│──────────────────────│
+│─────────────────────│        │ + operation(): Result  │
+│ + doWork()          │        └──────────┬───────────┘
+│   → component       │                   │
+│     .operation()    │        ┌──────────┼───────────┐
+└─────────────────────┘        │                      │
+                         ┌─────▼──────────┐  ┌────────▼──────────────┐
+                         │ Concrete       │  │     Decorator          │
+                         │ Component      │  │────────────────────────│
+                         │────────────────│  │ - wrapped: Component   │
+                         │ + operation()  │  │────────────────────────│
+                         │   → base logic │  │ + operation()           │
+                         └────────────────┘  │   → wrapped.operation() │
+                                             │   → add extra behavior  │
+                                             └────────────────────────┘
+
+Key insight: Decorator implements the SAME interface as the component it wraps.
+It delegates to the wrapped object AND adds behavior before/after.
+Unlike Proxy (which controls access), Decorator enhances functionality.
+```
+
+### Ride-Sharing — SurgePricingStrategy as Decorator
+
+```
+┌──────────────────────┐
+│     RideService       │        ┌───────────────────────────────┐
+│──────────────────────│        │       <<interface>>             │
+│ - pricingStrategy:   │        │      PricingStrategy           │
+│   PricingStrategy    │───────▶│───────────────────────────────│
+│──────────────────────│        │ + calculateFare(ride): double  │
+│ + completeRide()     │        └────────────┬──────────────────┘
+│   → pricingStrategy  │                     │
+│     .calculateFare() │          ┌──────────┴───────────┐
+└──────────────────────┘          │                      │
+                         ┌────────▼──────────┐  ┌────────▼───────────────────┐
+                         │ Standard          │  │ SurgePricingStrategy       │
+                         │ PricingStrategy   │  │ (THE DECORATOR)            │
+                         │──────────────────│  │────────────────────────────│
+                         │ + calculateFare() │  │ - wrapped: PricingStrategy │
+                         │   → baseFare      │  │ - surgeMultiplier: double  │
+                         │   + distanceFare  │  │────────────────────────────│
+                         │   + timeFare      │  │ + calculateFare(ride)      │
+                         │   = total         │  │   → fare = wrapped         │
+                         └──────────────────┘  │       .calculateFare(ride)  │
+                                ▲               │   → return fare *          │
+                                │  wrapped      │       surgeMultiplier      │
+                                │  inside       └────────────────────────────┘
+                                └───────────────────────┘
+
+SurgePricingStrategy implements PricingStrategy (same interface as Standard)
+AND wraps a PricingStrategy. It IS-A PricingStrategy. It HAS-A PricingStrategy.
+The wrapped strategy does the real work; the Decorator multiplies the result.
+```
+
+### Numbered Sequence — Surge Pricing Flow
+
+```
+RideService              SurgePricingStrategy(DECORATOR)    StandardPricingStrategy
+      │                         │                                │
+      │ (1) completeRide()      │                                │
+      │   pricingStrategy       │                                │
+      │     .calculateFare(ride)│                                │
+      │────────────────────────▶│                                │
+      │                         │                                │
+      │                         │ (2) wrapped.calculateFare(ride)│
+      │                         │───────────────────────────────▶│
+      │                         │                                │
+      │                         │                                │ (3) compute:
+      │                         │                                │   baseFare
+      │                         │                                │   + distance * rate
+      │                         │                                │   + time * rate
+      │                         │                                │   = $15.00
+      │                         │                                │
+      │                         │ (4) return $15.00              │
+      │                         │◀───────────────────────────────│
+      │                         │                                │
+      │                         │ (5) $15.00 * surgeMultiplier   │
+      │                         │     $15.00 * 1.5 = $22.50     │
+      │                         │                                │
+      │ (6) return $22.50       │                                │
+      │◀────────────────────────│                                │
+
+Steps:
+  (1) RideService calls pricingStrategy.calculateFare() — does not know it is a Decorator
+  (2) SurgePricingStrategy delegates to the wrapped StandardPricingStrategy
+  (3) StandardPricingStrategy computes base + distance + time = $15.00
+  (4) Returns the base fare to the Decorator
+  (5) SurgePricingStrategy multiplies the result by the surgeMultiplier (1.5x)
+  (6) Returns the surged fare ($22.50) — the original pricing logic was never modified
+```
+
+### When to Use / When NOT to Use
+
+**Use when:**
+- You need to add behavior to an individual object without affecting other instances of the same class
+- The enhancement should be transparent — callers use the same interface
+- You want to combine enhancements by stacking decorators (e.g., SurgePricing wrapping DiscountPricing wrapping Standard)
+- Subclassing would cause a combinatorial explosion of classes (SurgeStandard, SurgePremium, DiscountStandard, ...)
+
+**Do NOT use when:**
+- The component interface has too many methods — you have to delegate every single one
+- You only need one fixed enhancement — a simple subclass is clearer
+- The decorator needs to fundamentally change the wrapped object's behavior (that is Proxy or Strategy territory)
+
+### Interview One-Liner
+
+> "SurgePricingStrategy is a Decorator — wraps StandardPricingStrategy and multiplies the fare by the surge multiplier, without modifying the original pricing logic."
 
 ---
 
@@ -1101,6 +1456,112 @@ Decision at each step:
 
 ---
 
+## 14. State Pattern
+
+> "Allow an object to alter its behavior when its internal state changes."
+
+**Category**: Behavioral | **Used in**: Parking Lot
+
+### Generic UML
+
+```
+┌─────────────────────────┐
+│        Context           │        ┌──────────────────────┐
+│─────────────────────────│        │      <<enum>>         │
+│ - state: State           │───────▶│       State           │
+│─────────────────────────│        │──────────────────────│
+│ + request()              │        │  STATE_A              │
+│   → guard: is current    │        │  STATE_B              │
+│     state valid for      │        │  STATE_C              │
+│     this transition?     │        └──────────────────────┘
+│   → transition to        │
+│     next state           │
+└─────────────────────────┘
+
+State machine:
+  STATE_A ──(action1)──→ STATE_B
+  STATE_B ──(action2)──→ STATE_A
+  STATE_A ──(action3)──→ STATE_C
+  STATE_C ──(action4)──→ STATE_A
+
+Each transition is GUARDED — invalid transitions throw exceptions.
+```
+
+### Parking Lot — ParkingSpot State Machine
+
+```
+┌────────────────────────────────────────────────────────────────────┐
+│                     ParkingSpot State Machine                      │
+│                                                                    │
+│            occupy(vehicle)                  markOutOfOrder()       │
+│         ┌──────────────────┐            ┌────────────────────┐    │
+│         │                  │            │                    │    │
+│         ▼                  │            ▼                    │    │
+│  ┌─────────────┐    ┌─────┴──────┐    ┌──────────────────┐  │    │
+│  │  OCCUPIED   │    │ AVAILABLE  │    │  OUT_OF_ORDER    │  │    │
+│  │             │    │  (initial) │    │                  │  │    │
+│  └─────┬───────┘    └─────▲──────┘    └────────┬─────────┘  │    │
+│        │                  │                    │            │    │
+│        └──────────────────┘                    └────────────┘    │
+│            vacate()                           repair()           │
+│                                                                    │
+│  Valid transitions:                                                │
+│    AVAILABLE ──(occupy)──────────→ OCCUPIED                        │
+│    OCCUPIED  ──(vacate)──────────→ AVAILABLE                       │
+│    AVAILABLE ──(markOutOfOrder)──→ OUT_OF_ORDER                    │
+│    OUT_OF_ORDER ──(repair)───────→ AVAILABLE                       │
+│                                                                    │
+│  Invalid transitions (throw IllegalStateException):                │
+│    OCCUPIED  ──(occupy)──────────→ ERROR (already occupied!)       │
+│    AVAILABLE ──(vacate)──────────→ ERROR (not occupied!)           │
+│    OCCUPIED  ──(markOutOfOrder)──→ ERROR (must vacate first!)      │
+│    OUT_OF_ORDER ──(occupy)───────→ ERROR (needs repair!)           │
+└────────────────────────────────────────────────────────────────────┘
+```
+
+### Numbered Sequence — Park and Unpark Lifecycle
+
+```
+ParkingService            ParkingSpot                  SpotStatus
+      │                       │                           │
+      │ (1) parkVehicle()     │                           │
+      │                       │ status = AVAILABLE        │
+      │                       │                           │
+      │ (2) spot.occupy(car)  │                           │
+      │──────────────────────▶│                           │
+      │                       │ (3) guard: status ==      │
+      │                       │     AVAILABLE? ✓          │
+      │                       │                           │
+      │                       │ (4) status = OCCUPIED     │
+      │                       │────────────────────────▶ OCCUPIED
+      │                       │ (5) vehicle = car         │
+      │                       │                           │
+      :     [time passes]     :                           :
+      │                       │                           │
+      │ (6) unparkVehicle()   │                           │
+      │                       │                           │
+      │ (7) spot.vacate()     │                           │
+      │──────────────────────▶│                           │
+      │                       │ (8) guard: status ==      │
+      │                       │     OCCUPIED? ✓           │
+      │                       │                           │
+      │                       │ (9) vehicle = null        │
+      │                       │ (10) status = AVAILABLE   │
+      │                       │────────────────────────▶ AVAILABLE
+      │                       │                           │
+
+Steps:
+  (1) ParkingService (Facade) orchestrates the park operation
+  (2) Calls occupy() on the spot
+  (3) Guard check: only AVAILABLE spots can be occupied
+  (4-5) State transitions to OCCUPIED, vehicle is stored
+  (6-7) Later, unpark triggers vacate()
+  (8) Guard check: only OCCUPIED spots can be vacated
+  (9-10) Vehicle removed, state returns to AVAILABLE
+```
+
+---
+
 # CONCURRENCY PATTERNS
 
 > *How objects coordinate across threads — managing shared resources safely.*
@@ -1253,20 +1714,26 @@ A notification request arrives. All patterns cooperate:
 
 ### By GoF Category
 
-| Category | Pattern | URL Shortener (01) | Rate Limiter (02) | Notification (03) | Chat System (04) | Social Media Feed (05) |
-|----------|---------|-------------------|-------------------|-------------------|-------------------|------------------------|
-| **Creational** | Builder | `Url.Builder` (8 fields) | `RateLimitRule.Builder` (7 fields) | `Notification.Builder` (15 fields) | `Message.Builder` (12 fields) | `Tweet.Builder` |
-| **Creational** | Factory | `AppConfig` | `AppConfig` | `AppConfig` (complex) | `AppConfig` (complex) | `AppConfig` |
-| **Creational** | Singleton | `AtomicLong` counter | — | — | — | — |
-| **Structural** | Repository | `UrlRepository` (1) | `RuleRepository` (1) | 3 repositories | 3 repositories | 5 repositories |
-| **Structural** | Composite | — | — | — | — | `HybridFanoutStrategy` (Write + Read) |
-| **Behavioral** | Strategy | `EncodingStrategy` (3) | `RateLimiterStrategy` (5) | `NotificationHandler` (4) | `MessageRouter` (online/offline) | `FanoutStrategy` (3 impl) + `FeedRanker` (2 impl) |
-| **Behavioral** | Observer | — | — | `DeliveryTracker` | Presence + delivery + read receipts | tweet.published → fan-out + trending (conceptual) |
-| **Behavioral** | Template Method | — | — | Notification flow | — | — |
-| **Behavioral** | Chain of Resp. | — | Middleware pipeline | — | — | — |
-| **Behavioral** | Mediator | — | — | — | **ChatService orchestrator** | `FeedService` orchestrates cache + pull + merge + rank |
-| **Behavioral** | Command | — | — | — | **Message as command object** | — |
-| **Concurrency** | Producer-Consumer | — | — | `PriorityQueue` | — (Kafka conceptual) | — |
+| Category | Pattern | URL Shortener (01) | Rate Limiter (02) | Notification (03) | Chat System (04) | Social Media Feed (05) | Parking Lot (06) | Distributed Cache (07) | Ride-Sharing (08) | Search Autocomplete (09) | E-Commerce (10) | Payment System (11) | News Feed (12) | Video Streaming (13) | Real-time Collaboration (14) | File Storage (15) | Stock Trading (16) |
+|----------|---------|-------------------|-------------------|-------------------|-------------------|------------------------|------------------|------------------------|-------------------|--------------------------|-----------------|---------------------|----------------|----------------------|-------------------------------|-------------------|---------------------|
+| **Creational** | Builder | `Url.Builder` (8 fields) | `RateLimitRule.Builder` (7 fields) | `Notification.Builder` (15 fields) | `Message.Builder` (12 fields) | `Tweet.Builder` | `ParkingTicket.Builder` | `CacheEntry.Builder` + `CacheConfig.Builder` | `Ride.Builder` (12+ fields) | `SearchQuery.Builder` + `AutocompleteConfig.Builder` | `Order.Builder` + `Cart.Builder` + `Payment.Builder` + `SagaResult.Builder` -- FOUR builders | `Payment.Builder` + `Refund.Builder` | `Post.Builder` | `Video.Builder` | `Document.Builder` | `FileMetadata.Builder` | `Order.Builder` |
+| **Creational** | Factory | `AppConfig` | `AppConfig` | `AppConfig` (complex) | `AppConfig` (complex) | `AppConfig` | `AppConfig` + `ParkingController.createVehicle()` | `AppConfig.createCacheService()` + `createDistributedCacheService()` | `AppConfig` | `AppConfig` | `AppConfig` | `AppConfig` | `AppConfig` | `AppConfig` | `AppConfig` | `AppConfig` | `AppConfig` |
+| **Creational** | Singleton | `AtomicLong` counter | — | — | — | — | `ParkingLot` (double-checked locking) | `CacheConfig` (conceptual — single config per cache) | Conceptual | `AutocompleteConfig` (conceptual) | Conceptual | `CurrencyService` (conceptual) | — | — | — | — | `MatchingEngine` per symbol (conceptual) |
+| **Structural** | Repository | `UrlRepository` (1) | `RuleRepository` (1) | 3 repositories | 3 repositories | 5 repositories | `TicketRepository` | `CacheRepository` → `InMemoryCacheRepository` | 3 repositories (Ride, Driver, Rider) | `QueryRepository` → `InMemoryQueryRepository` | 5 repositories (Product, Order, Inventory, Cart, Payment) | 6 repositories (Payment, Ledger, Merchant, Account, Idempotency, Webhook) -- most of any project! | 4 repositories (Post, User, Follow, Engagement) | 3 repositories (Video, User, WatchHistory) | 3 repositories (Document, Operation, Version) | 4 repositories (File, Folder, Version, User) | 6 repositories (Order, Trade, Position, Account, Stock, MarketData) |
+| **Structural** | Composite | — | — | — | — | `HybridFanoutStrategy` (Write + Read) | — | — | — | — | — | — | `HybridFanoutStrategy` composes Write + Read strategies | — | — | `Folder` hierarchy — folders contain files AND subfolders | — |
+| **Structural** | Facade | — | — | — | — | — | `ParkingService` wraps 5 subsystems | `CacheService` wraps store + eviction + stats + hashing | `RideService` orchestrates matching + pricing + payment + notification | `AutocompleteService` orchestrates trie + ranking + cache + filter | `OrderService` orchestrates cart → saga → payment → shipping → notification | `PaymentService` orchestrates idempotency → fraud → processing → ledger → webhook | `FeedService` orchestrates timeline + pull + merge + rank + paginate | `VideoService` orchestrates upload → transcode → store → stream | `CollaborationService` orchestrates sync + broadcast + persist + presence | `FileStorageService` orchestrates upload → chunk → dedup → store → metadata → version → sync | `TradingService` orchestrates order → risk → match → settle → notify |
+| **Structural** | Proxy | — | — | — | — | — | — | `NodeAwareCacheStore` routes to correct node via consistent hashing | — | — | — | — | — | — | — | — | — |
+| **Structural** | Decorator | — | — | — | — | — | — | — | `SurgePricingStrategy` wraps `StandardPricingStrategy` | `PersonalizedRankingStrategy` wraps base `RankingStrategy` | `DiscountPricingStrategy` wraps `StandardPricingStrategy` | — | — | — | — | — | — |
+| **Behavioral** | Strategy | `EncodingStrategy` (3) | `RateLimiterStrategy` (5) | `NotificationHandler` (4) | `MessageRouter` (online/offline) | `FanoutStrategy` (3 impl) + `FeedRanker` (2 impl) | `ParkingStrategy` (2) + `PricingStrategy` (2) + `PaymentProcessor` (2) — THREE interfaces! | `EvictionStrategy` (3 impl: LRU, LFU, TTL) + `HashingStrategy` (2 impl: ConsistentHash, Mod) — TWO interfaces! | `MatchingStrategy` (Nearest, ETA) + `PricingStrategy` (Standard, Surge) — TWO interfaces! | `RankingStrategy` (3 impl) + `FilterStrategy` (Profanity) + `Trie` interface (Standard, Compressed, TopK) — THREE interfaces! | `PricingStrategy` (Standard, Discount) + `PaymentStrategy` (CreditCard, Wallet, COD) + `ShippingStrategy` (Standard, Express) — THREE interfaces! | `PaymentProcessor` (CreditCard, UPI, Wallet) + `FraudCheckStrategy` (RuleBased, ML) — TWO interfaces! | `FanoutStrategy` (Write, Read, Hybrid) + `RankingStrategy` (Chronological, Algorithmic) — TWO interfaces! | `TranscodingStrategy` (Parallel, Sequential) + `ABRStrategy` (Throughput, Buffer) + `RecommendationStrategy` (Trending, Personalized) — THREE interfaces! | `SyncStrategy` (OT, CRDT) + `PersistenceStrategy` (Snapshot, EventSourced) + `ConflictResolver` (OT, CRDT) — THREE interfaces! | `ChunkingStrategy` (FixedSize, ContentDefined) + `DeduplicationStrategy` (HashBased, NoDedup) + `ConflictStrategy` (LastWriterWins, KeepBoth) — THREE interfaces! | `OrderExecutionStrategy` (Market, Limit) + `RiskCheckStrategy` (Margin, PositionLimit, CircuitBreaker) + `PnLStrategy` (FIFO, AvgCost) — THREE interfaces! |
+| **Behavioral** | Observer | — | — | `DeliveryTracker` | Presence + delivery + read receipts | tweet.published → fan-out + trending (conceptual) | `DisplayBoard` updates on park/unpark (conceptual) | `CacheStats` tracks hit/miss/eviction events | `NotificationService` observes ride events | `DataCollectionService` observes/logs search events | `NotificationService` observes order/shipping events | `WebhookService` dispatches events to merchants | `NotificationService` observes post/like/comment events | `AnalyticsService` observes video events (views, watch time) | `BroadcastService` notifies connected users of operations/cursor updates | `SyncService` observes file changes, notifies other devices | `NotificationService` + `MarketDataService` observe trade events |
+| **Behavioral** | Template Method | — | — | Notification flow | — | — | `ParkingSpot.canFitVehicle()` — abstract method per spot type | — | — | — | — | PaymentProcessor common validate → process → respond flow (conceptual) | — | TranscodingStrategy common flow (conceptual) | — | — | — |
+| **Behavioral** | Chain of Resp. | — | Middleware pipeline | — | — | — | — | — | — | — | — | `FraudService` chains RuleBased + ML fraud checks | — | — | — | — | `RiskService` chains Margin → PositionLimit → CircuitBreaker |
+| **Behavioral** | Mediator | — | — | — | **ChatService orchestrator** | `FeedService` orchestrates cache + pull + merge + rank | — | — | — | — | — | — | `FeedService` mediates between FanoutService, TimelineService, RankingService | — | `CollaborationService` mediates between OperationService, PresenceService, BroadcastService | — | — |
+| **Behavioral** | Command | — | — | — | **Message as command object** | — | — | — | — | — | `SagaStep` as command object (execute + compensate) | — | — | — | `Operation` as command object (type + position + content, can be replayed) | — | `Order` as command object (place/cancel) |
+| **Behavioral** | State | — | — | — | — | — | `ParkingSpot` status: AVAILABLE → OCCUPIED → AVAILABLE | — | `Ride`: REQUESTED → MATCHED → EN_ROUTE → IN_PROGRESS → COMPLETED | — | `Order`: CREATED → INVENTORY_RESERVED → PAYMENT_CONFIRMED → SHIPPED → DELIVERED | `Payment`: INITIATED → PROCESSING → AUTHORIZED → CAPTURED → SETTLED | — | `Video`: UPLOADING → UPLOADED → TRANSCODING → READY | — | — | `Order`: PENDING_RISK → OPEN → PARTIALLY_FILLED → FILLED |
+| **Concurrency** | Producer-Consumer | — | — | `PriorityQueue` | — (Kafka conceptual) | — | — | — | — | — | — | — | — | — | — | — | — |
+| **Behavioral** | Memento | — | — | — | — | — | — | — | — | — | — | — | — | — | `DocumentVersion` stores document snapshots for version history and rollback (NEW) | `FileVersion` stores file state for rollback | — |
+| **Structural** | Flyweight | — | — | — | — | — | — | — | — | — | — | — | — | — | — | Deduplication — same chunk content shared across files via content-addressable storage (NEW) | — |
 
 ### Count by Project
 
@@ -1277,6 +1744,17 @@ A notification request arrives. All patterns cooperate:
 | Notification | 2 (Builder, Factory) | 1 (Repository) | 3 (Strategy, Observer, Template) | 1 (Prod-Con) | **7** |
 | Chat System | 2 (Builder, Factory) | 1 (Repository) | 4 (Strategy, Observer, Mediator, Command) | 0 | **7** |
 | Social Feed | 2 (Builder, Factory) | 2 (Repository, Composite) | 3 (Strategy x2, Observer, Mediator) | 0 | **7** |
+| Parking Lot | 3 (Builder, Factory, Singleton) | 2 (Repository, Facade) | 4 (Strategy x3, Observer, Template, State) | 0 | **9** |
+| Distributed Cache | 3 (Builder, Factory, Singleton) | 3 (Repository, Facade, Proxy) | 2 (Strategy x2, Observer) | 0 | **8** |
+| Ride-Sharing | 3 (Builder, Factory, Singleton) | 3 (Repository, Facade, Decorator) | 3 (Strategy x2, Observer, State) | 0 | **9** |
+| Search Autocomplete | 3 (Builder, Factory, Singleton) | 3 (Repository, Facade, Decorator) | 2 (Strategy x3, Observer) | 0 | **8** |
+| E-Commerce | 3 (Builder, Factory, Singleton) | 3 (Repository, Facade, Decorator) | 4 (Strategy x3, Observer, State, Command) | 0 | **10** |
+| Payment System | 3 (Builder, Factory, Singleton) | 2 (Repository, Facade) | 5 (Strategy x2, Observer, State, CoR, Template) | 0 | **10** |
+| News Feed | 2 (Builder, Factory) | 3 (Repository, Facade, Composite) | 3 (Strategy x2, Observer, Mediator) | 0 | **8** |
+| Video Streaming | 2 (Builder, Factory) | 2 (Repository, Facade) | 4 (Strategy x3, Observer, State, Template) | 0 | **8** |
+| Real-time Collaboration | 2 (Builder, Factory) | 2 (Repository, Facade) | 5 (Strategy x3, Observer, Command, Mediator, Memento) | 0 | **9** |
+| File Storage | 2 (Builder, Factory) | 4 (Repository, Facade, Composite, Flyweight) | 3 (Strategy x3, Observer, Memento) | 0 | **9** |
+| Stock Trading | 3 (Builder, Factory, Singleton) | 2 (Repository, Facade) | 5 (Strategy x3, Observer, State, CoR, Command) | 0 | **10** |
 
 ---
 
@@ -1296,6 +1774,10 @@ A notification request arrives. All patterns cooperate:
 |---------|------------------------|----------------|
 | Repository | "How do you decouple from the database?" | "Interface for data access. Service depends on interface. Swap InMemory for Redis — change one line in config." |
 | Composite | "How do you combine multiple strategies into one?" | "HybridFanoutStrategy implements the same FanoutStrategy interface as its children, but internally delegates to write or read strategy based on celebrity status. Strategy + Composite together." |
+| Facade | "How do you simplify a complex subsystem?" | "ParkingService is a Facade — one method call to park a vehicle instead of coordinating 5 subsystems (strategy, pricing, payment, repository, display board)." |
+| Proxy | "How do you add behavior without changing the real object?" | "NodeAwareCacheStore implements CacheStore but hashes the key, finds the right node on the consistent hash ring, and delegates to that node's store. Caller never knows it is talking to a proxy — same interface, transparent routing." |
+| Decorator | "How do you add behavior without modifying the original?" | "SurgePricingStrategy wraps StandardPricingStrategy and multiplies the fare by the surge multiplier. Same interface, delegates to wrapped object, enhances the result — original pricing logic untouched." |
+| Flyweight | "How do you avoid storing duplicate data?" | "Flyweight/dedup: hash each chunk, use hash as storage key. Same content stored once, referenced by many files. Content-addressable storage." |
 
 ### Behavioral Patterns
 
@@ -1307,6 +1789,8 @@ A notification request arrives. All patterns cooperate:
 | Chain of Resp. | "How do you handle middleware?" | "Each handler processes or passes to next. Auth → Rate Limit → Business Logic. Like Servlet Filters." |
 | Mediator | "How do you manage complex interactions?" | "One orchestrator class (ChatService) mediates all subsystem calls. Services don't know each other — reduces N×N coupling to N." |
 | Command | "How do you decouple sender from receiver?" | "Message is a self-contained command object. Created by sender, flows through queue/router, executed by handler. Sender doesn't know where or how it's delivered." |
+| State | "How do you handle state-dependent behavior?" | "ParkingSpot uses the State pattern — its behavior changes based on status (AVAILABLE, OCCUPIED, OUT_OF_ORDER), and each transition is guarded so only valid operations are allowed." |
+| Memento | "How do you implement undo/version history?" | "Memento stores document snapshots at intervals. To rollback: load snapshot, replay operations up to target version." |
 
 ### Concurrency Patterns
 
