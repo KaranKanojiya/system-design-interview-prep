@@ -1,0 +1,382 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>04 · Chat System — LLD</title>
+<link rel="stylesheet" href="../assets/canvas.css">
+</head>
+<body>
+<div class="wrap">
+
+  <header class="hero">
+    <h1>Chat System — Low-Level Design</h1>
+    <div class="sub">Use case 04 · Canvas 2 of 3. From boxes to classes: the actual Java object model of a WhatsApp-like chat. Start with the <b>interactive class map</b> — click a class to see its responsibility and how <code>AppConfig → Controller → ChatService → sub-services → Router/Repository</code> is wired — then dig into per-conversation sequence ordering, online/offline routing, and the request sequences.</div>
+    <div class="badges">
+      <span class="badge lvl">Use case 04 · LLD</span>
+      <span class="badge">Canvas 2 of 3</span>
+      <span class="badge">interactive</span>
+      <span class="badge">Mediator · Builder · Strategy · Observer · Repository</span>
+    </div>
+    <div class="legend">
+      <span><i class="dot" style="background:var(--eden)"></i> entry / composition root</span>
+      <span><i class="dot" style="background:var(--survivor)"></i> interface / contract</span>
+      <span><i class="dot" style="background:var(--old)"></i> concrete implementation</span>
+      <span><i class="dot" style="background:var(--warn)"></i> domain model</span>
+      <span><i class="dot" style="background:var(--muted)"></i> click a class for its role</span>
+    </div>
+  </header>
+
+  <!-- A · CLASS DESIGN (interactive class map) -->
+  <section>
+    <div class="sec-h"><span class="n">A</span><h2>Class design — click a class in the map</h2><span class="tag">the object model, wired</span></div>
+    <div>
+      <div class="arch">
+        <svg viewBox="0 0 800 440" width="100%" style="max-width:800px" role="img" aria-label="Chat system class map">
+          <defs>
+            <marker id="ah" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" fill="var(--muted)"></path></marker>
+          </defs>
+
+          <!-- wiring arrows -->
+          <line class="arrow" x1="86" y1="62" x2="86" y2="108" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"></line>
+          <line class="arrow" x1="152" y1="132" x2="206" y2="132" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"></line>
+          <line class="arrow" x1="342" y1="122" x2="398" y2="44" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"></line>
+          <line class="arrow" x1="342" y1="128" x2="398" y2="114" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"></line>
+          <line class="arrow" x1="342" y1="140" x2="398" y2="188" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"></line>
+          <line class="arrow" x1="342" y1="148" x2="398" y2="262" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"></line>
+          <line class="arrow" x1="532" y1="40" x2="588" y2="40" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"></line>
+          <line class="arrow" x1="466" y1="62" x2="466" y2="90" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"></line>
+          <line class="arrow" x1="532" y1="112" x2="588" y2="106" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"></line>
+          <line class="arrow" x1="532" y1="120" x2="588" y2="184" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"></line>
+          <line class="arrow" x1="532" y1="182" x2="588" y2="120" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"></line>
+          <path class="arrow" d="M405,50 C 300,120 276,220 276,298" fill="none" stroke="var(--muted)" stroke-width="2" stroke-dasharray="4 3" marker-end="url(#ah)"></path>
+          <line class="arrow" x1="588" y1="362" x2="534" y2="362" stroke="var(--muted)" stroke-width="2" stroke-dasharray="4 3" marker-end="url(#ah)"></line>
+          <text x="94" y="90" fill="var(--faint)" font-size="9">wires</text>
+          <text x="160" y="126" fill="var(--faint)" font-size="9">uses</text>
+          <text x="300" y="110" fill="var(--faint)" font-size="9">delegates</text>
+          <text x="540" y="356" fill="var(--faint)" font-size="9">extends</text>
+
+          <!-- nodes -->
+          <g data-node style="cursor:pointer" data-title="AppConfig  (config)" data-detail="<b>Role:</b> composition root / poor-man's DI container (Factory pattern). Its constructor news-up and wires the whole graph: repositories → ConnectionRegistry → MessageRouter → the four sub-services → ChatService.<br><b>Constants:</b> SERVER_ID=&quot;server-1&quot;, HEARTBEAT_INTERVAL_SEC=30.<br><b>Helpers:</b> <code>createController()</code>, <code>seedUsers()</code> (5 demo users), <code>setupConnections(userIds…)</code> builds a ConnectionHandler per user and registers it on the router. The single place wiring changes."><rect x="20" y="18" width="132" height="44" rx="9" fill="var(--panel-2)" stroke="var(--eden)"></rect><text x="86" y="38" text-anchor="middle" fill="var(--eden)" font-size="12" font-weight="600">AppConfig</text><text x="86" y="53" text-anchor="middle" fill="var(--faint)" font-size="10">composition root</text></g>
+
+          <g data-node style="cursor:pointer" data-title="ChatController  (controller)" data-detail="<b>Role:</b> framework-free stand-in for a Spring @RestController + WebSocket endpoint. Prints request/response traces.<br><b>Endpoints:</b> handleConnect / handleDisconnect (WS), handleSendDirectMessage &amp; handleSendGroupMessage (POST), handleGetHistory (GET), handleReadReceipt (PUT), handleAddMember / handleRemoveMember.<br><b>Wiring:</b> holds one <code>ChatService</code> and delegates every call to it — no business logic here."><rect x="20" y="110" width="132" height="44" rx="9" fill="var(--panel-2)" stroke="var(--border)"></rect><text x="86" y="130" text-anchor="middle" fill="var(--text)" font-size="12" font-weight="600">ChatController</text><text x="86" y="145" text-anchor="middle" fill="var(--faint)" font-size="10">REST + WS</text></g>
+
+          <g data-node style="cursor:pointer" data-title="ChatService  (orchestrator / mediator)" data-detail="<b>Role:</b> the Mediator — the single entry point that coordinates the four sub-services so they never call each other directly.<br><b>Holds:</b> MessageService, GroupService, PresenceService, MessageRouter, ConversationRepository, UserRepository.<br><b>sendDirectMessage():</b> findOneToOne(a,b) or create a new ONE_TO_ONE conversation, then delegate to MessageService.<br><b>userConnects():</b> presenceService.heartbeat → userRepo.updateStatus(ONLINE) → router.deliverOfflineMessages. Also createGroup, getConversationHistory, markAsRead, add/removeMember."><rect x="210" y="110" width="132" height="44" rx="9" fill="var(--panel-2)" stroke="var(--border)"></rect><text x="276" y="130" text-anchor="middle" fill="var(--text)" font-size="12" font-weight="600">ChatService</text><text x="276" y="145" text-anchor="middle" fill="var(--faint)" font-size="10">«mediator»</text></g>
+
+          <g data-node style="cursor:pointer" data-title="MessageService  (service)" data-detail="<b>Role:</b> the core send/history logic.<br><b>sendMessage():</b> findById(conv) → <code>isMember(sender)</code> else UnauthorizedException → <code>conv.nextSequence()</code> → build via Message.Builder (one deliveryStatus entry per recipient) → <code>msgRepo.save</code> → route by type: ONE_TO_ONE → <code>router.routeToUser(otherMember)</code>; GROUP → <code>router.routeToGroup</code>.<br><b>getHistory():</b> cursor pagination via beforeSequence. <b>markAsRead():</b> updateDeliveryStatus(READ) + ReadReceipt."><rect x="400" y="18" width="132" height="44" rx="9" fill="var(--panel-2)" stroke="var(--border)"></rect><text x="466" y="38" text-anchor="middle" fill="var(--text)" font-size="12" font-weight="600">MessageService</text><text x="466" y="53" text-anchor="middle" fill="var(--faint)" font-size="10">send · history</text></g>
+
+          <g data-node style="cursor:pointer" data-title="MessageRouter  (service · Strategy)" data-detail="<b>Role:</b> the online-vs-offline delivery engine (Strategy pattern).<br><b>routeToUser():</b> if <code>registry.isOnline</code> → <code>msg.markAsDelivered</code> + handler.deliverMessage; else append to <code>offlineQueues</code> (a <code>Map&lt;String,List&lt;Message&gt;&gt;</code>) and log a PUSH.<br><b>routeToGroup():</b> fan-out — routeToUser for every member except the sender.<br><b>deliverOfflineMessages():</b> drains the user's queue on reconnect. Holds the <code>connections</code> map (userId → ConnectionHandler)."><rect x="400" y="92" width="132" height="44" rx="9" fill="var(--panel-2)" stroke="var(--border)"></rect><text x="466" y="112" text-anchor="middle" fill="var(--text)" font-size="12" font-weight="600">MessageRouter</text><text x="466" y="127" text-anchor="middle" fill="var(--faint)" font-size="10">online / offline</text></g>
+
+          <g data-node style="cursor:pointer" data-title="PresenceService  (service · Observer)" data-detail="<b>Role:</b> heartbeat-based presence tracking in a <code>ConcurrentHashMap&lt;String,PresenceInfo&gt;</code>.<br><b>heartbeat():</b> compute() creates/refreshes a PresenceInfo → ONLINE + lastHeartbeat=now.<br><b>checkTimeouts():</b> scans the map; any ONLINE entry older than 60s → OFFLINE + registry.unregister (runs on a ScheduledExecutor in production).<br><b>disconnect / getPresence / isOnline / getOnlineUsers</b>. Presence changes fan out to contacts via ConnectionHandler (Observer)."><rect x="400" y="166" width="132" height="44" rx="9" fill="var(--panel-2)" stroke="var(--border)"></rect><text x="466" y="186" text-anchor="middle" fill="var(--text)" font-size="12" font-weight="600">PresenceService</text><text x="466" y="201" text-anchor="middle" fill="var(--faint)" font-size="10">heartbeat</text></g>
+
+          <g data-node style="cursor:pointer" data-title="GroupService  (service)" data-detail="<b>Role:</b> group lifecycle. Groups are stored through the <code>ConversationRepository</code> (a GroupChat <i>is-a</i> Conversation) — there is no separate GroupRepository.<br><b>createGroup():</b> validate creator → new GroupChat → addAdmin(creator) + addMember(creator) → add other members → save.<br><b>addMember / removeMember:</b> admin-only (validateAdmin) → mutate → emit a SYSTEM Message.<br><b>leaveGroup:</b> promotes the next member if the last admin leaves."><rect x="400" y="240" width="132" height="44" rx="9" fill="var(--panel-2)" stroke="var(--border)"></rect><text x="466" y="260" text-anchor="middle" fill="var(--text)" font-size="12" font-weight="600">GroupService</text><text x="466" y="275" text-anchor="middle" fill="var(--faint)" font-size="10">group lifecycle</text></g>
+
+          <g data-node style="cursor:pointer" data-title="MessageRepository  «interface»" data-detail="<b>Role:</b> the message data-access contract — <code>save</code>, <code>findById</code>, <code>findByConversationId(convId, limit, beforeSequence)</code>, <code>updateDeliveryStatus(msgId, userId, status)</code>.<br><b>Impl:</b> InMemoryMessageRepository keeps a <code>ConcurrentHashMap&lt;id,Message&gt;</code> plus a per-conversation <code>CopyOnWriteArrayList</code> index; history streams that list, filters <code>seq &lt; beforeSequence</code>, sorts descending, limits. Same contract behind Cassandra in production. Sibling contracts: ConversationRepository (incl. findOneToOne) and UserRepository."><rect x="590" y="18" width="132" height="44" rx="9" fill="var(--panel-2)" stroke="var(--survivor)"></rect><text x="656" y="38" text-anchor="middle" fill="var(--survivor)" font-size="11" font-weight="600">MessageRepository</text><text x="656" y="53" text-anchor="middle" fill="var(--faint)" font-size="10">«interface»</text></g>
+
+          <g data-node style="cursor:pointer" data-title="ConnectionRegistry  «interface»" data-detail="<b>Role:</b> maps which server each user is connected to — <code>register(userId, serverId)</code>, <code>unregister</code>, <code>getServer</code>, <code>isOnline</code>, <code>getOnlineCount</code>.<br><b>Impl:</b> InMemoryConnectionRegistry = a single <code>ConcurrentHashMap&lt;userId,serverId&gt;</code>. This is the seam that becomes <b>Redis</b> in a multi-server deployment so any node can find a user's edge server."><rect x="590" y="92" width="132" height="44" rx="9" fill="var(--panel-2)" stroke="var(--survivor)"></rect><text x="656" y="112" text-anchor="middle" fill="var(--survivor)" font-size="11" font-weight="600">ConnectionRegistry</text><text x="656" y="127" text-anchor="middle" fill="var(--faint)" font-size="10">«interface»</text></g>
+
+          <g data-node style="cursor:pointer" data-title="ConnectionHandler  (handler)" data-detail="<b>Role:</b> simulated WebSocket session for one connected user (console output stands in for a real socket).<br><b>connect / disconnect:</b> register / unregister on the ConnectionRegistry.<br><b>Push methods (Observer targets):</b> deliverMessage(msg, senderName), deliverPresenceUpdate(user, status), deliverReadReceipt(receipt). One handler per user, held in MessageRouter's <code>connections</code> map."><rect x="590" y="166" width="132" height="44" rx="9" fill="var(--panel-2)" stroke="var(--border)"></rect><text x="656" y="186" text-anchor="middle" fill="var(--text)" font-size="11" font-weight="600">ConnectionHandler</text><text x="656" y="201" text-anchor="middle" fill="var(--faint)" font-size="10">sim. WebSocket</text></g>
+
+          <g data-node style="cursor:pointer" data-title="Message  (model · Builder)" data-detail="<b>Role:</b> the core entity, built via the <b>Builder pattern</b> (<code>new Message.Builder()…build()</code>).<br><b>Fields:</b> messageId, conversationId, senderId, content, type, status, <b>sequenceNumber</b> (long), createdAt, and <code>deliveryStatus</code> — a <code>ConcurrentHashMap&lt;userId,MessageStatus&gt;</code> for per-recipient tracking.<br><b>Methods:</b> markAsDelivered / markAsRead(userId), getDeliveryStatusForUser, isFullyDelivered / isFullyRead(memberIds). <code>Comparable</code> by sequenceNumber."><rect x="210" y="300" width="132" height="44" rx="9" fill="var(--panel-2)" stroke="var(--warn)"></rect><text x="276" y="320" text-anchor="middle" fill="var(--warn)" font-size="12" font-weight="600">Message</text><text x="276" y="335" text-anchor="middle" fill="var(--faint)" font-size="10">«Builder» entity</text></g>
+
+          <g data-node style="cursor:pointer" data-title="Conversation  (model)" data-detail="<b>Role:</b> a 1:1 or group thread. Owns member management and the ordering counter.<br><b>Fields:</b> conversationId, type (ONE_TO_ONE / GROUP), name, <code>memberIds</code> (CopyOnWriteArrayList), createdBy, createdAt, and a <code>sequenceCounter</code> (<b>AtomicLong</b>).<br><b>nextSequence():</b> <code>incrementAndGet()</code> — the source of gap-free per-conversation ordering. Also addMember, isMember, getMemberCount, getOtherMember (1:1 only)."><rect x="400" y="340" width="132" height="44" rx="9" fill="var(--panel-2)" stroke="var(--warn)"></rect><text x="466" y="360" text-anchor="middle" fill="var(--warn)" font-size="12" font-weight="600">Conversation</text><text x="466" y="375" text-anchor="middle" fill="var(--faint)" font-size="10">members + seq</text></g>
+
+          <g data-node style="cursor:pointer" data-title="GroupChat  (model · extends Conversation)" data-detail="<b>Role:</b> a Conversation with group extras.<br><b>Adds:</b> maxMembers=256, <code>adminIds</code> (ConcurrentSkipListSet), description.<br><b>Overrides addMember()</b> to enforce the capacity cap (throws when full).<br><b>Admin ops:</b> isAdmin / addAdmin / removeAdmin. Because it subclasses Conversation, it is stored and routed through exactly the same repository and router paths as a 1:1 chat."><rect x="590" y="340" width="132" height="44" rx="9" fill="var(--panel-2)" stroke="var(--warn)"></rect><text x="656" y="360" text-anchor="middle" fill="var(--warn)" font-size="12" font-weight="600">GroupChat</text><text x="656" y="375" text-anchor="middle" fill="var(--faint)" font-size="10">admins + cap</text></g>
+        </svg>
+      </div>
+      <div class="node-detail"><span class="nd-title">Click any class</span><div class="nd-body">Its responsibility, key methods, and how it is wired appear here. Solid arrows are <i>uses</i> / <i>wires</i>; dashed arrows are <i>creates</i> / <i>extends</i>. Notice ChatService is the only class that touches all four sub-services — that <b>Mediator</b> hub is what keeps MessageService, PresenceService and GroupService ignorant of each other.</div></div>
+    </div>
+  </section>
+
+  <!-- B · CORE ALGORITHM -->
+  <section>
+    <div class="sec-h"><span class="n">B</span><h2>Message ordering &amp; routing — the core algorithm</h2><span class="tag">Conversation.nextSequence + MessageService.sendMessage</span></div>
+    <div class="grid g2">
+      <div class="card">
+        <div class="kicker">the send path (grounded)</div>
+        <pre class="code"><span class="cm">// MessageService.sendMessage(...)</span>
+Conversation conv = convRepo.findById(id)
+    .orElseThrow(ConversationNotFound::new);
+<span class="kw">if</span> (!conv.isMember(senderId))
+    <span class="kw">throw new</span> UnauthorizedException(...);
+
+<span class="cm">// server-side, gap-free order per conversation</span>
+<span class="kw">long</span> seq = conv.nextSequence();   <span class="cm">// AtomicLong ++</span>
+
+Message m = <span class="kw">new</span> Message.Builder()
+    .messageId(uuid8()).conversationId(id)
+    .senderId(senderId).content(content)
+    .type(type).status(<span class="st">SENT</span>)
+    .sequenceNumber(seq);
+<span class="kw">for</span> (String mid : conv.getMemberIds())
+    <span class="kw">if</span> (!mid.equals(senderId)) m.addRecipient(mid);
+
+msgRepo.save(m.build());
+<span class="cm">// route by conversation type</span>
+<span class="kw">if</span> (conv.getType() == ONE_TO_ONE)
+    router.routeToUser(m, conv.getOtherMember(senderId), name);
+<span class="kw">else</span>
+    router.routeToGroup(m, conv, name);</pre>
+        <p class="muted">The sequence number is assigned <b>server-side</b> under an <code>AtomicLong</code>, so two concurrent senders in one conversation can never collide or leave a gap.</p>
+      </div>
+      <div class="card">
+        <div class="kicker">worked example — three sends, one offline</div>
+        <pre class="code"><span class="cm">// conv seqCounter starts at 0</span>
+alice→bob "Hey"      nextSequence() = <span class="num">1</span>
+  bob online?  YES → deliverMessage, mark <span class="st">DELIVERED</span>
+bob→alice "yo"       nextSequence() = <span class="num">2</span>
+  alice online? YES → deliverMessage, mark <span class="st">DELIVERED</span>
+
+<span class="cm">// group grp-7 = {alice,bob,carol}, carol offline</span>
+alice→grp "standup?" nextSequence() = <span class="num">1</span>
+  routeToGroup fan-out (skip sender):
+    bob   online → deliver, <span class="st">DELIVERED</span>
+    carol OFFLINE→ offlineQueues[carol].add(m)
+                   [PUSH → carol]
+...carol reconnects → deliverOfflineMessages(carol)
+    drains queue → deliver, mark <span class="st">DELIVERED</span></pre>
+        <p class="muted">One <code>deliveryStatus</code> map entry per recipient means a group message can be <code>DELIVERED</code> to bob while still queued for carol — the per-recipient truth that drives the tick marks.</p>
+      </div>
+    </div>
+    <div class="callout tip"><b>Why per-conversation sequence numbers?</b> A monotonic <code>AtomicLong</code> on the <code>Conversation</code> gives every message a unique, gap-free, total order <i>within that thread</i> — the client can reorder out-of-order arrivals and detect gaps to re-request. Wall-clock timestamps suffer clock skew and sub-ms collisions across servers; random UUIDs give no ordering and no efficient range scan. Sequence also powers cursor pagination: <code>findByConversationId(id, limit, beforeSequence)</code> walks backward from a cursor. The trade-off — one counter per conversation is a write-serialization point — is exactly the ordering problem canvas 3 revisits at scale.</div>
+  </section>
+
+  <!-- C · DELIVERY STRATEGIES (tabs) -->
+  <section>
+    <div class="sec-h"><span class="n">C</span><h2>Delivery routing (Strategy pattern)</h2><span class="tag">online vs offline, without if/else sprawl</span></div>
+    <div data-tabscope>
+      <div class="tabs">
+        <button class="tab active" data-tab="online">Online · real-time</button>
+        <button class="tab" data-tab="offline">Offline · queue</button>
+        <button class="tab" data-tab="group">Group · fan-out</button>
+        <button class="tab" data-tab="beyond">Beyond MVP</button>
+      </div>
+      <div class="tabpanel active" data-panel="online">
+        <p><b>routeToUser</b> when <code>registry.isOnline(recipient)</code> is true. <span class="run">the real-time path</span></p>
+        <ul class="tight">
+          <li>Look up the recipient's <code>ConnectionHandler</code> in the router's <code>connections</code> map.</li>
+          <li><code>msg.markAsDelivered(recipientId)</code> — flips overall status and the per-recipient entry to <b>DELIVERED</b>.</li>
+          <li><code>handler.deliverMessage(msg, senderName)</code> pushes it down the (simulated) WebSocket immediately.</li>
+        </ul>
+      </div>
+      <div class="tabpanel" data-panel="offline">
+        <p><b>routeToUser</b> when the recipient is not online. <span class="run">store-and-forward</span></p>
+        <ul class="tight">
+          <li><code>offlineQueues.computeIfAbsent(recipient, k → new ArrayList&lt;&gt;()).add(msg)</code> — one FIFO list per user.</li>
+          <li>Logs a <code>[PUSH → user]</code> line (a real system fires an APNs/FCM push here).</li>
+          <li>On reconnect, <code>ChatService.userConnects → router.deliverOfflineMessages(user)</code> drains the queue in order and marks each DELIVERED.</li>
+        </ul>
+      </div>
+      <div class="tabpanel" data-panel="group">
+        <p><b>routeToGroup</b> — the same per-recipient decision, applied to every member. <span class="run">fan-out</span></p>
+        <ul class="tight">
+          <li>Iterate <code>group.getMemberIds()</code>, skip the sender, call <code>routeToUser</code> for each.</li>
+          <li>Each recipient independently takes the online or offline branch — a message can be live for some, queued for others.</li>
+          <li>Because <code>GroupChat extends Conversation</code>, no special storage path — same repository, same sequence counter.</li>
+        </ul>
+      </div>
+      <div class="tabpanel" data-panel="beyond">
+        <p>Not in the repo, but the seams make them drop-in:</p>
+        <ul class="tight">
+          <li><b>Redis-backed ConnectionRegistry:</b> swap the in-memory map so any WS server can locate a user's edge node — the multi-server routing story.</li>
+          <li><b>Kafka / Redis Pub-Sub router:</b> replace the in-process <code>connections</code> map with a message bus so delivery survives a server crash and scales fan-out horizontally.</li>
+          <li><b>Durable offline queue:</b> back <code>offlineQueues</code> with Redis / a durable store so queued messages survive restarts.</li>
+        </ul>
+      </div>
+    </div>
+    <table>
+      <thead><tr><th>Ordering approach</th><th>Ordering</th><th>Range query</th><th>Distributed hazard</th><th>Verdict</th></tr></thead>
+      <tbody>
+        <tr><td>Per-conversation sequence <b>(chosen)</b></td><td>total, gap-free</td><td>efficient (cursor)</td><td>one counter = write point</td><td>the design</td></tr>
+        <tr><td>Wall-clock timestamp</td><td>approximate</td><td>ok</td><td>clock skew, sub-ms ties</td><td>lossy</td></tr>
+        <tr><td>Random UUID</td><td>none</td><td>none</td><td>—</td><td>id only</td></tr>
+      </tbody>
+    </table>
+    <div class="callout"><b>The pattern:</b> <code>MessageRouter</code> picks a delivery behaviour from the recipient's <i>presence</i>, never branching on message type in the caller — <code>MessageService</code> just calls <code>routeToUser</code> / <code>routeToGroup</code>. Adding a new delivery mode (push-only, email digest) is a new branch/strategy inside the router with <b>zero</b> changes to the services above it.</div>
+  </section>
+
+  <!-- D · DATA MODEL -->
+  <section>
+    <div class="sec-h"><span class="n">D</span><h2>Data model detail</h2><span class="tag">Message · Conversation / GroupChat</span></div>
+    <div class="grid g2">
+      <div class="card">
+        <div class="kicker">Message — per-recipient delivery tracking</div>
+        <pre class="code">messageId      String   <span class="cm">// 8-char UUID</span>
+conversationId String   <span class="cm">// owning thread</span>
+senderId       String
+content        String
+type           MessageType   <span class="cm">// TEXT/IMAGE/VIDEO/FILE/SYSTEM</span>
+status         MessageStatus <span class="cm">// overall (min)</span>
+sequenceNumber long          <span class="cm">// order KEY</span>
+createdAt      LocalDateTime
+deliveryStatus Map&lt;String,MessageStatus&gt;
+               <span class="cm">// recipientId → SENT/DELIVERED/READ</span></pre>
+        <p class="muted"><code>deliveryStatus</code> is a <code>ConcurrentHashMap</code> so many delivery threads update it safely. <code>MessageStatus</code> is ordered SENDING → SENT → DELIVERED → READ (each carries a tick symbol); <code>markAsRead</code> / <code>markAsDelivered</code> flip both the per-user entry and the overall status.</p>
+      </div>
+      <div class="card">
+        <div class="kicker">Conversation &amp; GroupChat — ordering + members</div>
+        <pre class="code">conversationId String
+type           ConversationType <span class="cm">// ONE_TO_ONE|GROUP</span>
+name           String
+memberIds      List&lt;String&gt;  <span class="cm">// CopyOnWriteArrayList</span>
+sequenceCounter AtomicLong    <span class="cm">// nextSequence()</span>
+
+<span class="cm">// GroupChat extends Conversation</span>
+maxMembers   int = 256
+adminIds     Set&lt;String&gt;   <span class="cm">// ConcurrentSkipListSet</span>
+description  String        <span class="cm">// addMember() caps at 256</span></pre>
+        <p class="muted">Membership uses a <code>CopyOnWriteArrayList</code> — cheap concurrent reads (the common case: fan-out iterates members) with copy-on-write on the rarer join/leave. Storage is uniform: a GroupChat <i>is-a</i> Conversation, so both live in the one <code>ConversationRepository</code>.</p>
+      </div>
+    </div>
+    <div class="callout tip"><b>Two status views, on purpose:</b> <code>Message.status</code> is the coarse overall state shown as a single tick, while <code>deliveryStatus[user]</code> is the fine-grained per-recipient truth — that split is what lets a group message show delivered-to-Bob while still queued-for-Carol, and it is what a read receipt updates. Canvas 3 shows how this maps onto a Cassandra table partitioned by <code>conversation_id</code>, clustered by <code>sequence_number</code>.</div>
+  </section>
+
+  <!-- E · REQUEST SEQUENCES -->
+  <section>
+    <div class="sec-h"><span class="n">E</span><h2>Request handling sequence</h2><span class="tag">which class does what, in order</span></div>
+
+    <div class="collapsible open">
+      <div class="c-head"><h3>POST /messages &nbsp;→&nbsp; send a 1:1 message (recipient online)</h3></div>
+      <div class="c-body">
+        <pre class="code"><span class="cm">ChatController.handleSendDirectMessage(alice, bob, text)</span>
+  └─ ChatService.sendDirectMessage(alice, bob, text, TEXT)
+       1  convRepo.findOneToOne(alice, bob)
+            empty? → new Conversation(ONE_TO_ONE) + addMember×2 + save
+       2  MessageService.sendMessage(alice, convId, text, TEXT)
+            a  convRepo.findById → isMember(alice)?  else Unauthorized
+            b  seq = conv.nextSequence()            <span class="cm">// AtomicLong ++</span>
+            c  Message.Builder … addRecipient(bob) … build()
+            d  msgRepo.save(message)
+            e  conv.type == ONE_TO_ONE →
+                 router.routeToUser(msg, bob, "Alice")
+                   registry.isOnline(bob)? YES
+                   msg.markAsDelivered(bob)          <span class="cm">// ✓✓</span>
+                   handler[bob].deliverMessage(msg)  <span class="cm">// [WS → bob]</span>
+  └─ [RESPONSE] message SENT</pre>
+      </div>
+    </div>
+
+    <div class="collapsible open">
+      <div class="c-head"><h3>Offline path &nbsp;→&nbsp; queue, then drain on reconnect</h3></div>
+      <div class="c-body">
+        <pre class="code"><span class="cm">// send while carol is offline</span>
+router.routeToUser(msg, carol, name)
+   registry.isOnline(carol)? NO
+   offlineQueues[carol].add(msg)     <span class="cm">// FIFO list</span>
+   println("[PUSH → carol] new message")
+
+<span class="cm">// later: carol connects</span>
+ChatController.handleConnect(carol)
+  └─ ChatService.userConnects(carol)
+       1  presenceService.heartbeat(carol, "server-1")  <span class="cm">// → ONLINE</span>
+       2  userRepo.updateStatus(carol, ONLINE)
+       3  router.deliverOfflineMessages(carol)
+            queued = offlineQueues.remove(carol)
+            for m in queued:
+               m.markAsDelivered(carol)      <span class="cm">// ✓✓</span>
+               handler[carol].deliverMessage(m)</pre>
+        <p class="muted">The queue is drained <b>in insertion order</b>, preserving the per-conversation sequence the client will reassemble.</p>
+      </div>
+    </div>
+
+    <div class="collapsible open">
+      <div class="c-head"><h3>PUT /messages/{id}/read &nbsp;→&nbsp; read receipt</h3></div>
+      <div class="c-body">
+        <pre class="code"><span class="cm">ChatController.handleReadReceipt(msgId, bob)</span>
+  └─ ChatService.markAsRead(msgId, bob)
+       └─ MessageService.markAsRead(msgId, bob)
+            1  msgRepo.findById(msgId)  <span class="cm">// else not-found</span>
+            2  msgRepo.updateDeliveryStatus(msgId, bob, READ)
+                  → message.markAsRead(bob)      <span class="cm">// ✓✓ blue</span>
+            3  new ReadReceipt(msgId, bob, READ)
+            4  return receipt   <span class="cm">// sender notified via handler (Observer)</span>
+  └─ [RESPONSE] read receipt recorded</pre>
+        <p class="muted">Presence changes follow the same shape: <code>PresenceService</code> flips status, then pushes <code>deliverPresenceUpdate</code> to each online contact through their <code>ConnectionHandler</code> — the Observer fan-out.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- F · DESIGN PATTERNS -->
+  <section>
+    <div class="sec-h"><span class="n">F</span><h2>Design patterns used</h2><span class="tag">GoF-categorized</span></div>
+    <div class="grid g3">
+      <div class="card">
+        <div class="kicker">Creational</div>
+        <ul class="tight">
+          <li><b>Builder</b> — <code>Message.Builder</code>. Readable construction of a 9-field entity with an incremental <code>addRecipient</code>; <code>build()</code> assembles the immutable-ish Message.</li>
+          <li><b>Factory</b> — <code>AppConfig</code> wires the entire object graph in its constructor + <code>createController()</code> (composition root).</li>
+        </ul>
+      </div>
+      <div class="card">
+        <div class="kicker">Behavioral</div>
+        <ul class="tight">
+          <li><b>Mediator</b> — <code>ChatService</code> is the hub; sub-services never call each other, cutting N×(N−1) coupling to N.</li>
+          <li><b>Strategy</b> — <code>MessageRouter</code> chooses online vs offline delivery from presence, no branching leaking upward.</li>
+          <li><b>Observer</b> — presence updates &amp; read receipts push to contacts via <code>ConnectionHandler</code>; adding a channel needs no service change.</li>
+        </ul>
+      </div>
+      <div class="card">
+        <div class="kicker">Architectural (not GoF)</div>
+        <ul class="tight">
+          <li><b>Repository</b> — Message / Conversation / User contracts over in-memory maps; swap in Cassandra / Postgres with no service change.</li>
+          <li><b>Dependency Injection</b> — constructor injection everywhere, wired by hand in AppConfig (Spring @Configuration in production).</li>
+        </ul>
+      </div>
+    </div>
+    <div class="callout"><b>Why they cluster:</b> Mediator keeps the service graph a star instead of a mesh; Strategy + Repository keep delivery and storage swappable (Open-Closed); Observer decouples who-gets-notified from who-changed. Builder plus the concurrency primitives — <code>AtomicLong</code> sequence, <code>ConcurrentHashMap</code> stores, <code>CopyOnWriteArrayList</code> members, <code>ConcurrentSkipListSet</code> admins — keep the write paths lock-light. <span class="run">→ scaling, ordering &amp; the multi-server follow-up on canvas 3</span></div>
+  </section>
+
+  <!-- RUN IT -->
+  <section>
+    <div class="sec-h"><span class="n">▶</span><h2>Run it — repo file map</h2><span class="tag">concept → actual Java class</span></div>
+    <table>
+      <thead><tr><th>Concept above</th><th>File in <code>04-chat-system/src/main/java/…/chat/</code></th></tr></thead>
+      <tbody>
+        <tr><td>Composition root / wiring (§A)</td><td><code>config/AppConfig.java</code></td></tr>
+        <tr><td>REST + WebSocket endpoints</td><td><code>controller/ChatController.java</code></td></tr>
+        <tr><td>Mediator / orchestrator (§A)</td><td><code>service/ChatService.java</code></td></tr>
+        <tr><td>Send + sequence + history (§B)</td><td><code>service/MessageService.java</code></td></tr>
+        <tr><td>Online/offline routing (§C)</td><td><code>service/MessageRouter.java</code></td></tr>
+        <tr><td>Heartbeat presence (Observer)</td><td><code>service/PresenceService.java</code></td></tr>
+        <tr><td>Group lifecycle + admins</td><td><code>service/GroupService.java</code></td></tr>
+        <tr><td>Simulated WebSocket + registry</td><td><code>handler/ConnectionHandler.java</code> · <code>ConnectionRegistry.java</code> · <code>InMemoryConnectionRegistry.java</code></td></tr>
+        <tr><td>Storage contracts + impls</td><td><code>repository/MessageRepository.java</code> · <code>ConversationRepository.java</code> · <code>UserRepository.java</code> · <code>InMemory*.java</code></td></tr>
+        <tr><td>Domain models (§D)</td><td><code>model/Message.java</code> · <code>Conversation.java</code> · <code>GroupChat.java</code> · <code>User.java</code> · <code>PresenceInfo.java</code> · <code>ReadReceipt.java</code></td></tr>
+        <tr><td>Enums</td><td><code>model/MessageType.java</code> · <code>MessageStatus.java</code> · <code>UserStatus.java</code> · <code>ConversationType.java</code></td></tr>
+        <tr><td>Exceptions (404 / 403 / 400)</td><td><code>exception/ChatException.java</code> · <code>UserNotFoundException.java</code> · <code>ConversationNotFoundException.java</code> · <code>UnauthorizedException.java</code></td></tr>
+        <tr><td>Runnable demo (main)</td><td><code>ChatApp.java</code></td></tr>
+      </tbody>
+    </table>
+    <div class="callout tip"><b>Run the demo</b> (Gradle <code>application</code> plugin, mainClass <code>ChatApp</code>, no framework):<br><pre class="code">./gradlew :04-chat-system:run</pre>Seeds 5 users, then runs 7 scenarios: 1:1 real-time chat, offline queue + reconnect drain, group fan-out, read-receipt tick progression, presence online/offline, admin add/remove member, and paginated history.</div>
+  </section>
+
+  <!-- GLOSSARY -->
+  <section>
+    <div class="sec-h"><span class="n">§</span><h2>Glossary — one-liners</h2><span class="tag">terms used above</span></div>
+    <div class="grid g2">
+      <div class="card"><table><tbody>
+        <tr><td><b>Mediator pattern</b></td><td>a hub (ChatService) coordinates peers so they never reference each other</td></tr>
+        <tr><td><b>Strategy pattern</b></td><td>interchangeable behaviours (online vs offline delivery) chosen at runtime</td></tr>
+        <tr><td><b>Observer pattern</b></td><td>subject pushes events (presence, receipts) to a subscriber list</td></tr>
+        <tr><td><b>Builder pattern</b></td><td>fluent step-by-step construction of a many-field object</td></tr>
+        <tr><td><b>Repository pattern</b></td><td>interface over data access so storage can be swapped</td></tr>
+      </tbody></table></div>
+      <div class="card"><table><tbody>
+        <tr><td><b>Sequence number</b></td><td>per-conversation AtomicLong giving gap-free total order</td></tr>
+        <tr><td><b>deliveryStatus map</b></td><td>per-recipient SENT/DELIVERED/READ, drives tick marks</td></tr>
+        <tr><td><b>ConnectionRegistry</b></td><td>userId → server map (Redis in prod) for routing</td></tr>
+        <tr><td><b>Offline queue</b></td><td>per-user FIFO buffer drained on reconnect</td></tr>
+        <tr><td><b>Heartbeat / timeout</b></td><td>periodic ping; no ping in 60s → marked OFFLINE</td></tr>
+      </tbody></table></div>
+    </div>
+  </section>
+
+  <footer>
+    <p>Use case 04 · Chat System — Canvas 2 of 3 (LLD). Grounded in <code>04-chat-system/docs/lld/</code>, <code>docs/patterns/</code>, and the Java under <code>src/main/java/com/systemdesign/chat</code>.</p>
+    <p class="run">This use case: <a href="hld.html">Canvas 1 · HLD</a> · LLD · <a href="deepdive.html">Canvas 3 · Deep-dive &amp; Trade-offs</a> &nbsp;|&nbsp; Next → <a href="deepdive.html">Canvas 3 · Deep-dive &amp; Trade-offs</a> &nbsp;|&nbsp; <a href="../index.html">Hub</a></p>
+  </footer>
+
+</div>
+<script src="../assets/canvas.js"></script>
+</body>
+</html>

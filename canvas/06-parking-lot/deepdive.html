@@ -1,0 +1,385 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>06 · Parking Lot — Deep-dive &amp; Trade-offs</title>
+<link rel="stylesheet" href="../assets/canvas.css">
+</head>
+<body>
+<div class="wrap">
+
+  <header class="hero">
+    <h1>Parking Lot — Deep-dive &amp; Trade-offs</h1>
+    <div class="sub">Use case 06 · Canvas 3 of 3. The hard parts: how to <b>scale</b> concurrency without double-booking, why caching here is really <b>in-memory state</b>, the <b>bottlenecks</b> that break the design (and their fixes), why a single lot is a <b>CP</b> system, and a phase-by-phase <b>LLD interview walkthrough</b>. <b>Switch the locking tabs</b> and <b>open the bottleneck cards</b> to explore.</div>
+    <div class="badges">
+      <span class="badge lvl">Use case 06 · Deep-dive</span>
+      <span class="badge">Canvas 3 of 3</span>
+      <span class="badge">interactive</span>
+      <span class="badge">CP · concurrency-first</span>
+    </div>
+    <div class="legend">
+      <span><i class="dot" style="background:var(--eden)"></i> switch a tab</span>
+      <span><i class="dot" style="background:var(--old)"></i> open a bottleneck</span>
+      <span><i class="dot" style="background:var(--survivor)"></i> chosen option</span>
+      <span><i class="dot" style="background:var(--warn)"></i> failure / risk</span>
+      <span><i class="dot" style="background:var(--gc)"></i> fix / mitigation</span>
+    </div>
+  </header>
+
+  <!-- A · SCALING STRATEGY -->
+  <section>
+    <div class="sec-h"><span class="n">A</span><h2>Scaling strategy</h2><span class="tag">what to lock &amp; when to shard</span></div>
+    <div class="grid g3">
+      <div class="card"><div class="kicker">service tier</div><h3>Facade, one lot</h3><p class="muted"><code>ParkingService</code> orchestrates entry/exit for a single physical lot. Real throughput ceiling is the <b>gate hardware</b> (~1 car / 3–5 s per gate), not the JVM — so vertical scale on one node is plenty for one lot.</p></div>
+      <div class="card"><div class="kicker">availability reads</div><h3>Off the write path</h3><p class="muted"><code>AvailabilityService</code> serves counts from in-memory state; the multi-lot central dashboard reads a Redis aggregate / read-replica so heavy “where's a spot?” queries never contend with park/vacate.</p></div>
+      <div class="card"><div class="kicker">natural shard</div><h3>Partition by lot</h3><p class="muted">Each lot is <b>independent</b> — no cross-lot coordination to park a car. Sharding by <code>lotId</code> is a free partition boundary: 50 lots = 50 CP islands + one AP dashboard.</p></div>
+    </div>
+
+    <div data-tabscope style="margin-top:16px">
+      <div class="kicker">concurrency granularity — pick a locking strategy (the ladder you climb in the interview)</div>
+      <div class="tabs">
+        <button class="tab active" data-tab="global">synchronized service</button>
+        <button class="tab" data-tab="spot">per-spot lock</button>
+        <button class="tab" data-tab="cas">CAS (lock-free)</button>
+        <button class="tab" data-tab="db">DB row lock</button>
+      </div>
+
+      <div class="tabpanel active" data-panel="global">
+        <div class="grid g2">
+          <div class="card">
+            <h3>Coarse lock on <code>ParkingService</code></h3>
+            <p class="muted">One <code>synchronized</code> method serializes every park/unpark. The find-then-park sequence is atomic because only one thread is ever inside — trivially correct.</p>
+            <pre class="code"><span class="kw">public synchronized</span> ParkingTicket <span class="ty">parkVehicle</span>(Vehicle v) {
+  ParkingSpot spot = parkingStrategy.<span class="ty">findSpot</span>(v, lot.getFloors())
+      .orElseThrow(() -> <span class="kw">new</span> ParkingFullException());
+  spot.<span class="ty">park</span>(v);            <span class="cm">// only one thread here</span>
+  <span class="kw">return</span> ticketService.<span class="ty">issueTicket</span>(v, spot);
+}</pre>
+          </div>
+          <div class="card">
+            <div class="kicker">verdict — start here</div>
+            <ul class="tight">
+              <li><b>Simplest</b> — no race conditions, easy to reason about. Ideal interview opener / demo.</li>
+              <li><span style="color:var(--warn)">Whole lot is locked per operation:</span> Gate 2 waits while Gate 1 parks → throughput ceiling at peak.</li>
+              <li>Fine for a single-entrance, low-traffic lot.</li>
+            </ul>
+          </div>
+        </div>
+      </div>
+
+      <div class="tabpanel" data-panel="spot">
+        <div class="grid g2">
+          <div class="card">
+            <h3>Fine-grained lock per <code>ParkingSpot</code> <span class="run">← chosen for a real lot</span></h3>
+            <p class="muted">Each spot owns its lock. <code>park()</code> is an atomic check-and-set; the strategy walks spots and stops at the first that accepts. Cars on different floors never block each other.</p>
+            <pre class="code"><span class="kw">public synchronized boolean</span> <span class="ty">park</span>(Vehicle v) {  <span class="cm">// lock THIS spot</span>
+  <span class="kw">if</span> (this.vehicle != <span class="kw">null</span>) <span class="kw">return false</span>;   <span class="cm">// taken → try next</span>
+  <span class="kw">if</span> (!canFitVehicle(v)) <span class="kw">return false</span>;
+  this.vehicle = v; <span class="kw">return true</span>;
+}</pre>
+          </div>
+          <div class="card">
+            <div class="kicker">verdict</div>
+            <ul class="tight">
+              <li><b>Higher throughput</b> — parallelism scales with the number of gates / free spots.</li>
+              <li>Two cars racing for the same spot: first wins, second gets <code>false</code> and the strategy retries the next spot.</li>
+              <li><span style="color:var(--warn)">Retry loop</span> for “spot taken, try next”; risk of livelock only under extreme contention.</li>
+            </ul>
+          </div>
+        </div>
+      </div>
+
+      <div class="tabpanel" data-panel="cas">
+        <div class="grid g2">
+          <div class="card">
+            <h3>Optimistic CAS on status</h3>
+            <p class="muted">Hold status in an <code>AtomicReference&lt;SpotStatus&gt;</code>. A single compare-and-swap flips <code>AVAILABLE → OCCUPIED</code>; only the winner mutates the spot. No blocking, no monitor.</p>
+            <pre class="code"><span class="kw">boolean</span> parked = status.<span class="ty">compareAndSet</span>(
+    SpotStatus.AVAILABLE, SpotStatus.OCCUPIED);
+<span class="kw">if</span> (parked) this.vehicle = v;
+<span class="kw">return</span> parked;   <span class="cm">// lock-free, nanosecond scale</span></pre>
+          </div>
+          <div class="card">
+            <div class="kicker">verdict</div>
+            <ul class="tight">
+              <li><b>Maximum throughput</b>, non-blocking — good for a very high-traffic lot with many gates.</li>
+              <li><span style="color:var(--warn)">CAS retry loop</span> under high contention on the <i>same</i> spot; correctness is harder to reason about.</li>
+              <li>Often over-engineering for a lot bounded by physical gate speed.</li>
+            </ul>
+          </div>
+        </div>
+      </div>
+
+      <div class="tabpanel" data-panel="db">
+        <div class="grid g2">
+          <div class="card">
+            <h3>Database <code>SELECT … FOR UPDATE</code></h3>
+            <p class="muted">When the lot runs multiple app instances, JVM locks no longer coordinate. Push the lock into Postgres: row-level lock on the chosen spot, plus a partial <code>UNIQUE</code> index as a hard backstop against double-booking.</p>
+            <pre class="code"><span class="kw">BEGIN</span>;
+  <span class="kw">SELECT</span> * <span class="kw">FROM</span> parking_spot
+   <span class="kw">WHERE</span> status=<span class="st">'AVAILABLE'</span> <span class="kw">AND</span> spot_type=<span class="st">'COMPACT'</span>
+   <span class="kw">ORDER BY</span> floor_number, spot_number <span class="kw">LIMIT</span> <span class="st">1</span>
+   <span class="kw">FOR UPDATE</span>;                       <span class="cm">// row lock</span>
+  <span class="kw">UPDATE</span> parking_spot <span class="kw">SET</span> status=<span class="st">'OCCUPIED'</span> …;
+<span class="kw">COMMIT</span>;</pre>
+          </div>
+          <div class="card">
+            <div class="kicker">verdict — production</div>
+            <ul class="tight">
+              <li><b>Survives restarts</b> and works across many app instances — the DB is the source of truth.</li>
+              <li><span style="color:var(--warn)">Extra latency</span> (a DB round-trip) and you must handle deadlocks.</li>
+              <li>Same <code>TicketRepository</code> / <code>SpotRepository</code> interface — swapping in-memory → Postgres is one class.</li>
+            </ul>
+          </div>
+        </div>
+      </div>
+
+      <div class="callout tip"><b>Don't reach for a distributed lock (Redis <code>SETNX</code>) on a single lot:</b> every thread is in one JVM, so <code>synchronized</code> / <code>AtomicReference</code> is faster (ns vs ms), simpler, and dependency-free. Redis locks earn their keep only across multiple instances.</div>
+    </div>
+  </section>
+
+  <!-- B · CACHING DEEP-DIVE -->
+  <section>
+    <div class="sec-h"><span class="n">B</span><h2>Caching deep-dive</h2><span class="tag">the state IS the cache</span></div>
+    <div class="grid g2">
+      <div class="card">
+        <div class="kicker">core insight — no cache-aside for one lot</div>
+        <pre class="code"><span class="cm">// 5,000-spot mega-lot ≈ 500 KB of heap</span>
+Floor.spots : List&lt;ParkingSpot&gt;   <span class="cm">// source of truth</span>
+  ├─ park(v)  → status = OCCUPIED  <span class="cm">// immediate, atomic</span>
+  └─ vacate() → status = AVAILABLE <span class="cm">// no TTL, no stale copy</span></pre>
+        <p class="muted">There is <b>no cache-invalidation problem</b> because there is no separate cache — the in-memory structure is both store and cache. Availability is a live <code>stream().filter(isAvailable).count()</code>, not a snapshot.</p>
+      </div>
+      <div class="card">
+        <div class="kicker">ticket &amp; pricing — HashMap, not Redis</div>
+        <pre class="code"><span class="cm">// InMemoryTicketRepository</span>
+Map&lt;String,ParkingTicket&gt; active
+    = <span class="kw">new</span> ConcurrentHashMap&lt;&gt;();  <span class="cm">// ~500–2000 live, ~400 KB</span>
+
+<span class="cm">// HourlyPricingStrategy — rates cached at construction</span>
+Map&lt;SpotType,BigDecimal&gt; rates = Map.copyOf(cfg); <span class="cm">// immutable</span></pre>
+        <p class="muted">Tickets are written once on entry, read once on exit — a textbook HashMap by <code>ticketId</code>. Pricing rules change quarterly, so they're loaded once at startup (<code>AppConfig</code>) and swapped atomically on reload.</p>
+      </div>
+    </div>
+
+    <div class="grid g3" style="margin-top:14px">
+      <div class="card">
+        <div class="kicker">display board — push</div>
+        <h3>Observer refresh</h3>
+        <p class="muted">On every park/vacate, <code>ParkingService</code> notifies observers so the LED board re-renders in real time — no polling latency on the happy path.</p>
+        <pre class="code">parkVehicle()
+  └─ spot.park(v)
+       └─ notifyObservers()
+            → DisplayBoard.update(lot)
+              <span class="cm">// Floor 1: Cars 8/50 …</span></pre>
+      </div>
+      <div class="card">
+        <div class="kicker">display board — fallback</div>
+        <h3>5-second poll</h3>
+        <p class="muted">A missed Observer event would leave a stale board. A heartbeat poll re-reads live state every 5 s, so the board always self-heals. Push for latency, poll for resilience.</p>
+        <pre class="code"><span class="kw">while</span> (true) {
+  board.<span class="ty">update</span>(lot);   <span class="cm">// fresh in-mem read</span>
+  Thread.<span class="ty">sleep</span>(5_000);
+}</pre>
+      </div>
+      <div class="card">
+        <div class="kicker">when caching DOES matter</div>
+        <h3>Multi-lot Redis</h3>
+        <p class="muted">Only when the interviewer says “50 lots across a city”: each lot stays in-memory, but a Redis aggregate holds per-lot counts with a 30 s TTL for the mobile app / dashboard.</p>
+        <pre class="code"><span class="kw">SET</span> lot:A:available 41
+  <span class="cm">// TTL 30s, eventual</span>
+<span class="cm">// fed by a Kafka/SNS event</span>
+<span class="cm">// on every park/vacate</span></pre>
+      </div>
+    </div>
+    <div class="callout tip"><b>Layer map:</b> single lot → JVM heap only (strong). Multi-lot → local heap (strong) + Redis aggregate (30 s TTL, eventual) + HTTP cache headers (~10 s) + CDN/push for the mobile app. Spend zero interview time on Redis for one lot — spend it all on thread-safe spot assignment. <span class="run">→ full layering on canvas 1 · HLD</span></div>
+  </section>
+
+  <!-- C · BOTTLENECKS & SOLUTIONS -->
+  <section>
+    <div class="sec-h"><span class="n">C</span><h2>Bottlenecks &amp; solutions</h2><span class="tag">click a card to open</span></div>
+    <div class="grid" style="gap:10px">
+
+      <div class="card collapsible open">
+        <div class="c-head"><h3>Double-booking race (the core problem)</h3></div>
+        <div class="c-body">
+          <p><b style="color:var(--warn)">Impact:</b> two cars at two gates both call <code>findSpot()</code>, both get spot #42 as AVAILABLE, both call <code>park()</code> → one spot, two vehicles, data corruption.</p>
+          <p><b style="color:var(--gc)">Fix:</b> make check-and-set atomic — <code>synchronized</code> <code>park()</code> per spot (or CAS on status). The loser sees <code>false</code> and the strategy assigns the next free spot. In multi-instance production, a partial <code>UNIQUE (spot_id) WHERE status='OCCUPIED'</code> index is the hard backstop.</p>
+        </div>
+      </div>
+
+      <div class="card collapsible">
+        <div class="c-head"><h3>Coarse lock throughput ceiling</h3></div>
+        <div class="c-body">
+          <p><b style="color:var(--warn)">Impact:</b> a single <code>synchronized</code> on <code>ParkingService</code> serializes the whole lot — Gate 2 blocks while Gate 1 parks, capping peak-hour throughput.</p>
+          <p><b style="color:var(--gc)">Fix:</b> drop to per-spot locking so parallelism scales with free spots and gates; a 500-spot lot can service 500 concurrent <code>tryPark()</code> calls on distinct spots. Reserve CAS for the highest-contention lots.</p>
+        </div>
+      </div>
+
+      <div class="card collapsible">
+        <div class="c-head"><h3>Deadlock when a bus needs 3 spots</h3></div>
+        <div class="c-body">
+          <p><b style="color:var(--warn)">Impact:</b> locking multiple spots for a <code>Bus</code> (consecutive large spots) in arbitrary order can create a circular wait between two threads.</p>
+          <p><b style="color:var(--gc)">Fix:</b> a single-spot design has no circular dependency. When multiple locks are unavoidable, acquire them in a <b>fixed global order</b> (by spot ID) so no cycle can form.</p>
+        </div>
+      </div>
+
+      <div class="card collapsible">
+        <div class="c-head"><h3>Display board misses an event</h3></div>
+        <div class="c-body">
+          <p><b style="color:var(--warn)">Impact:</b> a dropped Observer notification leaves the LED board showing a stale count — a driver circles a “free” floor that's full.</p>
+          <p><b style="color:var(--gc)">Fix:</b> hybrid push + poll — Observer for real-time updates, plus a 5-second heartbeat poll that re-reads live in-memory state and catches any missed event.</p>
+        </div>
+      </div>
+
+      <div class="card collapsible">
+        <div class="c-head"><h3>Crash mid-parking</h3></div>
+        <div class="c-body">
+          <p><b style="color:var(--warn)">Impact:</b> the app crashes after <code>findSpot()</code> but before <code>issueTicket()</code> — in the in-memory demo the spot may be marked occupied with no ticket, a leaked reservation.</p>
+          <p><b style="color:var(--gc)">Fix:</b> make the DB the source of truth — park + issue-ticket in one transaction, so a crash rolls back and the spot reverts to AVAILABLE. On restart, reload spot state from the DB (or re-sync from sensors).</p>
+        </div>
+      </div>
+
+      <div class="card collapsible">
+        <div class="c-head"><h3>Payment / gate hardware slowness</h3></div>
+        <div class="c-body">
+          <p><b style="color:var(--warn)">Impact:</b> a slow Stripe call or a stuck barrier at exit holds the driver — and if it also held the spot lock, it would stall the whole exit lane.</p>
+          <p><b style="color:var(--gc)">Fix:</b> keep <code>PaymentProcessor</code> behind a Strategy interface with timeouts/retries; don't hold a spot lock across the external call — compute fee, charge, then <code>vacate()</code>. The real throughput bound is the physical gate (~1 car / 3–5 s), not software.</p>
+        </div>
+      </div>
+
+      <div class="card collapsible">
+        <div class="c-head"><h3>Multi-lot dashboard staleness</h3></div>
+        <div class="c-body">
+          <p><b style="color:var(--warn)">Impact:</b> across 50 lots, a central dashboard that tried to be strongly consistent would need cross-lot coordination on every park — killing availability for a number that doesn't need to be exact.</p>
+          <p><b style="color:var(--gc)">Fix:</b> accept eventual consistency at the dashboard — Redis aggregate with a 30 s TTL, fed by per-lot park/vacate events over Kafka/SNS. Each lot stays CP for its own spots; the aggregate is AP. Stale “42 vs 41” is fine.</p>
+        </div>
+      </div>
+
+    </div>
+  </section>
+
+  <!-- D · CAP & CONSISTENCY -->
+  <section>
+    <div class="sec-h"><span class="n">D</span><h2>CAP &amp; consistency — why CP</h2><span class="tag">one spot, one car</span></div>
+    <div class="grid g2">
+      <div class="card">
+        <div class="kicker">the choice</div>
+        <p class="muted">A single lot on a local DB has <b>no network partitions</b> — gate controllers, sensors, terminals and boards share a LAN. So CAP's real lesson here is the A-vs-C tradeoff, and consistency wins: you can <b>never double-book a spot</b>. A 1–2 s wait at the gate is acceptable; a collision is not.</p>
+        <ul class="tight">
+          <li><b>CP:</b> two cars, one spot → one parks, the other waits ~1 s, never both.</li>
+          <li>Gate-sensor fault → stay closed rather than admit an untracked car (revenue &amp; safety).</li>
+          <li>The real challenge is <b>concurrency</b>, not partitions — locks, not quorums.</li>
+        </ul>
+      </div>
+      <div class="card">
+        <div class="kicker">where it becomes distributed (50 lots)</div>
+        <pre class="code"><span class="cm">// each lot = an independent CP island</span>
+Lot A (local DB, CP)  Lot B (CP)  Lot C (CP)
+        └──────── events ─────────┘
+              ▼
+Central dashboard (AP)  <span class="cm">// Redis, read replicas</span>
+  "Lot A: 42  Lot B: 15"  <span class="cm">// stale ≤30s = fine</span></pre>
+        <p class="muted">Lots don't coordinate to park a car, so <code>lotId</code> is a natural partition boundary. The dashboard and mobile app go <b>AP</b> (stale counts OK); a <b>cross-lot reservation</b> flips back to CP because a promised spot must be guaranteed.</p>
+      </div>
+    </div>
+    <div class="callout tip"><b>Read-your-own-state:</b> because a single lot's in-memory structure is the source of truth and every mutation is atomic, a park is visible immediately — no propagation lag, no read-repair. Consistency is a lock, not a replication setting.</div>
+    <table style="margin-top:12px">
+      <thead><tr><th>Operation / component</th><th>CAP choice</th><th>Reasoning</th></tr></thead>
+      <tbody>
+        <tr><td>Park a car (single lot)</td><td>CP</td><td>Cannot double-book — atomic check-and-set</td></tr>
+        <tr><td>Gate / sensor fault</td><td>CP</td><td>Fail closed; no untracked entry</td></tr>
+        <tr><td>Central dashboard count</td><td>AP</td><td>Stale “42 vs 41” is acceptable</td></tr>
+        <tr><td>Mobile “spots available” badge</td><td>AP</td><td>Can be ~30 s old</td></tr>
+        <tr><td>Cross-lot reservation</td><td>CP</td><td>A promised spot must be guaranteed</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <!-- E · TRADE-OFFS SUMMARY -->
+  <section>
+    <div class="sec-h"><span class="n">E</span><h2>Trade-offs summary</h2><span class="tag">decision · chosen · alternative · why</span></div>
+    <table>
+      <thead><tr><th>Decision</th><th>Chosen</th><th>Alternative</th><th>Why this choice</th></tr></thead>
+      <tbody>
+        <tr><td>Consistency model</td><td><b style="color:var(--survivor)">CP · strong</b></td><td>AP / eventual</td><td>One spot = one car; a 1 s wait beats a collision</td></tr>
+        <tr><td>Concurrency control</td><td><b style="color:var(--survivor)">synchronized per spot</b></td><td>global lock / CAS / DB lock</td><td>Parallel across floors, no double-booking, easy to reason about</td></tr>
+        <tr><td>Distributed lock</td><td><b style="color:var(--survivor)">none (in-JVM)</b></td><td>Redis SETNX</td><td>Single JVM → ns-scale locks, no external dependency</td></tr>
+        <tr><td>Caching</td><td><b style="color:var(--survivor)">in-memory state is the cache</b></td><td>Redis / Memcached</td><td>≤1 MB heap, source of truth, zero invalidation</td></tr>
+        <tr><td>Ticket store</td><td><b style="color:var(--survivor)">ConcurrentHashMap</b></td><td>Redis</td><td>~2K live tickets, exact-match by id — HashMap is enough</td></tr>
+        <tr><td>Persistence (production)</td><td><b style="color:var(--survivor)">PostgreSQL</b></td><td>NoSQL</td><td>ACID, FK relations, UNIQUE constraint, SQL reporting</td></tr>
+        <tr><td>Spot selection</td><td><b style="color:var(--survivor)">Strategy pattern</b></td><td>hardcoded if/else</td><td>Swap Nearest-first / Compact-floor without touching pricing</td></tr>
+        <tr><td>Pricing &amp; payment</td><td><b style="color:var(--survivor)">Strategy interfaces</b></td><td>inline logic</td><td>Each axis varies independently; add a method with one class</td></tr>
+        <tr><td>Display refresh</td><td><b style="color:var(--survivor)">Observer push + 5 s poll</b></td><td>push-only / poll-only</td><td>Real-time and resilient to missed events</td></tr>
+        <tr><td>Multi-lot dashboard</td><td><b style="color:var(--survivor)">Redis aggregate (30 s TTL)</b></td><td>strong cross-lot sync</td><td>Stale counts fine; lots stay independent CP islands</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <!-- F · INTERVIEW WALKTHROUGH -->
+  <section>
+    <div class="sec-h"><span class="n">F</span><h2>Interview walkthrough — timing strip</h2><span class="tag">35–40 min · LLD</span></div>
+    <div class="flow">
+      <div class="step eden"><div class="box">Clarify</div><small>P1 · 2–3 min<br>types · floors · pricing · concurrency</small></div>
+      <div class="step surv"><div class="box">Core entities</div><small>P2 · 5–7 min<br>Vehicle &amp; Spot hierarchies</small></div>
+      <div class="step eden"><div class="box">Floor + Lot</div><small>P3 · 3–4 min<br>Singleton lot</small></div>
+      <div class="step surv"><div class="box">Strategies</div><small>P4 · 5–7 min<br>park · price · pay</small></div>
+      <div class="step old"><div class="box">Facade + flow</div><small>P5–6 · service · entry/exit</small></div>
+      <div class="step dead"><div class="box">Concurrency + SOLID</div><small>P7–8 · synchronized · principles</small></div>
+    </div>
+    <div class="grid g2" style="margin-top:14px">
+      <div class="card">
+        <div class="kicker">phase-by-phase</div>
+        <ul class="tight">
+          <li><b>P1 Clarify (2–3):</b> vehicle types (car/motorcycle/bus), floors &amp; spots, pricing model, payment methods, display board, multiple gates, reservations vs walk-in.</li>
+          <li><b>P2 Core entities (5–7 · START HERE):</b> abstract <code>Vehicle</code> and abstract <code>ParkingSpot</code> (Compact/Large/Motorcycle/Handicapped); <code>canFitVehicle()</code> as a Template Method — say <b>why abstract class over interface</b> (shared state).</li>
+          <li><b>P3 Floor + Lot (3–4):</b> <code>ParkingFloor</code> holds spots + board; <code>ParkingLot</code> Singleton (one physical lot) — note DI is often preferred but Singleton maps to reality here.</li>
+          <li><b>P4 Strategies (5–7 · PATTERN MASTERY):</b> <code>ParkingStrategy</code>, <code>PricingStrategy</code>, <code>PaymentProcessor</code> — “Strategy in three places because each axis varies independently.”</li>
+        </ul>
+      </div>
+      <div class="card">
+        <div class="kicker">…and finish strong</div>
+        <ul class="tight">
+          <li><b>P5 Facade (3–4):</b> <code>ParkingService.parkVehicle / unparkVehicle</code> orchestrates find → park → ticket → notify; one entry point for gate, panel, or app.</li>
+          <li><b>P6 Ticketing flow (3–4):</b> entry (scan → find spot → <code>park()</code> → ticket → gate) and exit (ticket → fee → pay → <code>vacate()</code> → gate).</li>
+          <li><b>P7 Concurrency (2–3 · unprompted wins):</b> <code>synchronized park()</code> — two cars, same spot, first wins, strategy retries; follow-up: <code>ReentrantLock.tryLock()</code> or optimistic version field on a DB.</li>
+          <li><b>P8 SOLID (2–3 · if time):</b> one concrete example each — OCP: add <code>EVChargingSpot</code> with zero edits; DIP: service depends on strategy interfaces.</li>
+        </ul>
+      </div>
+    </div>
+    <div class="callout tip"><b>Green flags:</b> clean abstract hierarchies · Strategy with “each axis varies independently” · explain abstract-class-vs-interface · raise thread safety unprompted · Template Method for <code>canFitVehicle()</code> · Observer for the board. <b>Red flags:</b> one giant <code>ParkingLot</code> class · <code>switch(vehicleType)</code> instead of polymorphism · hardcoded pricing · ignoring concurrency · everything public · schema before classes.</div>
+  </section>
+
+  <!-- GLOSSARY -->
+  <section>
+    <div class="sec-h"><span class="n">§</span><h2>Glossary — one-liners</h2><span class="tag">terms used above</span></div>
+    <div class="grid g2">
+      <div class="card"><table><tbody>
+        <tr><td><b>CP (CAP)</b></td><td>favour Consistency + Partition-tolerance over Availability — never double-book</td></tr>
+        <tr><td><b>Pessimistic lock</b></td><td><code>synchronized</code> — acquire the lock before touching the spot</td></tr>
+        <tr><td><b>Fine-grained lock</b></td><td>one lock per spot so different spots proceed in parallel</td></tr>
+        <tr><td><b>CAS / optimistic lock</b></td><td>compare-and-swap status atomically, no blocking</td></tr>
+        <tr><td><b>SELECT … FOR UPDATE</b></td><td>row-level DB lock for multi-instance deployments</td></tr>
+        <tr><td><b>Partial UNIQUE index</b></td><td><code>UNIQUE (spot_id) WHERE status='OCCUPIED'</code> — DB backstop vs double-booking</td></tr>
+      </tbody></table></div>
+      <div class="card"><table><tbody>
+        <tr><td><b>Template Method</b></td><td><code>canFitVehicle()</code> — base defines flow, subclass overrides the check</td></tr>
+        <tr><td><b>Strategy pattern</b></td><td>swap spot-selection / pricing / payment without touching the rest</td></tr>
+        <tr><td><b>Facade</b></td><td><code>ParkingService</code> — one method hides all orchestration</td></tr>
+        <tr><td><b>Observer</b></td><td>push availability changes to the display board on park/vacate</td></tr>
+        <tr><td><b>Livelock</b></td><td>threads keep retrying “spot taken” and make no progress under contention</td></tr>
+        <tr><td><b>Natural shard</b></td><td>independent lots partitioned by <code>lotId</code> — no cross-lot coordination</td></tr>
+      </tbody></table></div>
+    </div>
+  </section>
+
+  <footer>
+    <p>Use case 06 · Parking Lot — Canvas 3 of 3 (Deep-dive &amp; Trade-offs). Grounded in <code>06-parking-lot/docs/tradeoffs · caching · tech</code> and <code>revision/INTERVIEW_WALKTHROUGH.md</code>.</p>
+    <p class="run">This use case: <a href="hld.html">06a · HLD</a> · <a href="lld.html">06b · LLD</a> · Deep-dive &nbsp;|&nbsp; Next → <a href="../07-distributed-cache/hld.html">07 · Distributed Cache — HLD</a></p>
+  </footer>
+
+</div>
+<script src="../assets/canvas.js"></script>
+</body>
+</html>

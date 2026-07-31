@@ -1,0 +1,356 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>07 · Distributed Cache — Deep-dive &amp; Trade-offs</title>
+<link rel="stylesheet" href="../assets/canvas.css">
+</head>
+<body>
+<div class="wrap">
+
+  <header class="hero">
+    <h1>Distributed Cache — Deep-dive &amp; Trade-offs</h1>
+    <div class="sub">Use case 07 · Canvas 3 of 3. The hard parts: how to <b>shard &amp; replicate</b> the cache tier, the <b>caching patterns</b> that decide 100 ns vs 10 ms, the <b>bottlenecks</b> that melt the DB (and their fixes), why a cache is an <b>AP · PA/EL</b> system, and a phase-by-phase <b>interview walkthrough</b>. <b>Switch the sharding tabs</b> and <b>open the bottleneck cards</b> to explore.</div>
+    <div class="badges">
+      <span class="badge lvl">Use case 07 · Deep-dive</span>
+      <span class="badge">Canvas 3 of 3</span>
+      <span class="badge">interactive</span>
+      <span class="badge">AP · PA/EL · eventual</span>
+    </div>
+    <div class="legend">
+      <span><i class="dot" style="background:var(--eden)"></i> switch a tab</span>
+      <span><i class="dot" style="background:var(--old)"></i> open a bottleneck</span>
+      <span><i class="dot" style="background:var(--survivor)"></i> chosen option</span>
+      <span><i class="dot" style="background:var(--warn)"></i> failure / risk</span>
+      <span><i class="dot" style="background:var(--gc)"></i> fix / mitigation</span>
+    </div>
+  </header>
+
+  <!-- A · SCALING STRATEGY -->
+  <section>
+    <div class="sec-h"><span class="n">A</span><h2>Scaling strategy</h2><span class="tag">how to shard &amp; replicate the cache</span></div>
+    <div class="grid g3">
+      <div class="card"><div class="kicker">app tier · L1</div><h3>Stateless + local Caffeine</h3><p class="muted">App servers are stateless behind the LB. Each carries an in-process <b>L1</b> (Caffeine / ConcurrentHashMap, ~10K entries, 10–30 s TTL) that absorbs 50–80% of hot-key reads with no network hop (~100 ns vs ~1 ms).</p></div>
+      <div class="card"><div class="kicker">L2 · horizontal</div><h3>Add cache nodes</h3><p class="muted">Grow the distributed L2 past one node's RAM by adding cache nodes. Keys are spread by a hashing strategy so any app server routes a key to the same node. A 32 GB node at ~600 B/entry holds ~40 M entries.</p></div>
+      <div class="card"><div class="kicker">replicas · HA</div><h3>Async primary → replica</h3><p class="muted">Each master has ≥1 replica fed by <b>async</b> replication (~1 ms writes). On master failure the replica promotes (Sentinel / Cluster). Replicas also serve reads to shave hot-key load off the primary.</p></div>
+    </div>
+
+    <div data-tabscope style="margin-top:16px">
+      <div class="kicker">key distribution — pick a partition strategy</div>
+      <div class="tabs">
+        <button class="tab active" data-tab="mod">Modulo hashing</button>
+        <button class="tab" data-tab="chash">Consistent hashing</button>
+        <button class="tab" data-tab="slots">Redis hash slots</button>
+      </div>
+
+      <div class="tabpanel active" data-panel="mod">
+        <div class="grid g2">
+          <div class="card">
+            <h3>Modulo hashing</h3>
+            <p class="muted">Route each key by <code>hash(key) % N</code> where <code>N</code> is the node count. Trivial to reason about and evenly spread while <code>N</code> is fixed.</p>
+            <pre class="code">node = <span class="ty">hash</span>(key) % N   <span class="cm">// fine — until N changes</span></pre>
+          </div>
+          <div class="card">
+            <div class="kicker">verdict — avoid at scale</div>
+            <ul class="tight">
+              <li><span style="color:var(--warn)">Reshard storm:</span> add/remove one node and <code>% N</code> changes for almost every key.</li>
+              <li>3→4 nodes remaps <b>~75%</b> of keys; 99→100 remaps ~99% — a cluster-wide miss storm that stampedes the DB.</li>
+              <li>Only safe for a fixed-size, never-resized cluster.</li>
+            </ul>
+          </div>
+        </div>
+      </div>
+
+      <div class="tabpanel" data-panel="chash">
+        <div class="grid g2">
+          <div class="card">
+            <h3>Consistent hashing <span class="run">← chosen</span></h3>
+            <p class="muted">Nodes and keys map onto a hash ring (a <code>TreeMap&lt;Long,Node&gt;</code>). To place a key, hash it and walk clockwise to the first node. Adding/removing a node only remaps the keys in that node's arc.</p>
+            <pre class="code"><span class="cm">// only ~1/N keys move when a node joins/leaves</span>
+node = ring.<span class="ty">ceilingEntry</span>( <span class="ty">MD5</span>(key) )
+       ?: ring.firstEntry()   <span class="cm">// wrap around</span></pre>
+          </div>
+          <div class="card">
+            <div class="kicker">verdict</div>
+            <ul class="tight">
+              <li><b>Elastic:</b> 3→4 nodes moves only <b>~25%</b> of keys (K/N) — not 75%.</li>
+              <li><b>Virtual nodes</b> (~150 per physical) smooth the ring: variance drops from ~40% at 3 vnodes to ~5% at 150.</li>
+              <li><b>MD5</b>, not <code>hashCode()</code> — uniform distribution even for similar node IDs.</li>
+              <li>Same key → same node also gives natural read-your-writes.</li>
+            </ul>
+          </div>
+        </div>
+      </div>
+
+      <div class="tabpanel" data-panel="slots">
+        <div class="grid g2">
+          <div class="card">
+            <h3>Redis Cluster hash slots</h3>
+            <p class="muted">Redis fixes the ring at <b>16384 slots</b>: <code>CRC16(key) % 16384</code> → a slot, and slots are assigned to masters. Clients cache the slot→node map and follow <code>-MOVED</code> redirects when topology changes.</p>
+            <pre class="code">slot = <span class="ty">CRC16</span>(key) % 16384   <span class="cm">// e.g. slot 7629 → Master B</span></pre>
+          </div>
+          <div class="card">
+            <div class="kicker">verdict — the production form</div>
+            <ul class="tight">
+              <li>A fixed slot count makes rebalancing = <b>move slots</b>, not rehash keys.</li>
+              <li>Automatic failover: a replica promotes on master loss.</li>
+              <li>Effectively consistent hashing with a fixed 16384-point ring — the model to name in an interview.</li>
+            </ul>
+          </div>
+        </div>
+      </div>
+
+      <div class="callout tip"><b>Eviction under memory pressure:</b> cap each node at ~75% of RAM, then evict by policy — <b>LRU</b> (temporal locality: sessions, recent views), <b>LFU</b> (frequency locality: hot config, popular items), or <b>volatile-TTL</b>. Watch eviction rate &gt; 5% and hit rate &lt; 80% as the "cache too small" signals.</div>
+    </div>
+  </section>
+
+  <!-- B · CACHING DEEP-DIVE -->
+  <section>
+    <div class="sec-h"><span class="n">B</span><h2>Caching deep-dive</h2><span class="tag">100 ns vs 10 ms lives here</span></div>
+    <div class="grid g2">
+      <div class="card">
+        <div class="kicker">cache-aside — the default read path</div>
+        <pre class="code"><span class="kw">GET</span> key <span class="kw">from</span> L1 (Caffeine)
+  ├─ HIT  → return                      <span class="cm">// ~100 ns, no network</span>
+  └─ MISS → GET from L2 (Redis)
+             ├─ HIT  → promote to L1 → return   <span class="cm">// ~1 ms</span>
+             └─ MISS → read DB → SETEX L2 → L1   <span class="cm">// ~10 ms, self-heals</span></pre>
+        <p class="muted">The application owns cache + DB independently; the cache never talks to the DB. Cache failure degrades gracefully to a DB read. First access to a key is a miss that backfills every layer.</p>
+      </div>
+      <div class="card">
+        <div class="kicker">write patterns — pick per data shape</div>
+        <pre class="code"><span class="kw">cache-aside</span>  write DB → <span class="ty">invalidate</span> cache   <span class="cm">// default; avoids races</span>
+<span class="kw">write-through</span> write cache + DB sync         <span class="cm">// strong, 2× latency</span>
+<span class="kw">write-behind</span>  write cache, async flush DB    <span class="cm">// fastest, data-loss risk</span></pre>
+        <p class="muted">On update we <b>invalidate</b> (delete) rather than rewrite the cache — deleting sidesteps the write-write race. Write-through when consistency matters and reads dominate; write-behind only when write latency must be near-zero and loss is tolerable.</p>
+      </div>
+    </div>
+
+    <div class="grid g3" style="margin-top:14px">
+      <div class="card">
+        <div class="kicker">hot-key problem</div>
+        <h3>L1 + key replication</h3>
+        <p class="muted">A celebrity key at 100K req/s saturates its one node while others idle. Per-server <b>L1</b> absorbs the spike; for extreme cases <b>replicate</b> the key to all nodes and read a random one, or <b>shard</b> the key with a random suffix.</p>
+        <pre class="code">Caffeine.newBuilder()
+  .maximumSize(<span class="st">10_000</span>)
+  .expireAfterWrite(<span class="st">10</span>, SECONDS);</pre>
+      </div>
+      <div class="card">
+        <div class="kicker">thundering herd</div>
+        <h3>Singleflight lock</h3>
+        <p class="muted">When a hot key expires, hundreds of misses fire identical DB queries. First request grabs a per-key lock (or Redis <code>SETNX</code>), fetches once, backfills; the rest wait and re-read the cache.</p>
+        <pre class="code"><span class="cm">// only one DB call per expiry</span>
+ok = redis.<span class="ty">setnx</span>(<span class="st">"lock:"</span>+key, <span class="st">1</span>, EX 10)
+  ok  → load DB, put cache, del lock
+  !ok → sleep 50ms, re-GET cache</pre>
+      </div>
+      <div class="card">
+        <div class="kicker">cache warming</div>
+        <h3>Preload top keys</h3>
+        <p class="muted">A fresh/empty cluster sends 100% traffic to the DB. Before cutting over, bulk-load the top ~10K keys by access count, then shift traffic gradually (or shadow reads to the new cluster).</p>
+        <pre class="code"><span class="kw">SELECT</span> key <span class="kw">FROM</span> hot_keys
+<span class="kw">ORDER BY</span> access_count <span class="kw">DESC</span>
+<span class="kw">LIMIT</span> <span class="st">10000</span>;   <span class="cm">// MSET into L2</span></pre>
+      </div>
+    </div>
+    <div class="callout tip"><b>Multi-layer:</b> L1 Caffeine (~100 ns) → L2 Redis Cluster (~1 ms) → Database (~10 ms). Each layer catches a tier of traffic; keep L1 TTL short (10–30 s) so cross-server staleness is bounded, or push Redis Pub/Sub invalidations to L1. <span class="run">→ full layering on canvas 1 · HLD</span></div>
+  </section>
+
+  <!-- C · BOTTLENECKS & SOLUTIONS -->
+  <section>
+    <div class="sec-h"><span class="n">C</span><h2>Bottlenecks &amp; solutions</h2><span class="tag">click a card to open</span></div>
+    <div class="grid" style="gap:10px">
+
+      <div class="card collapsible open">
+        <div class="c-head"><h3>Thundering herd (cache stampede)</h3></div>
+        <div class="c-body">
+          <p><b style="color:var(--warn)">Impact:</b> a popular key expires and hundreds of concurrent misses fire identical queries at the DB in the same instant — timeouts and cascading failure (Facebook's 2010 Memcached outage).</p>
+          <p><b style="color:var(--gc)">Fix:</b> per-key mutex / singleflight so only one thread loads (others wait then read cache); Redis <code>SETNX</code> lease for cluster-wide dedupe; stale-while-revalidate; probabilistic early expiration; TTL jitter to desynchronize expiry.</p>
+        </div>
+      </div>
+
+      <div class="card collapsible">
+        <div class="c-head"><h3>Hot key (celebrity key)</h3></div>
+        <div class="c-body">
+          <p><b style="color:var(--warn)">Impact:</b> a single trending key routes 100K+ req/s to one node while its neighbours idle — the node hits 100% CPU and becomes the bottleneck.</p>
+          <p><b style="color:var(--gc)">Fix:</b> per-server L1 Caffeine (10–30 s TTL) absorbs most reads with zero network hop; replicate the hot key to all nodes and read a random one; or key-split with a random suffix (<code>key:0..9</code>) at the cost of write amplification. Detect proactively by counting per-key request rate.</p>
+        </div>
+      </div>
+
+      <div class="card collapsible">
+        <div class="c-head"><h3>Modulo-hash reshard storm</h3></div>
+        <div class="c-body">
+          <p><b style="color:var(--warn)">Impact:</b> with <code>hash(key) % N</code>, adding one node remaps ~75% of keys (3→4) — a near-total miss storm that dumps the whole cache's traffic onto the DB.</p>
+          <p><b style="color:var(--gc)">Fix:</b> consistent hashing with ~150 virtual nodes — only ~1/N keys move on rebalance. Redis Cluster's fixed 16384 slots achieve the same by migrating slots rather than rehashing keys.</p>
+        </div>
+      </div>
+
+      <div class="card collapsible">
+        <div class="c-head"><h3>Cache node failure</h3></div>
+        <div class="c-body">
+          <p><b style="color:var(--warn)">Impact:</b> a node dies; its keys are suddenly unreachable and every request for them misses.</p>
+          <p><b style="color:var(--gc)">Fix:</b> health check removes the node from the ring; its keys reroute to the next node clockwise (only K/N affected) and self-heal via cache-aside; an async replica serves reads during the transition and promotes to master. No data loss — the DB is the source of truth.</p>
+        </div>
+      </div>
+
+      <div class="card collapsible">
+        <div class="c-head"><h3>Split brain on partition</h3></div>
+        <div class="c-body">
+          <p><b style="color:var(--warn)">Impact:</b> a partition isolates a master; a replica is promoted, so two masters accept conflicting writes. When it heals, the old master's ~30 s of writes are lost — the AP trade-off.</p>
+          <p><b style="color:var(--gc)">Fix:</b> accept it (cache is not source of truth) and let <b>TTL expiration</b> converge both sides to the DB value. To lean toward CP for critical keys: <code>min-replicas-to-write 1</code> and <code>min-replicas-max-lag 10</code> so a master refuses writes without healthy replicas.</p>
+        </div>
+      </div>
+
+      <div class="card collapsible">
+        <div class="c-head"><h3>Cold-start stampede after deploy/restart</h3></div>
+        <div class="c-body">
+          <p><b style="color:var(--warn)">Impact:</b> a fresh cluster (or a recovered node with an empty cache) sends 100% of traffic to the DB — the DB melts before hit rate recovers.</p>
+          <p><b style="color:var(--gc)">Fix:</b> pre-warm the top ~10K keys from the DB before cutover; gradual/blue-green traffic shift (10% → 100%) or shadow reads to warm silently; Redis RDB+AOF restores prior state on restart.</p>
+        </div>
+      </div>
+
+      <div class="card collapsible">
+        <div class="c-head"><h3>Memory pressure &amp; eviction thrash</h3></div>
+        <div class="c-body">
+          <p><b style="color:var(--warn)">Impact:</b> the working set exceeds RAM; eviction rate climbs, hit rate falls, and the cache degrades into an expensive proxy for the DB.</p>
+          <p><b style="color:var(--gc)">Fix:</b> cap <code>maxmemory</code> at ~75% of RAM; choose the right policy (LRU/LFU/volatile-TTL); size for ~2× raw data on JVM caches; alert when eviction &gt; 5% or hit rate &lt; 80% — then scale nodes or trim TTLs. LFU pollution → decay/windowed LFU.</p>
+        </div>
+      </div>
+
+      <div class="card collapsible">
+        <div class="c-head"><h3>Stale L1 across servers</h3></div>
+        <div class="c-body">
+          <p><b style="color:var(--warn)">Impact:</b> server 1 updates L2, but server 2's in-process L1 still holds the old value until its TTL expires — users hit different app servers and see different data.</p>
+          <p><b style="color:var(--gc)">Fix:</b> keep L1 TTL short (5–30 s) so staleness is bounded; or broadcast a Redis Pub/Sub <code>invalidate:key</code> event that each server applies to its L1. Never use L1 for strong-consistency data.</p>
+        </div>
+      </div>
+
+    </div>
+  </section>
+
+  <!-- D · CAP & CONSISTENCY -->
+  <section>
+    <div class="sec-h"><span class="n">D</span><h2>CAP &amp; consistency — why AP</h2><span class="tag">stale is annoying; down is catastrophic</span></div>
+    <div class="grid g2">
+      <div class="card">
+        <div class="kicker">the choice</div>
+        <p class="muted"><b>P is mandatory</b> in any distributed deployment, so the real decision is A vs C during a partition. A cache is <b>not the source of truth</b> — the DB is. Serving a slightly stale value for a few seconds is an inconvenience; refusing to serve causes latency spikes and a DB stampede. So we pick <b>AP</b>.</p>
+        <ul class="tight">
+          <li><b>AP:</b> both sides of a partition keep serving; stale reads over errors.</li>
+          <li><b>PACELC → PA/EL:</b> partition → Availability; else → Latency. Fast reads always.</li>
+          <li><b>TTL is free conflict resolution:</b> after a partition heals, conflicting entries just expire and the next miss refetches the DB value — no vector clocks needed.</li>
+        </ul>
+      </div>
+      <div class="card">
+        <div class="kicker">tunable consistency &amp; convergence</div>
+        <pre class="code"><span class="cm">// default: async replication (AP, ~1 ms)</span>
+jedis.set(<span class="st">"user:1"</span>, v);
+
+<span class="cm">// WAIT moves toward CP for critical keys</span>
+jedis.set(<span class="st">"user:1"</span>, v);
+n = jedis.<span class="ty">wait</span>(1, 100);   <span class="cm">// ≥1 replica acked, 100 ms cap</span>
+
+<span class="cm">// quorum overlap: W + R &gt; N  (2 + 2 &gt; 3)</span></pre>
+        <p class="muted">Async replication is the AP default; Redis <code>WAIT</code> gives semi-sync (read-your-writes) when a key matters. Consistent hashing routes the same key to the same node, which naturally provides read-your-writes and monotonic reads for a session.</p>
+      </div>
+    </div>
+    <div class="callout tip"><b>When to break AP:</b> distributed locks (use RedLock / ZooKeeper / etcd — an AP cache can grant the same lock to two clients during a partition), session tokens after logout, and inventory / financial counts (read the DB, never the cache). For those, use a CP store or bypass the cache.</div>
+    <table style="margin-top:12px">
+      <thead><tr><th>Data / operation</th><th>Consistency need</th><th>Approach</th></tr></thead>
+      <tbody>
+        <tr><td>Page fragments, HTML</td><td>Eventual</td><td>AP cache + TTL</td></tr>
+        <tr><td>User profiles</td><td>Eventual</td><td>AP cache + TTL (30 s–5 min)</td></tr>
+        <tr><td>Product catalog</td><td>Eventual</td><td>AP cache + event invalidation</td></tr>
+        <tr><td>Shopping cart</td><td>Read-your-writes</td><td>Sticky routing (same node) + AP cache</td></tr>
+        <tr><td>Session tokens</td><td>Strong</td><td>CP store / Redis WAIT, revocation list</td></tr>
+        <tr><td>Inventory counts</td><td>Strong</td><td>Read DB, bypass cache</td></tr>
+        <tr><td>Distributed locks</td><td>Strong</td><td>RedLock / ZooKeeper / etcd</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <!-- E · TRADE-OFFS SUMMARY -->
+  <section>
+    <div class="sec-h"><span class="n">E</span><h2>Trade-offs summary</h2><span class="tag">decision · chosen · alternative · why</span></div>
+    <table>
+      <thead><tr><th>Decision</th><th>Chosen</th><th>Alternative</th><th>Why this choice</th></tr></thead>
+      <tbody>
+        <tr><td>Consistency model</td><td><b style="color:var(--survivor)">AP · eventual (PA/EL)</b></td><td>CP / strong</td><td>Cache isn't source of truth; stale is fine, downtime causes DB stampede</td></tr>
+        <tr><td>Key distribution</td><td><b style="color:var(--survivor)">Consistent hashing</b></td><td>modulo hashing</td><td>Only ~1/N keys move on rebalance vs ~75% miss storm</td></tr>
+        <tr><td>Ring smoothing</td><td><b style="color:var(--survivor)">~150 virtual nodes</b></td><td>1 point per node</td><td>Drops key-distribution variance from ~40% to ~5%</td></tr>
+        <tr><td>Hash function</td><td><b style="color:var(--survivor)">MD5 / MurmurHash3</b></td><td>Object.hashCode()</td><td>Uniform distribution for similar keys; hashCode clusters</td></tr>
+        <tr><td>Eviction policy</td><td><b style="color:var(--survivor)">LRU (LFU optional)</b></td><td>FIFO / random</td><td>O(1) via HashMap + doubly-linked list; LFU for frequency locality</td></tr>
+        <tr><td>Cache pattern</td><td><b style="color:var(--survivor)">Cache-aside + invalidate</b></td><td>write-through / write-behind</td><td>App controls logic; delete-on-write avoids races</td></tr>
+        <tr><td>Tiering</td><td><b style="color:var(--survivor)">L1 Caffeine + L2 Redis</b></td><td>L2 only</td><td>L1 absorbs 50–80% of hot reads at ~100 ns, no network hop</td></tr>
+        <tr><td>Replication</td><td><b style="color:var(--survivor)">Async primary→replica</b></td><td>synchronous</td><td>~1 ms writes; sync defeats the point of a cache</td></tr>
+        <tr><td>Stampede protection</td><td><b style="color:var(--survivor)">Singleflight / SETNX</b></td><td>none</td><td>One DB load per expiry instead of hundreds</td></tr>
+        <tr><td>Engine</td><td><b style="color:var(--survivor)">Redis</b></td><td>Memcached</td><td>Data structures, persistence, replication, cluster, pub/sub</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <!-- F · INTERVIEW WALKTHROUGH -->
+  <section>
+    <div class="sec-h"><span class="n">F</span><h2>Interview walkthrough — timing strip</h2><span class="tag">~35 min answer</span></div>
+    <div class="flow">
+      <div class="step eden"><div class="box">Clarify</div><small>P1 · 2–3 min<br>data type · scale · consistency</small></div>
+      <div class="step eden"><div class="box">Architecture</div><small>P2 · 5–7 min<br>L1 + L2 + consistent hash</small></div>
+      <div class="step surv"><div class="box">Deep dive</div><small>P3 · 8–10 min · CORE<br>LRU · LFU · ring internals</small></div>
+      <div class="step old"><div class="box">Scaling &amp; edges</div><small>P4 · 5–7 min<br>herd · hot key · failure</small></div>
+      <div class="step old"><div class="box">Code</div><small>P5 · 5–8 min<br>interfaces · facade · builder</small></div>
+      <div class="step dead"><div class="box">Trade-offs</div><small>P6 · 3–5 min<br>LRU/LFU · AP/CP · Redis</small></div>
+    </div>
+    <div class="grid g2" style="margin-top:14px">
+      <div class="card">
+        <div class="kicker">phase-by-phase</div>
+        <ul class="tight">
+          <li><b>P1 Clarify (2–3):</b> small objects vs blobs (changes eviction &amp; serialization), reads/writes per sec, staleness tolerance, persistence?, single vs multi-region, which eviction policies.</li>
+          <li><b>P2 Architecture (5–7):</b> three layers — L1 local (Caffeine) + L2 distributed (Redis, consistent hashing) + DB source of truth; async replication. Justify L1: absorbs 50–80% of hot reads, ~1 ms → ~100 ns.</li>
+          <li><b>P3 Deep dive (8–10 · CORE):</b> LRU = HashMap + doubly-linked list, O(1) everything; LFU = frequency buckets + minFreq, O(1); consistent hashing ring with ~150 vnodes, "only K/N keys move".</li>
+        </ul>
+      </div>
+      <div class="card">
+        <div class="kicker">…and finish strong</div>
+        <ul class="tight">
+          <li><b>P4 Scaling &amp; edges (5–7):</b> thundering herd → per-key lock; hot key → L1 / replicate / split; node failure → reroute + replica; cold start → pre-warm + jittered TTL.</li>
+          <li><b>P5 Code (5–8):</b> Strategy (eviction / distribution / replication), Facade (CacheService.get/put), Builder (CacheEntry), Repository (CacheStore) — interface-driven, ConcurrentHashMap + AtomicLong for thread safety.</li>
+          <li><b>P6 Trade-offs (3–5):</b> LRU vs LFU (temporal vs frequency locality), AP vs CP ("stale is fine, downtime is not"), Redis vs Memcached, cache-aside as default.</li>
+        </ul>
+      </div>
+    </div>
+    <div class="callout tip"><b>Green flags:</b> draw the LRU list &amp; explain O(1) · LFU buckets with minFreq · consistent-hash ring with vnodes · "only K/N keys move" · raise thundering herd before asked · L1 for hot keys · "AP for cache". <b>Red flags:</b> "just use Redis" with no internals · modulo instead of consistent hashing · ignoring hot keys / herd · proposing strong consistency for a cache.</div>
+  </section>
+
+  <!-- GLOSSARY -->
+  <section>
+    <div class="sec-h"><span class="n">§</span><h2>Glossary — one-liners</h2><span class="tag">terms used above</span></div>
+    <div class="grid g2">
+      <div class="card"><table><tbody>
+        <tr><td><b>AP (CAP)</b></td><td>favour Availability + Partition-tolerance over strong Consistency</td></tr>
+        <tr><td><b>PACELC</b></td><td>on Partition pick A/C; Else pick Latency/Consistency — a cache is PA/EL</td></tr>
+        <tr><td><b>Consistent hashing</b></td><td>ring mapping so only ~1/N keys move when a node joins/leaves</td></tr>
+        <tr><td><b>Virtual node</b></td><td>multiple ring positions per physical node (~150) to smooth key spread</td></tr>
+        <tr><td><b>Hash slot</b></td><td>Redis Cluster's fixed 16384-point ring: <code>CRC16(key) % 16384</code></td></tr>
+        <tr><td><b>WAIT</b></td><td>Redis command to block until N replicas ack — semi-synchronous, leans CP</td></tr>
+      </tbody></table></div>
+      <div class="card"><table><tbody>
+        <tr><td><b>L1 / L2</b></td><td>local in-process cache (Caffeine, ~100 ns) vs shared distributed cache (Redis, ~1 ms)</td></tr>
+        <tr><td><b>Cache-aside</b></td><td>app checks cache first; on miss reads DB and backfills; invalidates on write</td></tr>
+        <tr><td><b>LRU / LFU</b></td><td>evict least-recently-used (temporal) / least-frequently-used (frequency)</td></tr>
+        <tr><td><b>Thundering herd</b></td><td>many misses hit the DB at once when a hot key expires</td></tr>
+        <tr><td><b>Singleflight</b></td><td>dedupe concurrent misses so only one request repopulates the cache</td></tr>
+        <tr><td><b>Stale-while-revalidate</b></td><td>serve expired data immediately while refreshing it in the background</td></tr>
+      </tbody></table></div>
+    </div>
+  </section>
+
+  <footer>
+    <p>Use case 07 · Distributed Cache — Canvas 3 of 3 (Deep-dive &amp; Trade-offs). Grounded in <code>07-distributed-cache/docs/tradeoffs · caching · tech</code> and <code>revision/INTERVIEW_WALKTHROUGH.md</code>.</p>
+    <p class="run">This use case: <a href="hld.html">07a · HLD</a> · <a href="lld.html">07b · LLD</a> · Deep-dive &nbsp;|&nbsp; Next → <a href="../08-ride-sharing/hld.html">08 · Ride-sharing (HLD)</a></p>
+  </footer>
+
+</div>
+<script src="../assets/canvas.js"></script>
+</body>
+</html>

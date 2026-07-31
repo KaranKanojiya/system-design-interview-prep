@@ -1,0 +1,367 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>01 · URL Shortener — Deep-dive &amp; Trade-offs</title>
+<link rel="stylesheet" href="../assets/canvas.css">
+</head>
+<body>
+<div class="wrap">
+
+  <header class="hero">
+    <h1>URL Shortener — Deep-dive &amp; Trade-offs</h1>
+    <div class="sub">Use case 01 · Canvas 3 of 3. The hard parts: how to <b>scale</b> each tier, the <b>caching</b> details that decide 5 ms vs 50 ms, the <b>bottlenecks</b> that break the design (and their fixes), why this is an <b>AP</b> system, and a phase-by-phase <b>interview walkthrough</b>. <b>Switch the sharding tabs</b> and <b>open the bottleneck cards</b> to explore.</div>
+    <div class="badges">
+      <span class="badge lvl">Use case 01 · Deep-dive</span>
+      <span class="badge">Canvas 3 of 3</span>
+      <span class="badge">interactive</span>
+      <span class="badge">AP · tunable consistency</span>
+    </div>
+    <div class="legend">
+      <span><i class="dot" style="background:var(--eden)"></i> switch a tab</span>
+      <span><i class="dot" style="background:var(--old)"></i> open a bottleneck</span>
+      <span><i class="dot" style="background:var(--survivor)"></i> chosen option</span>
+      <span><i class="dot" style="background:var(--warn)"></i> failure / risk</span>
+      <span><i class="dot" style="background:var(--gc)"></i> fix / mitigation</span>
+    </div>
+  </header>
+
+  <!-- A · SCALING STRATEGY -->
+  <section>
+    <div class="sec-h"><span class="n">A</span><h2>Scaling strategy</h2><span class="tag">what to shard &amp; how</span></div>
+    <div class="grid g3">
+      <div class="card"><div class="kicker">app tier</div><h3>Stateless → horizontal</h3><p class="muted">No session affinity, so any instance serves any request. Auto-scale behind the LB (~1K req/s each → ~12–15 at 12K peak reads/s). Round-robin is enough for stateless nodes.</p></div>
+      <div class="card"><div class="kicker">read replicas</div><h3>Off the hot path</h3><p class="muted">Redirects hit cache, not replicas. Add replicas for the <b>stats/analytics</b> queries so heavy aggregations never compete with the redirect path.</p></div>
+      <div class="card"><div class="kicker">cache tier</div><h3>Redis Cluster</h3><p class="muted">Consistent-hash the <code>short_code</code> across Redis nodes so any app server finds the same entry. Cluster mode lets the cache grow past one node's RAM.</p></div>
+    </div>
+
+    <div data-tabscope style="margin-top:16px">
+      <div class="kicker">database sharding — pick a partition strategy</div>
+      <div class="tabs">
+        <button class="tab active" data-tab="hash">Hash on short_code</button>
+        <button class="tab" data-tab="range">Range-based</button>
+        <button class="tab" data-tab="chash">Consistent hashing</button>
+      </div>
+
+      <div class="tabpanel active" data-panel="hash">
+        <div class="grid g2">
+          <div class="card">
+            <h3>Hash-based partitioning</h3>
+            <p class="muted">Route each row by <code>hash(short_code) % N</code>. Because short codes are random Base62 keys, the hash spreads writes and reads evenly across shards — no hot partition.</p>
+            <pre class="code">shard = <span class="ty">hash</span>(short_code) % N   <span class="cm">// even spread, random keys</span></pre>
+          </div>
+          <div class="card">
+            <div class="kicker">verdict</div>
+            <ul class="tight">
+              <li><b>Even load</b> — the natural fit for a key-value lookup by <code>short_code</code>.</li>
+              <li><span style="color:var(--warn)">Resharding pain:</span> changing <code>N</code> remaps almost every key → use consistent hashing to avoid it.</li>
+              <li>No range scans — but a URL shortener never needs them.</li>
+            </ul>
+          </div>
+        </div>
+      </div>
+
+      <div class="tabpanel" data-panel="range">
+        <div class="grid g2">
+          <div class="card">
+            <h3>Range-based partitioning</h3>
+            <p class="muted">Assign contiguous key ranges to shards (e.g. <code>a*</code> → shard 1, <code>b*</code> → shard 2). Simple to reason about and supports range scans.</p>
+            <pre class="code">a000000–azzzzzz → shard 1
+b000000–bzzzzzz → shard 2   <span class="cm">// sequential keys pile up</span></pre>
+          </div>
+          <div class="card">
+            <div class="kicker">verdict — avoid here</div>
+            <ul class="tight">
+              <li><span style="color:var(--warn)">Hot partitions:</span> if codes are handed out sequentially, all fresh writes hit the same shard.</li>
+              <li>Good only when you need ordered scans — a URL shortener does point lookups, so this buys nothing.</li>
+              <li>The interview red flag: "range-based causes hot partitions."</li>
+            </ul>
+          </div>
+        </div>
+      </div>
+
+      <div class="tabpanel" data-panel="chash">
+        <div class="grid g2">
+          <div class="card">
+            <h3>Consistent hashing <span class="run">← chosen at scale</span></h3>
+            <p class="muted">Nodes and keys map onto a hash ring. Adding or removing a node only remaps the keys in that node's arc — not the whole keyspace. This is how Cassandra / DynamoDB partition natively.</p>
+            <pre class="code"><span class="cm">// ring: only ~1/N keys move when a node joins/leaves</span>
+node = firstNodeClockwise( <span class="ty">hash</span>(short_code) )</pre>
+          </div>
+          <div class="card">
+            <div class="kicker">verdict</div>
+            <ul class="tight">
+              <li><b>Elastic:</b> add capacity for traffic spikes with minimal reshuffling.</li>
+              <li>Virtual nodes smooth out uneven arcs and speed rebalancing.</li>
+              <li>Same technique shards the <b>Redis cache</b> tier and can give the LB cache-affinity.</li>
+            </ul>
+          </div>
+        </div>
+      </div>
+
+      <div class="callout tip"><b>Key generation at scale:</b> a distributed counter with ZooKeeper-assigned ranges, or a <b>KGS</b> that pre-allocates disjoint key pools per server — so short-code minting never becomes the write bottleneck.</div>
+    </div>
+  </section>
+
+  <!-- B · CACHING DEEP-DIVE -->
+  <section>
+    <div class="sec-h"><span class="n">B</span><h2>Caching deep-dive</h2><span class="tag">5 ms vs 50 ms lives here</span></div>
+    <div class="grid g2">
+      <div class="card">
+        <div class="kicker">cache-aside — read path (redirect)</div>
+        <pre class="code"><span class="kw">GET</span> url:{shortCode} <span class="kw">from</span> Redis
+  ├─ HIT  → 302 redirect                <span class="cm">// ~2–5 ms</span>
+  └─ MISS → query Cassandra
+             ├─ FOUND     → SETEX cache (TTL) → 302
+             └─ NOT_FOUND → cache tombstone   → 404</pre>
+        <p class="muted">Only hot data is cached; the first access to any code is a miss that self-heals. Negative <b>tombstones</b> (1–5 min) stop bad codes hammering the DB.</p>
+      </div>
+      <div class="card">
+        <div class="kicker">write path — write-through on create</div>
+        <pre class="code"><span class="kw">POST</span> /shorten
+  1. write mapping → Cassandra (durable)
+  2. write-through → Redis           <span class="cm">// no guaranteed first miss</span>
+
+<span class="kw">DELETE</span> → remove from Cassandra + Redis (+ purge CDN)</pre>
+        <p class="muted">Creators typically click their own link immediately, so write-through avoids a cold miss. Delete actively invalidates every layer; TTL is the safety net.</p>
+      </div>
+    </div>
+
+    <div class="grid g3" style="margin-top:14px">
+      <div class="card">
+        <div class="kicker">hot-key problem</div>
+        <h3>Local Caffeine L1</h3>
+        <p class="muted">A viral URL can concentrate millions of hits on one Redis key. Put an in-process <b>Caffeine</b> cache on each app server for the top ~10K codes — sub-ms, no network hop, absorbs the spike before Redis.</p>
+        <pre class="code">Caffeine.newBuilder()
+  .maximumSize(<span class="st">10_000</span>)
+  .expireAfterWrite(<span class="st">5</span>, MINUTES)
+  .refreshAfterWrite(<span class="st">3</span>, MINUTES);</pre>
+      </div>
+      <div class="card">
+        <div class="kicker">cache stampede</div>
+        <h3>Singleflight lock</h3>
+        <p class="muted">When a hot key's TTL expires, 1,000 concurrent misses would stampede the DB. First request grabs a lock, fetches once, backfills; the rest wait and re-read.</p>
+        <pre class="code"><span class="cm">// only one DB call per expiry</span>
+ok = redis.<span class="ty">set</span>(<span class="st">"lock:"</span>+code, <span class="st">"1"</span>, NX, EX 5)
+  ok  → load DB, SETEX, del lock
+  !ok → sleep 50ms, re-GET cache</pre>
+      </div>
+      <div class="card">
+        <div class="kicker">cache warming</div>
+        <h3>Preload top 1,000</h3>
+        <p class="muted">On startup / after deploy / after a Redis restart, bulk-load the top URLs by <code>click_count</code> so the first requests don't cold-miss.</p>
+        <pre class="code"><span class="kw">SELECT</span> short_code, original_url
+<span class="kw">FROM</span> urls <span class="kw">ORDER BY</span> click_count <span class="kw">DESC</span>
+<span class="kw">LIMIT</span> <span class="st">1000</span>;   <span class="cm">// MSET into Redis</span></pre>
+      </div>
+    </div>
+    <div class="callout tip"><b>Multi-layer:</b> Browser (302 + <code>Cache-Control</code>) → CDN edge → Caffeine L1 → Redis L2 → Cassandra. Each layer catches a tier of traffic; the DB is the last resort. <span class="run">→ full layering on canvas 1 · HLD</span></div>
+  </section>
+
+  <!-- C · BOTTLENECKS & SOLUTIONS -->
+  <section>
+    <div class="sec-h"><span class="n">C</span><h2>Bottlenecks &amp; solutions</h2><span class="tag">click a card to open</span></div>
+    <div class="grid" style="gap:10px">
+
+      <div class="card collapsible open">
+        <div class="c-head"><h3>Single load balancer — SPOF</h3></div>
+        <div class="c-body">
+          <p><b style="color:var(--warn)">Impact:</b> one LB means one point of failure and one throughput ceiling — if it dies, every redirect and create fails.</p>
+          <p><b style="color:var(--gc)">Fix:</b> active-passive (or active-active) LB pair with health checks and DNS failover; L7 LB (ALB / Nginx / HAProxy / Envoy) doing TLS termination and routing.</p>
+        </div>
+      </div>
+
+      <div class="card collapsible">
+        <div class="c-head"><h3>Database write bottleneck</h3></div>
+        <div class="c-body">
+          <p><b style="color:var(--warn)">Impact:</b> a single-leader SQL primary caps write throughput as URL creation scales into thousands of TPS across regions.</p>
+          <p><b style="color:var(--gc)">Fix:</b> masterless Cassandra / DynamoDB — any node accepts writes, linear horizontal scaling via consistent hashing, no leader election or failover. Postgres is fine below ~10M URLs.</p>
+        </div>
+      </div>
+
+      <div class="card collapsible">
+        <div class="c-head"><h3>Hot key (viral URL)</h3></div>
+        <div class="c-body">
+          <p><b style="color:var(--warn)">Impact:</b> a single trending code sends millions of requests at one Redis shard, saturating it while other shards idle.</p>
+          <p><b style="color:var(--gc)">Fix:</b> per-node Caffeine L1 cache (top ~10K, 5-min TTL) absorbs the spike with zero network hop; CDN edge caches the 302 for viral traffic; optionally key-replicate the hot entry across shards.</p>
+        </div>
+      </div>
+
+      <div class="card collapsible">
+        <div class="c-head"><h3>KGS failure</h3></div>
+        <div class="c-body">
+          <p><b style="color:var(--warn)">Impact:</b> if the Key Generation Service is a single instance, its outage stops all new-URL creation.</p>
+          <p><b style="color:var(--gc)">Fix:</b> run multiple KGS instances, each holding a <b>disjoint</b> in-memory key batch; a crash simply discards its unused batch (3.5T codes total, so no scarcity) and no duplicates are ever issued.</p>
+        </div>
+      </div>
+
+      <div class="card collapsible">
+        <div class="c-head"><h3>Cache stampede (thundering herd)</h3></div>
+        <div class="c-body">
+          <p><b style="color:var(--warn)">Impact:</b> when a popular key expires, a burst of simultaneous misses fires identical queries at the DB and can overload it.</p>
+          <p><b style="color:var(--gc)">Fix:</b> singleflight / mutex (Redis <code>SET key val NX EX 5</code>) so only one request repopulates; stale-while-revalidate and TTL jitter as complements.</p>
+        </div>
+      </div>
+
+      <div class="card collapsible">
+        <div class="c-head"><h3>Database node / region failure</h3></div>
+        <div class="c-body">
+          <p><b style="color:var(--warn)">Impact:</b> a node or an entire datacenter drops offline mid-traffic.</p>
+          <p><b style="color:var(--gc)">Fix:</b> AP design — replication factor ≥ 3 with QUORUM writes and ONE reads; masterless nodes keep serving, and multi-region replication (Cassandra / DynamoDB global tables) survives a DC loss. Reconcile conflicts with last-write-wins / CRDT counters after the partition heals.</p>
+        </div>
+      </div>
+
+      <div class="card collapsible">
+        <div class="c-head"><h3>Slow analytics on the hot path</h3></div>
+        <div class="c-body">
+          <p><b style="color:var(--warn)">Impact:</b> writing a click row synchronously on every redirect adds latency and couples the redirect to the analytics store.</p>
+          <p><b style="color:var(--gc)">Fix:</b> fire-and-forget a click event to Kafka (partition by <code>short_code</code>); a consumer batches into a columnar store (ClickHouse / Druid). Redirect returns the 302 immediately; Kafka replay recovers if the pipeline fails.</p>
+        </div>
+      </div>
+
+    </div>
+  </section>
+
+  <!-- D · CAP & CONSISTENCY -->
+  <section>
+    <div class="sec-h"><span class="n">D</span><h2>CAP &amp; consistency — why AP</h2><span class="tag">pick two; P is not optional</span></div>
+    <div class="grid g2">
+      <div class="card">
+        <div class="kicker">the choice</div>
+        <p class="muted"><b>P is mandatory</b> in any distributed deployment, so the real decision is A vs C during a partition. Redirects are ~100:1 reads and <b>must always work</b> — a link that fails to resolve is useless. A brand-new URL taking 1–2 s to propagate is fine.</p>
+        <ul class="tight">
+          <li><b>AP:</b> during a partition, serve possibly-stale data rather than error.</li>
+          <li><b>PACELC → PA/EL:</b> partition → Availability; else → Latency. Fast reads always.</li>
+          <li>Worst case for a just-created URL: a rare 404 that resolves on retry.</li>
+        </ul>
+      </div>
+      <div class="card">
+        <div class="kicker">tunable consistency (Cassandra levels)</div>
+        <pre class="code"><span class="cm">// W + R &gt; N gives read-your-writes overlap</span>
+create alias → <span class="st">QUORUM</span> write   <span class="cm">// leaning CP where it matters</span>
+redirect     → <span class="st">ONE</span> read      <span class="cm">// fast, AP behavior</span>
+custom alias → IF NOT EXISTS   <span class="cm">// LWT / conditional write</span></pre>
+        <p class="muted">Per-key linearizability for alias uniqueness (Cassandra <code>IF NOT EXISTS</code>, DynamoDB <code>attribute_not_exists</code>, Redis <code>SETNX</code>) — the one place duplicates are unacceptable — without giving up system-wide availability.</p>
+      </div>
+    </div>
+    <div class="callout tip"><b>Read-your-own-writes:</b> if a creator needs to hit their link instantly, use sticky routing to the writing node, write-through the local cache, or sync-replicate to one extra replica before ack.</div>
+    <table style="margin-top:12px">
+      <thead><tr><th>Operation</th><th>CAP choice</th><th>Reasoning</th></tr></thead>
+      <tbody>
+        <tr><td>Redirect <code>GET /:code</code></td><td>AP</td><td>Must always work; stale = OK</td></tr>
+        <tr><td>Create URL <code>POST</code></td><td>AP + tunable</td><td>Available, but conditional write to dedupe</td></tr>
+        <tr><td>Custom alias</td><td>leaning CP</td><td>Duplicates unacceptable → LWT / conditional write</td></tr>
+        <tr><td>Click analytics</td><td>AP</td><td>Approximate counts are fine (sum via CRDT)</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <!-- E · CLOUD MAPPING -->
+  <section>
+    <div class="sec-h"><span class="n">E</span><h2>Cloud mapping (AWS / GCP / Azure)</h2><span class="tag">same design, three clouds</span></div>
+    <table>
+      <thead><tr><th>Component</th><th>AWS</th><th>GCP</th><th>Azure</th></tr></thead>
+      <tbody>
+        <tr><td>API Gateway</td><td>API Gateway</td><td>Cloud Endpoints / Apigee</td><td>API Management</td></tr>
+        <tr><td>Load Balancer</td><td>ALB / NLB</td><td>Cloud Load Balancing</td><td>Application Gateway</td></tr>
+        <tr><td>Compute (hot path)</td><td>ECS / EKS / Fargate</td><td>Cloud Run / GKE</td><td>AKS / Container Apps</td></tr>
+        <tr><td>Database (KV)</td><td>DynamoDB</td><td>Bigtable / Firestore</td><td>Cosmos DB (Table API)</td></tr>
+        <tr><td>Cache</td><td>ElastiCache (Redis)</td><td>Memorystore</td><td>Azure Cache for Redis</td></tr>
+        <tr><td>Event stream</td><td>Kinesis / SQS</td><td>Pub/Sub</td><td>Event Hubs / Service Bus</td></tr>
+        <tr><td>CDN</td><td>CloudFront</td><td>Cloud CDN</td><td>Azure CDN</td></tr>
+        <tr><td>Analytics consumer</td><td>Lambda</td><td>Cloud Functions</td><td>Functions</td></tr>
+        <tr><td>DNS / Storage</td><td>Route 53 / S3</td><td>Cloud DNS / GCS</td><td>Azure DNS / Blob</td></tr>
+      </tbody>
+    </table>
+    <div class="callout"><b>Hot vs cold split:</b> containers for the redirect API (cold starts of 100–500 ms are unacceptable at peak reads/s), serverless for async analytics, cleanup, and reporting. Cache aggressively — a ~$200/mo Redis node saves thousands in DynamoDB RCUs.</div>
+  </section>
+
+  <!-- F · TRADE-OFFS SUMMARY -->
+  <section>
+    <div class="sec-h"><span class="n">F</span><h2>Trade-offs summary</h2><span class="tag">decision · chosen · alternative · why</span></div>
+    <table>
+      <thead><tr><th>Decision</th><th>Chosen</th><th>Alternative</th><th>Why this choice</th></tr></thead>
+      <tbody>
+        <tr><td>Consistency model</td><td><b style="color:var(--survivor)">AP · eventual</b></td><td>CP / strong</td><td>Redirects must never fail; 1–2 s propagation is fine</td></tr>
+        <tr><td>Primary DB</td><td><b style="color:var(--survivor)">Cassandra / DynamoDB</b></td><td>PostgreSQL</td><td>Key-value pattern, write-heavy, masterless horizontal scale, native TTL</td></tr>
+        <tr><td>Code generation</td><td><b style="color:var(--survivor)">KGS pre-gen</b></td><td>hash+truncate / auto-increment / random</td><td>No collisions, not guessable, no runtime hashing</td></tr>
+        <tr><td>DB sharding</td><td><b style="color:var(--survivor)">Consistent hash</b></td><td>range-based</td><td>Even load, elastic; range → hot partitions</td></tr>
+        <tr><td>Cache layer</td><td><b style="color:var(--survivor)">Redis</b></td><td>Memcached</td><td>TTL, data structures, SETNX, persistence, cluster mode</td></tr>
+        <tr><td>Local cache</td><td><b style="color:var(--survivor)">Caffeine</b></td><td>Guava</td><td>2–3× faster W-TinyLFU eviction, active development</td></tr>
+        <tr><td>Invalidation</td><td><b style="color:var(--survivor)">Cache-aside + write-through on create</b></td><td>write-behind</td><td>Durability over raw write speed</td></tr>
+        <tr><td>Redirect code</td><td><b style="color:var(--survivor)">302 + Cache-Control</b></td><td>301</td><td>Preserves analytics while enabling edge caching</td></tr>
+        <tr><td>Stampede protection</td><td><b style="color:var(--survivor)">Singleflight / mutex</b></td><td>none</td><td>Critical for viral URLs</td></tr>
+        <tr><td>Analytics</td><td><b style="color:var(--survivor)">Async via Kafka</b></td><td>synchronous write</td><td>Keeps redirect off the analytics store</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <!-- G · INTERVIEW WALKTHROUGH -->
+  <section>
+    <div class="sec-h"><span class="n">G</span><h2>Interview walkthrough — timing strip</h2><span class="tag">35–45 min answer</span></div>
+    <div class="flow">
+      <div class="step eden"><div class="box">Opening</div><small>P1 clarify · 2–3 min<br>you drive the scope</small></div>
+      <div class="step eden"><div class="box">Estimation</div><small>P2 · 3–4 min<br>~40 W/s · ~4K R/s · 1.8 TB</small></div>
+      <div class="step surv"><div class="box">API</div><small>P3 · 2–3 min<br>REST · 301 vs 302</small></div>
+      <div class="step surv"><div class="box">Core design</div><small>P4 · 5–7 min<br>draw diagram first</small></div>
+      <div class="step old"><div class="box">Deep dives</div><small>P5–7 · KGS · DB · cache</small></div>
+      <div class="step dead"><div class="box">Scale &amp; wrap</div><small>P8–10 · sharding · CAP</small></div>
+    </div>
+    <div class="grid g2" style="margin-top:14px">
+      <div class="card">
+        <div class="kicker">phase-by-phase</div>
+        <ul class="tight">
+          <li><b>P1 Clarify (2–3):</b> scope = shorten + redirect (+analytics/alias/expiry?); public vs internal; scale; confirm no auth/billing.</li>
+          <li><b>P2 Estimate (3–4):</b> 100M/mo → ~40 W/s, 100:1 → ~4K R/s, 6B × 300 B ≈ 1.8 TB, hot 20% fits one Redis node, 62⁷ ≈ 3.5 T codes.</li>
+          <li><b>P3 API (2–3):</b> <code>POST /shorten</code>, <code>GET /{code}</code>→302, stats, delete. Mention 301 vs 302.</li>
+          <li><b>P4 Architecture (5–7 · CORE):</b> Client → LB → API → Redis → DB, plus KGS &amp; Kafka. Draw first, then narrate flows.</li>
+          <li><b>P5 URL generation (5–7 · MOST ASKED):</b> compare hash / Base62-counter / KGS / random → recommend KGS at scale.</li>
+        </ul>
+      </div>
+      <div class="card">
+        <div class="kicker">…and finish strong</div>
+        <ul class="tight">
+          <li><b>P6 Database (2–3):</b> justify by access pattern → DynamoDB / Cassandra; PG fine below ~10M.</li>
+          <li><b>P7 Caching (2–3):</b> cache-aside, 24 h TTL / LRU, multi-layer, hot-key local cache; name-drop stampede.</li>
+          <li><b>P8 Scaling (3–4):</b> stateless app tier, consistent-hash sharding (range = hot partitions), replicas for stats, cache sharding.</li>
+          <li><b>P9 Extras (2–3):</b> pick 2–3 — async analytics, rate limiting, TTL cleanup, abuse prevention, geo, monitoring.</li>
+          <li><b>P10 Tradeoffs &amp; CAP (1–2):</b> AP system; conditional writes for aliases; state 301/302, SQL/NoSQL, KGS/on-the-fly.</li>
+        </ul>
+      </div>
+    </div>
+    <div class="callout tip"><b>Green flags:</b> you drive scoping · rough math shown · compare 2–3 then pick one · mention CAP unasked · raise failure scenarios · clean diagrams. <b>Red flags:</b> schema before architecture · "just use Redis" · unjustified DB · forgetting caching · over-engineering (K8s/microservices).</div>
+  </section>
+
+  <!-- GLOSSARY -->
+  <section>
+    <div class="sec-h"><span class="n">§</span><h2>Glossary — one-liners</h2><span class="tag">terms used above</span></div>
+    <div class="grid g2">
+      <div class="card"><table><tbody>
+        <tr><td><b>AP (CAP)</b></td><td>favour Availability + Partition-tolerance over strong Consistency</td></tr>
+        <tr><td><b>PACELC</b></td><td>on Partition pick A/C; Else pick Latency/Consistency — here PA/EL</td></tr>
+        <tr><td><b>QUORUM / ONE</b></td><td>tunable read/write levels; W+R&gt;N gives read-your-writes overlap</td></tr>
+        <tr><td><b>LWT / conditional write</b></td><td><code>IF NOT EXISTS</code> / <code>attribute_not_exists</code> — per-key uniqueness</td></tr>
+        <tr><td><b>Consistent hashing</b></td><td>ring mapping so only ~1/N keys move when a node joins/leaves</td></tr>
+        <tr><td><b>Singleflight</b></td><td>dedupe concurrent misses so only one request repopulates the cache</td></tr>
+      </tbody></table></div>
+      <div class="card"><table><tbody>
+        <tr><td><b>Cache-aside</b></td><td>check cache first; on miss read DB and backfill</td></tr>
+        <tr><td><b>Write-through</b></td><td>write to cache and DB together (used on URL create)</td></tr>
+        <tr><td><b>Cache stampede</b></td><td>many misses hit the DB at once when a hot key expires</td></tr>
+        <tr><td><b>Negative cache / tombstone</b></td><td>cache a NOT_FOUND briefly to stop repeated DB lookups</td></tr>
+        <tr><td><b>W-TinyLFU</b></td><td>Caffeine's eviction policy — better hit rate than plain LRU</td></tr>
+        <tr><td><b>CRDT counter</b></td><td>conflict-free counter — sum click counts from both sides after a partition</td></tr>
+      </tbody></table></div>
+    </div>
+  </section>
+
+  <footer>
+    <p>Use case 01 · URL Shortener — Canvas 3 of 3 (Deep-dive &amp; Trade-offs). Grounded in <code>01-url-shortener/docs/tradeoffs · caching · tech · cloud</code> and <code>revision/INTERVIEW_WALKTHROUGH.md</code>.</p>
+    <p class="run">This use case: <a href="hld.html">01a · HLD</a> · <a href="lld.html">01b · LLD</a> · Deep-dive &nbsp;|&nbsp; Next → <a href="../index.html">Hub (next use case coming)</a></p>
+  </footer>
+
+</div>
+<script src="../assets/canvas.js"></script>
+</body>
+</html>

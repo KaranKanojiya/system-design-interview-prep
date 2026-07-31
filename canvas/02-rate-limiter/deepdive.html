@@ -1,0 +1,337 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>02 · Rate Limiter — Deep-dive &amp; Trade-offs</title>
+<link rel="stylesheet" href="../assets/canvas.css">
+</head>
+<body>
+<div class="wrap">
+
+  <header class="hero">
+    <h1>Rate Limiter — Deep-dive &amp; Trade-offs</h1>
+    <div class="sub">Use case 02 · Canvas 3 of 3. The hard parts: how to <b>scale</b> the counter tier, the <b>caching</b> split that keeps a check under 1.5 ms, the <b>bottlenecks</b> that break the design (and their fixes), why this is an <b>AP</b> system that <b>fails open</b>, and a phase-by-phase <b>interview walkthrough</b>. <b>Switch the counter-distribution tabs</b> and <b>open the bottleneck cards</b> to explore.</div>
+    <div class="badges">
+      <span class="badge lvl">Use case 02 · Deep-dive</span>
+      <span class="badge">Canvas 3 of 3</span>
+      <span class="badge">interactive</span>
+      <span class="badge">AP · fail-open</span>
+    </div>
+    <div class="legend">
+      <span><i class="dot" style="background:var(--eden)"></i> switch a tab</span>
+      <span><i class="dot" style="background:var(--old)"></i> open a bottleneck</span>
+      <span><i class="dot" style="background:var(--survivor)"></i> chosen option</span>
+      <span><i class="dot" style="background:var(--warn)"></i> failure / risk</span>
+      <span><i class="dot" style="background:var(--gc)"></i> fix / mitigation</span>
+    </div>
+  </header>
+
+  <!-- A · SCALING STRATEGY -->
+  <section>
+    <div class="sec-h"><span class="n">A</span><h2>Scaling strategy</h2><span class="tag">where the counters live &amp; how they shard</span></div>
+    <div class="grid g3">
+      <div class="card"><div class="kicker">app tier</div><h3>Stateless middleware</h3><p class="muted">The rate-limit check is a filter in front of business logic — no local state, so any app node serves any request. Auto-scale behind the LB; correctness never depends on which node a client lands on because the counter is shared in Redis.</p></div>
+      <div class="card"><div class="kicker">counter tier</div><h3>Redis Cluster hash-slots</h3><p class="muted">The rate-limit key (e.g. <code>user:123:POST:/api/orders</code>) is hashed to one of 16,384 slots so the same key always lands on the same shard. Single-threaded per shard → atomic <code>INCR</code>/Lua, no cross-node coordination.</p></div>
+      <div class="card"><div class="kicker">rules tier</div><h3>Read replicas off the hot path</h3><p class="muted">Rules are read thousands/sec but written a few times a day. Serve reads from a local cache; point the admin CRUD API at the primary and let replicas absorb any reporting queries. The hot path never touches the DB.</p></div>
+    </div>
+
+    <div data-tabscope style="margin-top:16px">
+      <div class="kicker">counter distribution — pick how nodes share the count</div>
+      <div class="tabs">
+        <button class="tab active" data-tab="central">Centralized Redis</button>
+        <button class="tab" data-tab="local">Local + periodic sync</button>
+        <button class="tab" data-tab="sticky">Sticky sessions</button>
+      </div>
+
+      <div class="tabpanel active" data-panel="central">
+        <div class="grid g2">
+          <div class="card">
+            <h3>Centralized Redis <span class="run">← chosen</span></h3>
+            <p class="muted">Every app node increments the <b>same</b> key on the same shard. Redis is single source of truth; atomic <code>INCR</code> (or a Lua script) means no race, regardless of how the LB spreads traffic.</p>
+            <pre class="code"><span class="ty">INCR</span> ratelimit:{key}:{window}   <span class="cm">// atomic, sub-ms</span>
+shard = HASH_SLOT(key)             <span class="cm">// same key → same shard</span></pre>
+          </div>
+          <div class="card">
+            <div class="kicker">verdict</div>
+            <ul class="tight">
+              <li><b>Exact global count</b> — works with any LB strategy, no client can game it.</li>
+              <li>+0.3–1 ms per check over a local network — negligible vs 50–500 ms business logic.</li>
+              <li><span style="color:var(--warn)">Redis becomes a critical dependency</span> → Sentinel/Cluster for HA + fail-open in the app.</li>
+            </ul>
+          </div>
+        </div>
+      </div>
+
+      <div class="tabpanel" data-panel="local">
+        <div class="grid g2">
+          <div class="card">
+            <h3>Local counter with periodic sync</h3>
+            <p class="muted">Each node counts in memory and flushes to a global store every ~1 s. Fastest possible check (no network hop), but between syncs nodes disagree.</p>
+            <pre class="code">Node A local=30 ─sync 1s→ Redis total=90
+Node B local=25 ─sync 1s→ Redis total=90   <span class="cm">// drift between flushes</span></pre>
+          </div>
+          <div class="card">
+            <div class="kicker">verdict — approximate only</div>
+            <ul class="tight">
+              <li><span style="color:var(--warn)">Over-limit drift</span> ≈ <code>nodes × sync_interval × rate</code> before nodes converge.</li>
+              <li>Good for coarse edge/DDoS shaping where approximate is fine.</li>
+              <li>Also the shape of the <b>fail-open fallback</b>: a degraded local bucket when Redis is unreachable.</li>
+            </ul>
+          </div>
+        </div>
+      </div>
+
+      <div class="tabpanel" data-panel="sticky">
+        <div class="grid g2">
+          <div class="card">
+            <h3>Sticky sessions (route client → node)</h3>
+            <p class="muted">The LB pins each client to one node, which tracks only "its" clients in local memory. No shared counter needed.</p>
+            <pre class="code">client ──hash──▶ always Node A   <span class="cm">// local memory, exact</span></pre>
+          </div>
+          <div class="card">
+            <div class="kicker">verdict — avoid at scale</div>
+            <ul class="tight">
+              <li><span style="color:var(--warn)">Uneven load</span> — a hot client saturates its pinned node while others idle.</li>
+              <li><span style="color:var(--warn)">Failover loses counters</span> — a node crash resets every client it owned.</li>
+              <li>Breaks when one client rotates across many API keys / IPs.</li>
+            </ul>
+          </div>
+        </div>
+      </div>
+
+      <div class="callout tip"><b>Multi-region:</b> a global Redis (e.g. ElastiCache Global Datastore) is simplest but adds cross-region latency; the practical choice is <b>per-region limits</b> — give each region a fraction of the global cap (3 regions → 33% each). Global fairness costs coordination latency a hot path can't afford.</div>
+    </div>
+  </section>
+
+  <!-- B · CACHING DEEP-DIVE -->
+  <section>
+    <div class="sec-h"><span class="n">B</span><h2>Caching deep-dive</h2><span class="tag">what to cache — and what NOT to</span></div>
+    <div class="grid g2">
+      <div class="card">
+        <div class="kicker">rules — DO cache locally</div>
+        <pre class="code"><span class="kw">check</span>(ctx, rule):
+  rule = <span class="ty">ruleCache</span>.get(key)   <span class="cm">// ConcurrentHashMap, ~100 ns</span>
+    ├─ HIT + fresh → use it
+    └─ MISS/expired → DB read → cache (TTL 30–60 s)</pre>
+        <p class="muted">Rules change a few times a day, so per-request DB reads are pure waste. Local map lookup is nanoseconds; worst case an admin change is stale for one TTL. <code>RuleRepository</code> behind an in-memory cache does this.</p>
+      </div>
+      <div class="card">
+        <div class="kicker">counters — do NOT cache locally</div>
+        <pre class="code"><span class="kw">counter</span> lives ONLY in Redis
+  INCR / Lua → shared source of truth
+  <span class="cm">// local counter = each node counts alone</span>
+  <span class="cm">// 4 nodes × limit 100 → user gets 400</span></pre>
+        <p class="muted">The whole point of rate limiting is <b>accurate shared counting</b>. A local counter cache means every node has its own view and the global limit is silently multiplied by the node count.</p>
+      </div>
+    </div>
+
+    <div class="grid g3" style="margin-top:14px">
+      <div class="card">
+        <div class="kicker">Redis IS the cache</div>
+        <h3>No DB behind counters</h3>
+        <p class="muted">A common misconception is "cache the counters." Redis is already an in-memory store — counters live in the fastest possible place. They're ephemeral: if Redis restarts, counters reset and users briefly get one extra window, which is acceptable.</p>
+        <pre class="code">EXPIRE key {window}   <span class="cm">// auto-cleanup, no GC job</span>
+<span class="cm">// AOF persistence optional; loss = brief over-limit</span></pre>
+      </div>
+      <div class="card">
+        <div class="kicker">rule hot-reload</div>
+        <h3>TTL + Pub/Sub invalidation</h3>
+        <p class="muted">TTL alone means up to 30 s stale. For urgent changes (blocking an abuser) publish an invalidate event over Redis Pub/Sub so every node drops that key within milliseconds. Best of both: TTL floor + event-driven precision.</p>
+        <pre class="code">admin update → publish {invalidate, key}
+  → all nodes ruleCache.invalidate(key)</pre>
+      </div>
+      <div class="card">
+        <div class="kicker">pipelining</div>
+        <h3>Batch multi-rule checks</h3>
+        <p class="muted">A request often checks several rules — global + per-user + per-endpoint. Pipeline them into <b>one</b> round trip instead of N, so 3 checks cost ~1 ms instead of ~3 ms.</p>
+        <pre class="code">pipeline: EVALSHA×3 → sync()   <span class="cm">// 1 RTT</span>
+naive:    3 separate RTTs      <span class="cm">// ~3 ms</span></pre>
+      </div>
+    </div>
+    <div class="callout tip"><b>Latency budget per check:</b> local rule lookup ~100 ns (cache hit) + Redis counter check 0.3–1 ms = <b>&lt; 1.5 ms</b> total. A cache miss (TTL expiry) adds a 2–5 ms DB read but is rare. <span class="run">→ full layering on canvas 1 · HLD</span></div>
+  </section>
+
+  <!-- C · BOTTLENECKS & SOLUTIONS -->
+  <section>
+    <div class="sec-h"><span class="n">C</span><h2>Bottlenecks &amp; solutions</h2><span class="tag">click a card to open</span></div>
+    <div class="grid" style="gap:10px">
+
+      <div class="card collapsible open">
+        <div class="c-head"><h3>Redis is a single point of failure</h3></div>
+        <div class="c-body">
+          <p><b style="color:var(--warn)">Impact:</b> the counter store is on every request's hot path. If Redis is unreachable, no check can complete — and blocking all traffic turns a protection layer into a self-inflicted outage.</p>
+          <p><b style="color:var(--gc)">Fix:</b> <b>fail-open</b> — on <code>RedisConnectionException</code>/timeout, return <code>allowed</code>, fire a <code>rate_limiter.fail_open</code> metric + alert, and optionally fall back to a per-node local bucket as degraded mode. Run Redis Sentinel/Cluster for HA. Fail-<i>closed</i> only for billing/security paths.</p>
+        </div>
+      </div>
+
+      <div class="card collapsible">
+        <div class="c-head"><h3>Race condition on read-then-write</h3></div>
+        <div class="c-body">
+          <p><b style="color:var(--warn)">Impact:</b> two nodes both <code>GET</code> count 99, both see "under 100", both <code>SET</code> 100 → the limit is silently exceeded. <code>INCR</code>+<code>EXPIRE</code> as two separate commands is not atomic either.</p>
+          <p><b style="color:var(--gc)">Fix:</b> atomic <code>INCR</code> for simple counters; a <b>Lua script</b> for multi-step algorithms (Token Bucket read-refill-consume-write) so nothing interleaves on the single-threaded shard. <code>MULTI/EXEC</code> can't read-then-use a value mid-transaction — Lua can.</p>
+        </div>
+      </div>
+
+      <div class="card collapsible">
+        <div class="c-head"><h3>Clients gaming multiple nodes</h3></div>
+        <div class="c-body">
+          <p><b style="color:var(--warn)">Impact:</b> with local counters and a round-robin LB, a client spread across N nodes gets up to N× its limit before any node rejects.</p>
+          <p><b style="color:var(--gc)">Fix:</b> centralized Redis counters — every node increments the same key, so distribution doesn't matter. Sticky sessions are only a partial mitigation and bring uneven load + failover loss.</p>
+        </div>
+      </div>
+
+      <div class="card collapsible">
+        <div class="c-head"><h3>Clock skew across nodes</h3></div>
+        <div class="c-body">
+          <p><b style="color:var(--warn)">Impact:</b> if Node A is 2 s ahead of Node B they disagree on which window a request belongs to (Fixed Window) or compute different refills (Token Bucket).</p>
+          <p><b style="color:var(--gc)">Fix:</b> use <b>Redis server time</b> (<code>TIME</code>) inside the Lua script so all window math shares one clock; NTP-sync nodes as a backstop; prefer time-delta algorithms (Token Bucket) that tolerate small skew.</p>
+        </div>
+      </div>
+
+      <div class="card collapsible">
+        <div class="c-head"><h3>Fixed-window boundary burst / thundering herd</h3></div>
+        <div class="c-body">
+          <p><b style="color:var(--warn)">Impact:</b> Fixed Window lets 2× the limit through at a window edge (5 at 1:00:30 + 5 at 1:01:00), and all counters resetting at once creates a synchronized boundary spike.</p>
+          <p><b style="color:var(--gc)">Fix:</b> use <b>Sliding Window Counter</b> (weighted previous+current window, no hard reset) or Token Bucket (gradual refill); add jitter to window boundaries. The algorithm is selectable per rule in <code>RateLimitRule</code>.</p>
+        </div>
+      </div>
+
+      <div class="card collapsible">
+        <div class="c-head"><h3>Stale rules after an admin change</h3></div>
+        <div class="c-body">
+          <p><b style="color:var(--warn)">Impact:</b> an admin lowers a limit from 1000 to 100 but nodes keep serving the cached old rule for up to a TTL.</p>
+          <p><b style="color:var(--gc)">Fix:</b> keep the TTL short (30 s) and publish a Pub/Sub invalidation event on change so nodes update within milliseconds; expose a force-refresh admin endpoint for emergencies.</p>
+        </div>
+      </div>
+
+      <div class="card collapsible">
+        <div class="c-head"><h3>Rule-cache stampede on TTL expiry</h3></div>
+        <div class="c-body">
+          <p><b style="color:var(--warn)">Impact:</b> many threads discover the same rule expired at once and all hit the DB to reload it.</p>
+          <p><b style="color:var(--gc)">Fix:</b> lock-based refresh — one thread reloads while others serve the stale value; probabilistic early expiry and a background refresher are complements. Bound the cache size with LRU to cap memory.</p>
+        </div>
+      </div>
+
+    </div>
+  </section>
+
+  <!-- D · CAP & CONSISTENCY -->
+  <section>
+    <div class="sec-h"><span class="n">D</span><h2>CAP &amp; consistency — why AP</h2><span class="tag">pick two; P is not optional</span></div>
+    <div class="grid g2">
+      <div class="card">
+        <div class="kicker">the choice</div>
+        <p class="muted">A rate limiter <b>must always respond</b> allow/deny. During a partition the real decision is A vs C, and here the cost of blocking legitimate users (an outage) far outweighs briefly serving 10–20% over-limit. Protection, not precision.</p>
+        <ul class="tight">
+          <li><b>AP:</b> during a partition each node keeps deciding on its local view rather than erroring.</li>
+          <li>Partitioned nodes can each pass up to their own limit → in the worst case ~<code>N × limit</code>, typically 110–120% for brief splits.</li>
+          <li>A rate limiter that causes an outage is worse than no rate limiter at all.</li>
+        </ul>
+      </div>
+      <div class="card">
+        <div class="kicker">fail-open vs fail-closed</div>
+        <pre class="code"><span class="cm">// Redis down — which way do we fail?</span>
+general API  → <span class="st">FAIL-OPEN</span>   allow + alert   <span class="cm">// AP</span>
+billing/auth → <span class="st">FAIL-CLOSED</span> reject to be safe <span class="cm">// CP</span></pre>
+        <p class="muted">Fail-open is the production default: worst case a free user gets extra requests. Fail-closed is reserved for paths where an overage costs real money or breaks security — payments, login attempts, SMS/email sends. Many systems run <b>both</b> layers.</p>
+      </div>
+    </div>
+    <div class="callout tip"><b>Redis single-key consistency:</b> a single shard is single-threaded, so <code>INCR</code> on one key gives sequential consistency with no locks — "good enough for 99% of rate limiting." Replica reads can lag, so read counters from the primary (or accept slight inconsistency).</div>
+    <table style="margin-top:12px">
+      <thead><tr><th>Use case</th><th>Consistency</th><th>Reasoning</th></tr></thead>
+      <tbody>
+        <tr><td>API rate limiting</td><td>Eventual (AP)</td><td>10–20% over-limit is fine; availability wins</td></tr>
+        <tr><td>DDoS / edge shaping</td><td>Eventual (AP)</td><td>Approximate counts at the edge are acceptable</td></tr>
+        <tr><td>Billing / usage caps (paid)</td><td>Strong (CP)</td><td>Overages cost real money → fail-closed</td></tr>
+        <tr><td>Login-attempt limiting</td><td>Strong (CP)</td><td>Security-critical → fail-closed</td></tr>
+        <tr><td>SMS / email sending</td><td>Strong (CP)</td><td>Real per-message cost</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <!-- E · TRADE-OFFS SUMMARY -->
+  <section>
+    <div class="sec-h"><span class="n">E</span><h2>Trade-offs summary</h2><span class="tag">decision · chosen · alternative · why</span></div>
+    <table>
+      <thead><tr><th>Decision</th><th>Chosen</th><th>Alternative</th><th>Why this choice</th></tr></thead>
+      <tbody>
+        <tr><td>Consistency model</td><td><b style="color:var(--survivor)">AP · fail-open</b></td><td>CP / fail-closed</td><td>Blocking legit users is worse than brief over-limit</td></tr>
+        <tr><td>Counter store</td><td><b style="color:var(--survivor)">Redis</b></td><td>Memcached / DynamoDB / Postgres</td><td>Atomic INCR + Lua, sub-ms; Memcached has no multi-step atomicity, DB too slow for the hot path</td></tr>
+        <tr><td>Atomicity</td><td><b style="color:var(--survivor)">Lua script (EVALSHA)</b></td><td>INCR+EXPIRE / MULTI-EXEC</td><td>Multi-step read-compute-write with no interleave; MULTI can't reuse a read value</td></tr>
+        <tr><td>Counter distribution</td><td><b style="color:var(--survivor)">Centralized Redis</b></td><td>local+sync / sticky sessions</td><td>Exact global count regardless of LB; no gaming across nodes</td></tr>
+        <tr><td>Default algorithm</td><td><b style="color:var(--survivor)">Token Bucket</b></td><td>Sliding Window Counter</td><td>Battle-tested (Stripe, AWS), handles bursts, 2 values; SWC when boundary accuracy matters</td></tr>
+        <tr><td>Rules caching</td><td><b style="color:var(--survivor)">Local map, 30–60 s TTL</b></td><td>DB read per request</td><td>Rules change rarely; avoids a DB round trip on every request</td></tr>
+        <tr><td>Rule invalidation</td><td><b style="color:var(--survivor)">TTL + Pub/Sub</b></td><td>TTL only / versioned poll</td><td>Short-TTL floor with millisecond precision for urgent changes</td></tr>
+        <tr><td>Clock source</td><td><b style="color:var(--survivor)">Redis TIME</b></td><td>node local clock</td><td>One clock for all window math → immune to node skew</td></tr>
+        <tr><td>Multi-region</td><td><b style="color:var(--survivor)">Per-region limits</b></td><td>global synced counter</td><td>Cross-region coordination is too slow for the hot path</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <!-- F · INTERVIEW WALKTHROUGH -->
+  <section>
+    <div class="sec-h"><span class="n">F</span><h2>Interview walkthrough — timing strip</h2><span class="tag">35–45 min answer</span></div>
+    <div class="flow">
+      <div class="step eden"><div class="box">Clarify</div><small>P1 · 2 min<br>limit by what? fail mode?</small></div>
+      <div class="step surv"><div class="box">Algorithms</div><small>P2 · 8–10 min · CORE<br>all 5, then recommend</small></div>
+      <div class="step surv"><div class="box">Architecture</div><small>P3 · 5 min<br>draw diagram first</small></div>
+      <div class="step old"><div class="box">Distributed</div><small>P4 · 5–7 min<br>race · fail-open · skew</small></div>
+      <div class="step old"><div class="box">API · Scale</div><small>P5–6 · headers · sharding</small></div>
+      <div class="step dead"><div class="box">CAP &amp; wrap</div><small>P7–8 · AP · real-world</small></div>
+    </div>
+    <div class="grid g2" style="margin-top:14px">
+      <div class="card">
+        <div class="kicker">phase-by-phase</div>
+        <ul class="tight">
+          <li><b>P1 Clarify (2):</b> limit by IP / user / API key? per-endpoint or per-tier? single vs distributed? <b>fail-open or fail-closed?</b> return rate-limit headers?</li>
+          <li><b>P2 Algorithms (8–10 · CORE):</b> walk all 5 — Token Bucket, Leaky Bucket, Fixed Window, Sliding Window Log, Sliding Window Counter — with tradeoffs, then recommend <b>Token Bucket</b> (or SWC for accuracy).</li>
+          <li><b>P3 Architecture (5):</b> Client → WAF (IP) → API Gateway (global) → LB → app middleware → Redis (counters+Lua) + Rules DB. Draw first, then narrate the flow.</li>
+          <li><b>P4 Distributed (5–7):</b> race → Lua atomicity; Redis down → fail-open; clock skew → Redis <code>TIME</code>; sync across nodes → centralized Redis + consistent hashing.</li>
+        </ul>
+      </div>
+      <div class="card">
+        <div class="kicker">…and finish strong</div>
+        <ul class="tight">
+          <li><b>P5 API &amp; headers (2):</b> 429 + <code>X-RateLimit-Limit / Remaining / Reset</code> + <code>Retry-After</code>; include headers on <b>every</b> response so clients self-regulate.</li>
+          <li><b>P6 Scaling (3):</b> Redis Cluster shard-by-key, local rules cache reloaded every 30 s / Pub/Sub, edge WAF for IP DDoS, per-region limits.</li>
+          <li><b>P7 CAP (2–3):</b> AP system; fail-open; slight over-limit acceptable; name the tradeoffs — burst vs accuracy, availability vs strictness, centralized vs local.</li>
+          <li><b>P8 Real-world (2):</b> Stripe / AWS (Token Bucket), Cloudflare / GitHub (Sliding Window).</li>
+        </ul>
+      </div>
+    </div>
+    <div class="callout tip"><b>Green flags:</b> walk all 5 algorithms with diagrams · recommend one with a reason · mention Lua atomicity unasked · raise fail-open vs fail-closed · composite keys (user+endpoint) · headers on every response · layer WAF → Gateway → middleware. <b>Red flags:</b> skipping the algorithm deep-dive · "just use Redis INCR" without Lua · forgetting failure modes · picking an algorithm without comparing · ignoring the distributed aspect · over-engineering (Kafka / microservices / ML).</div>
+  </section>
+
+  <!-- GLOSSARY -->
+  <section>
+    <div class="sec-h"><span class="n">§</span><h2>Glossary — one-liners</h2><span class="tag">terms used above</span></div>
+    <div class="grid g2">
+      <div class="card"><table><tbody>
+        <tr><td><b>AP (CAP)</b></td><td>favour Availability + Partition-tolerance over strong Consistency</td></tr>
+        <tr><td><b>Fail-open</b></td><td>on Redis failure allow the request (available but unprotected) — the default</td></tr>
+        <tr><td><b>Fail-closed</b></td><td>on failure reject the request — for billing / security paths only</td></tr>
+        <tr><td><b>Atomic INCR</b></td><td>single-command increment; single-threaded Redis serialises it, no race</td></tr>
+        <tr><td><b>Lua script / EVALSHA</b></td><td>multi-step logic run atomically on the Redis server, cached by SHA</td></tr>
+        <tr><td><b>Hash slot</b></td><td>one of 16,384 buckets a key maps to so it always hits the same shard</td></tr>
+      </tbody></table></div>
+      <div class="card"><table><tbody>
+        <tr><td><b>Token Bucket</b></td><td>tokens refill at a fixed rate; each request spends one; allows bursts</td></tr>
+        <tr><td><b>Sliding Window Counter</b></td><td>weighted previous+current window count — accurate, no boundary spike</td></tr>
+        <tr><td><b>Boundary burst</b></td><td>Fixed Window flaw: up to 2× the limit passes across a window edge</td></tr>
+        <tr><td><b>Rules cache</b></td><td>local map of key→rule, 30–60 s TTL, so the hot path skips the DB</td></tr>
+        <tr><td><b>Clock skew</b></td><td>node clocks disagree; fixed by using Redis <code>TIME</code> for window math</td></tr>
+        <tr><td><b>Pipelining</b></td><td>batch several Redis commands into one round trip to cut latency</td></tr>
+      </tbody></table></div>
+    </div>
+  </section>
+
+  <footer>
+    <p>Use case 02 · Rate Limiter — Canvas 3 of 3 (Deep-dive &amp; Trade-offs). Grounded in <code>02-rate-limiter/docs/tradeoffs · caching · tech</code> and <code>revision/INTERVIEW_WALKTHROUGH.md</code>.</p>
+    <p class="run">This use case: <a href="hld.html">02a · HLD</a> · <a href="lld.html">02b · LLD</a> · Deep-dive &nbsp;|&nbsp; Next → <a href="../03-notification-system/hld.html">03 · Notification System</a></p>
+  </footer>
+
+</div>
+<script src="../assets/canvas.js"></script>
+</body>
+</html>

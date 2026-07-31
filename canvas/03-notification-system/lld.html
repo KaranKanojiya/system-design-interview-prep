@@ -1,0 +1,395 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>03 · Notification System — LLD</title>
+<link rel="stylesheet" href="../assets/canvas.css">
+</head>
+<body>
+<div class="wrap">
+
+  <header class="hero">
+    <h1>Notification System — Low-Level Design</h1>
+    <div class="sub">Use case 03 · Canvas 2 of 3. From boxes to classes: the actual Java object model. Start with the <b>interactive class map</b> — click a class to see its responsibility and how <code>AppConfig → Controller → NotificationService → Handler/Queue/Repository</code> is wired — then dig into priority ordering, the pluggable channel handlers, and the send/process/retry sequences.</div>
+    <div class="badges">
+      <span class="badge lvl">Use case 03 · LLD</span>
+      <span class="badge">Canvas 2 of 3</span>
+      <span class="badge">interactive</span>
+      <span class="badge">Strategy · Builder · Priority Queue · Repository</span>
+    </div>
+    <div class="legend">
+      <span><i class="dot" style="background:var(--eden)"></i> entry / composition root</span>
+      <span><i class="dot" style="background:var(--survivor)"></i> interface / contract</span>
+      <span><i class="dot" style="background:var(--old)"></i> concrete implementation</span>
+      <span><i class="dot" style="background:var(--warn)"></i> domain model</span>
+      <span><i class="dot" style="background:var(--muted)"></i> click a class for its role</span>
+    </div>
+  </header>
+
+  <!-- A · CLASS DESIGN (interactive class map) -->
+  <section>
+    <div class="sec-h"><span class="n">A</span><h2>Class design — click a class in the map</h2><span class="tag">the object model, wired</span></div>
+    <div>
+      <div class="arch">
+        <svg viewBox="0 0 760 290" width="100%" style="max-width:760px" role="img" aria-label="Notification system class map">
+          <defs>
+            <marker id="ah" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" fill="var(--muted)"></path></marker>
+          </defs>
+
+          <!-- wiring arrows -->
+          <line class="arrow" x1="76" y1="60" x2="76" y2="86" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"></line>
+          <path class="arrow" d="M136,44 C 170,64 176,90 196,102" fill="none" stroke="var(--muted)" stroke-width="2" stroke-dasharray="4 3" marker-end="url(#ah)"></path>
+          <line class="arrow" x1="136" y1="108" x2="196" y2="108" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"></line>
+          <line class="arrow" x1="256" y1="86" x2="256" y2="62" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"></line>
+          <line class="arrow" x1="256" y1="130" x2="256" y2="154" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"></line>
+          <path class="arrow" d="M196,124 C 168,160 168,214 196,244" fill="none" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"></path>
+          <line class="arrow" x1="316" y1="100" x2="386" y2="56" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"></line>
+          <line class="arrow" x1="316" y1="108" x2="386" y2="108" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"></line>
+          <line class="arrow" x1="316" y1="118" x2="386" y2="240" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"></line>
+          <line class="arrow" x1="316" y1="178" x2="386" y2="178" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"></line>
+          <line class="arrow" x1="516" y1="38" x2="596" y2="38" stroke="var(--muted)" stroke-width="2" stroke-dasharray="4 3" marker-end="url(#ah)"></line>
+          <line class="arrow" x1="516" y1="108" x2="596" y2="108" stroke="var(--muted)" stroke-width="2" stroke-dasharray="4 3" marker-end="url(#ah)"></line>
+          <text x="142" y="120" fill="var(--faint)" font-size="9">uses</text>
+          <text x="524" y="32" fill="var(--faint)" font-size="9">impl</text>
+
+          <!-- nodes -->
+          <g data-node style="cursor:pointer" data-title="AppConfig  (config)" data-detail="<b>Role:</b> manual DI / composition root — the job Spring's ApplicationContext would do (Factory pattern).<br><b>Wiring:</b> <code>createNotificationService()</code> new-ups the four handlers into an <code>EnumMap&lt;Channel,NotificationHandler&gt;</code>, plus PreferenceService, TemplateService (+ SimpleTemplateEngine), DeliveryTracker and InMemoryPriorityQueue, and injects them into NotificationService. <code>createController()</code> seeds demo templates &amp; preferences then wraps the service.<br><b>Constants:</b> MAX_RETRIES_PUSH=5, MAX_RETRIES_EMAIL=5, MAX_RETRIES_SMS=3. The one place wiring changes."><rect x="16" y="16" width="120" height="44" rx="9" fill="var(--panel-2)" stroke="var(--eden)"></rect><text x="76" y="36" text-anchor="middle" fill="var(--eden)" font-size="12" font-weight="600">AppConfig</text><text x="76" y="51" text-anchor="middle" fill="var(--faint)" font-size="10">composition root</text></g>
+
+          <g data-node style="cursor:pointer" data-title="NotificationController  (controller)" data-detail="<b>Role:</b> framework-free stand-in for a Spring @RestController.<br><b>Methods:</b> handleSend → send, handleProcessQueue(batch) → drain the queue, handleGetStatus(id) → status + delivery attempts, handleRetryFailed → re-enqueue failures.<br><b>Wiring:</b> holds one NotificationService and delegates every call; it also reaches through <code>getDeliveryTracker()</code> to print per-notification attempts."><rect x="16" y="86" width="120" height="44" rx="9" fill="var(--panel-2)" stroke="var(--border)"></rect><text x="76" y="106" text-anchor="middle" fill="var(--text)" font-size="12" font-weight="600">Controller</text><text x="76" y="121" text-anchor="middle" fill="var(--faint)" font-size="10">API endpoints</text></g>
+
+          <g data-node style="cursor:pointer" data-title="PreferenceService  (service)" data-detail="<b>Role:</b> the gate. <code>canSend(userId, channel, now)</code> returns false if the user disabled that channel or the moment falls inside their quiet-hours window.<br><b>getOrDefault():</b> returns saved UserPreference or a brand-new all-enabled default (fail-open). Backed only by PreferenceRepository."><rect x="196" y="16" width="120" height="44" rx="9" fill="var(--panel-2)" stroke="var(--border)"></rect><text x="256" y="36" text-anchor="middle" fill="var(--text)" font-size="11" font-weight="600">PrefService</text><text x="256" y="51" text-anchor="middle" fill="var(--faint)" font-size="10">opt-in / quiet hrs</text></g>
+
+          <g data-node style="cursor:pointer" data-title="NotificationService  (service)" data-detail="<b>Role:</b> the orchestrator. Holds the repository, PreferenceService, TemplateService, DeliveryTracker, the NotificationQueue, and the <code>Map&lt;Channel,NotificationHandler&gt;</code> registry.<br><b>send():</b> per user → canSend? → render template → pick maxRetries by channel → Notification.Builder → save → set QUEUED → enqueue.<br><b>processQueue(n):</b> dequeue → route to handler → record attempt → on SENT mark sent+delivered, else markFailed + incrementRetry + re-enqueue if retryable.<br>Depends only on the three interfaces."><rect x="196" y="86" width="120" height="44" rx="9" fill="var(--panel-2)" stroke="var(--border)"></rect><text x="256" y="106" text-anchor="middle" fill="var(--text)" font-size="11" font-weight="600">NotifService</text><text x="256" y="121" text-anchor="middle" fill="var(--faint)" font-size="10">orchestrator</text></g>
+
+          <g data-node style="cursor:pointer" data-title="TemplateService  (service)" data-detail="<b>Role:</b> load + render. <code>renderTemplate(templateId, data)</code> loads the NotificationTemplate (→ TemplateNotFoundException if absent), validates required variables via the engine, then renders subject + body and returns <code>String[]{subject, body}</code>."><rect x="196" y="156" width="120" height="44" rx="9" fill="var(--panel-2)" stroke="var(--border)"></rect><text x="256" y="176" text-anchor="middle" fill="var(--text)" font-size="11" font-weight="600">TemplateService</text><text x="256" y="191" text-anchor="middle" fill="var(--faint)" font-size="10">load + render</text></g>
+
+          <g data-node style="cursor:pointer" data-title="DeliveryTracker  (service)" data-detail="<b>Role:</b> observability. <code>record(attempt)</code> appends every DeliveryAttempt into a <code>ConcurrentHashMap&lt;notificationId, List&lt;DeliveryAttempt&gt;&gt;</code>.<br><b>getAttempts(id)</b> returns the audit trail; <b>printStats()</b> streams the map to tally total/sent/delivered/failed. This is the Observer sink of the send path."><rect x="196" y="226" width="120" height="44" rx="9" fill="var(--panel-2)" stroke="var(--border)"></rect><text x="256" y="246" text-anchor="middle" fill="var(--text)" font-size="11" font-weight="600">DeliveryTracker</text><text x="256" y="261" text-anchor="middle" fill="var(--faint)" font-size="10">attempt log + stats</text></g>
+
+          <g data-node style="cursor:pointer" data-title="NotificationHandler  «interface»" data-detail="<b>Role:</b> the Strategy contract — <code>DeliveryAttempt send(Notification)</code>, <code>Channel supportedChannel()</code>, <code>boolean isAvailable()</code>.<br><b>Why:</b> the service routes by channel through a Map and calls the interface only, so a new channel (WhatsApp, Slack) is a new class + one registry line (Open-Closed). Four implementations ship today."><rect x="386" y="16" width="130" height="44" rx="9" fill="var(--panel-2)" stroke="var(--survivor)"></rect><text x="451" y="35" text-anchor="middle" fill="var(--survivor)" font-size="10" font-weight="600">NotificationHandler</text><text x="451" y="50" text-anchor="middle" fill="var(--faint)" font-size="10">«interface»</text></g>
+
+          <g data-node style="cursor:pointer" data-title="NotificationQueue  «interface»" data-detail="<b>Role:</b> the buffering contract — <code>enqueue</code>, <code>dequeue</code>, <code>size</code>, <code>isEmpty</code>.<br><b>Why:</b> the service is unaware of whether it is talking to an in-memory queue or Kafka/SQS. Producer-Consumer boundary between the accept path and the delivery path."><rect x="386" y="86" width="130" height="44" rx="9" fill="var(--panel-2)" stroke="var(--survivor)"></rect><text x="451" y="105" text-anchor="middle" fill="var(--survivor)" font-size="10" font-weight="600">NotificationQueue</text><text x="451" y="120" text-anchor="middle" fill="var(--faint)" font-size="10">«interface»</text></g>
+
+          <g data-node style="cursor:pointer" data-title="SimpleTemplateEngine" data-detail="<b>Role:</b> string processing. <code>render(template, data)</code> substitutes every <code>{{key}}</code> with its value; <code>extractVariables()</code> pulls placeholders via the regex <code>\\{\\{(\\w+)}}</code>; <code>validate()</code> throws IllegalArgumentException if a required variable is missing. No external deps."><rect x="386" y="156" width="130" height="44" rx="9" fill="var(--panel-2)" stroke="var(--old)"></rect><text x="451" y="176" text-anchor="middle" fill="var(--old)" font-size="11" font-weight="600">TemplateEngine</text><text x="451" y="191" text-anchor="middle" fill="var(--faint)" font-size="10">{{var}} render</text></g>
+
+          <g data-node style="cursor:pointer" data-title="NotificationRepository  «interface»" data-detail="<b>Role:</b> the data-access contract — <code>save</code>, <code>findById</code>, <code>findByUserId</code>, <code>updateStatus</code>, <code>findRetryable()</code> (FAILED + retries left).<br><b>Why:</b> storage swaps (in-memory today, DynamoDB / Cassandra tomorrow) with no service change. Repository pattern. Two sibling repos — PreferenceRepository, TemplateRepository — follow the same shape."><rect x="386" y="226" width="130" height="44" rx="9" fill="var(--panel-2)" stroke="var(--survivor)"></rect><text x="451" y="245" text-anchor="middle" fill="var(--survivor)" font-size="10" font-weight="600">NotifRepository</text><text x="451" y="260" text-anchor="middle" fill="var(--faint)" font-size="10">«interface»</text></g>
+
+          <g data-node style="cursor:pointer" data-title="Push / Email / Sms / InApp Handlers" data-detail="<b>Role:</b> the four Strategy implementations, one per Channel.<br><b>PushNotificationHandler</b> — FCM/APNs sim, 90% success, else <code>FCM:device_not_registered</code>.<br><b>EmailNotificationHandler</b> — SES sim, 95% success, else <code>SES:bounce_invalid_address</code>.<br><b>SmsNotificationHandler</b> — Twilio sim, 85% success, else <code>Twilio:undeliverable</code>.<br><b>InAppNotificationHandler</b> — always SENT, writes an in-app record.<br>Each returns a DeliveryAttempt (never throws) and reports <code>isAvailable()</code>."><rect x="596" y="16" width="140" height="44" rx="9" fill="var(--panel-2)" stroke="var(--old)"></rect><text x="666" y="35" text-anchor="middle" fill="var(--old)" font-size="10" font-weight="600">Push·Email·Sms·InApp</text><text x="666" y="50" text-anchor="middle" fill="var(--faint)" font-size="10">4 strategies</text></g>
+
+          <g data-node style="cursor:pointer" data-title="InMemoryPriorityQueue" data-detail="<b>Role:</b> the MVP queue. Wraps a <code>PriorityBlockingQueue&lt;Notification&gt;</code> — thread-safe, orders by Notification.compareTo (priority value).<br><b>dequeue()</b> is <code>poll()</code> — non-blocking, returns null when empty, so the worker loop drains and stops rather than blocking. Production: Kafka topics per priority."><rect x="596" y="86" width="140" height="44" rx="9" fill="var(--panel-2)" stroke="var(--old)"></rect><text x="666" y="105" text-anchor="middle" fill="var(--old)" font-size="11" font-weight="600">PriorityQueue</text><text x="666" y="120" text-anchor="middle" fill="var(--faint)" font-size="9">PriorityBlockingQueue</text></g>
+
+          <g data-node style="cursor:pointer" data-title="Notification  (model)" data-detail="<b>Role:</b> the core domain entity, built via the <b>Builder pattern</b> and <code>implements Comparable&lt;Notification&gt;</code> so the priority queue can order it.<br><b>Fields:</b> id (8-char UUID), userId, templateId, channel, priority, status, subject, body, data, scheduledAt, sentAt, deliveredAt, retryCount, maxRetries, createdAt.<br><b>Logic:</b> markAsSent / markAsDelivered / markAsFailed / incrementRetry, and <code>isRetryable() = retryCount &lt; maxRetries &amp;&amp; status==FAILED</code>."><rect x="596" y="156" width="140" height="44" rx="9" fill="var(--panel-2)" stroke="var(--warn)"></rect><text x="666" y="176" text-anchor="middle" fill="var(--warn)" font-size="12" font-weight="600">Notification</text><text x="666" y="191" text-anchor="middle" fill="var(--faint)" font-size="10">«Builder» entity</text></g>
+
+          <g data-node style="cursor:pointer" data-title="DeliveryAttempt  (model)" data-detail="<b>Role:</b> immutable per-attempt record returned by every handler.<br><b>Fields:</b> notificationId, attemptNumber (retryCount + 1), status (SENT / FAILED), providerResponse (e.g. <code>FCM:msg_id_...</code>), timestamp — all final, set through the all-args constructor.<br>Recorded by DeliveryTracker for the audit trail and stats."><rect x="596" y="226" width="140" height="44" rx="9" fill="var(--panel-2)" stroke="var(--warn)"></rect><text x="666" y="246" text-anchor="middle" fill="var(--warn)" font-size="11" font-weight="600">DeliveryAttempt</text><text x="666" y="261" text-anchor="middle" fill="var(--faint)" font-size="10">attempt record</text></g>
+        </svg>
+      </div>
+      <div class="node-detail"><span class="nd-title">Click any class</span><div class="nd-body">Its responsibility, key methods, and how it is wired appear here. Dashed arrows are <i>implements</i>; solid arrows are <i>uses</i>. Notice the Service depends only on the three <b>«interface»</b> boxes — that is what makes channels, the queue, and storage swappable.</div></div>
+    </div>
+  </section>
+
+  <!-- B · PRIORITY ORDERING + RETRY (core algorithm) -->
+  <section>
+    <div class="sec-h"><span class="n">B</span><h2>Priority ordering &amp; the send → process → retry loop</h2><span class="tag">Notification · PriorityQueue · processQueue</span></div>
+    <div class="grid g2">
+      <div class="card">
+        <div class="kicker">the code (verbatim)</div>
+        <pre class="code"><span class="cm">// Notification implements Comparable — lower value wins</span>
+<span class="kw">public int</span> <span class="ty">compareTo</span>(Notification other) {
+  <span class="kw">return</span> Integer.compare(
+      <span class="kw">this</span>.priority.getValue(),
+      other.priority.getValue());
+}
+
+<span class="cm">// eligible for another attempt?</span>
+<span class="kw">public boolean</span> <span class="ty">isRetryable</span>() {
+  <span class="kw">return</span> retryCount &lt; maxRetries
+      &amp;&amp; status == NotificationStatus.FAILED;
+}
+
+<span class="cm">// InMemoryPriorityQueue — non-blocking drain</span>
+<span class="kw">public</span> Notification <span class="ty">dequeue</span>() {
+  <span class="kw">return</span> queue.poll(); <span class="cm">// null when empty</span>
+}</pre>
+        <p class="muted"><code>Priority</code> = CRITICAL(0), HIGH(1), MEDIUM(2), LOW(3). The <code>PriorityBlockingQueue</code> keeps a heap ordered by <code>compareTo</code>, so the smallest value is always dequeued first.</p>
+      </div>
+      <div class="card">
+        <div class="kicker">worked example — mixed priorities + one retry</div>
+        <pre class="code"><span class="cm">// enqueue order (as they arrive)</span>
+enqueue  LOW(3)  · CRITICAL(0) · HIGH(1) · MEDIUM(2)
+
+<span class="cm">// heap re-orders by priority.value</span>
+dequeue → CRITICAL(0)   ■ SENT     ✓ delivered
+dequeue → HIGH(1)       ■ FAILED   retry 1/5
+        └ isRetryable? 1&lt;5 &amp;&amp; FAILED → re-enqueue
+dequeue → MEDIUM(2)     ■ SENT     ✓ delivered
+dequeue → LOW(3)        ■ SENT     ✓ delivered
+dequeue → HIGH(1)*      ■ SENT     ✓ delivered  <span class="cm">(the retry)</span>
+
+<span class="cm">// IN_APP maxRetries = 0 → isRetryable never true</span></pre>
+        <p class="muted">On failure the service calls <code>markAsFailed()</code> → <code>incrementRetry()</code>; if <code>isRetryable()</code> it re-enqueues, where the same priority puts it back ahead of lower-priority work.</p>
+      </div>
+    </div>
+    <div class="callout tip"><b>Exponential backoff (conceptual).</b> The production retry delay is <code>BASE_DELAY_MS · 2^retryCount</code> → 2s, 4s, 8s, 16s, 32s, spacing attempts so a flaky provider is not hammered. The in-memory demo re-enqueues <i>immediately</i> (no scheduler); channel caps are PUSH=5, EMAIL=5, SMS=3, IN_APP=0. Once <code>retryCount == maxRetries</code> the notification is left FAILED — in production it moves to a Dead-Letter Queue for investigation and replay.</div>
+  </section>
+
+  <!-- C · CHANNEL HANDLERS (Strategy, tabs) -->
+  <section>
+    <div class="sec-h"><span class="n">C</span><h2>Channel handlers (Strategy pattern)</h2><span class="tag">swap the channel, not the service</span></div>
+    <div data-tabscope>
+      <div class="tabs">
+        <button class="tab active" data-tab="push">Push</button>
+        <button class="tab" data-tab="email">Email</button>
+        <button class="tab" data-tab="sms">SMS</button>
+        <button class="tab" data-tab="inapp">In-App</button>
+        <button class="tab" data-tab="beyond">Beyond MVP</button>
+      </div>
+      <div class="tabpanel active" data-panel="push">
+        <p><b>PushNotificationHandler</b> — simulates FCM / APNs. <span class="run">supportedChannel() = PUSH · maxRetries 5</span></p>
+        <ul class="tight">
+          <li><b>Success:</b> 90% (<code>random.nextInt(100) &lt; 90</code>) → status SENT, response <code>FCM:msg_id_…</code>.</li>
+          <li><b>Failure:</b> response <code>FCM:device_not_registered</code> → FAILED, retried up to 5×.</li>
+          <li><b>Returns</b> a DeliveryAttempt (never throws) so the worker loop stays simple.</li>
+        </ul>
+      </div>
+      <div class="tabpanel" data-panel="email">
+        <p><b>EmailNotificationHandler</b> — simulates AWS SES. <span class="run">supportedChannel() = EMAIL · maxRetries 5</span></p>
+        <ul class="tight">
+          <li><b>Success:</b> 95% → status SENT, response <code>SES:message_id_…</code>.</li>
+          <li><b>Failure:</b> response <code>SES:bounce_invalid_address</code> → FAILED.</li>
+          <li>Highest reliability of the external channels; cheap enough for 5 retries.</li>
+        </ul>
+      </div>
+      <div class="tabpanel" data-panel="sms">
+        <p><b>SmsNotificationHandler</b> — simulates Twilio. <span class="run">supportedChannel() = SMS · maxRetries 3</span></p>
+        <ul class="tight">
+          <li><b>Success:</b> 85% (the noisiest channel) → response <code>Twilio:SM_…</code>.</li>
+          <li><b>Failure:</b> response <code>Twilio:undeliverable</code> → FAILED.</li>
+          <li>Only 3 retries — SMS is expensive, so we give up sooner than push/email.</li>
+        </ul>
+      </div>
+      <div class="tabpanel" data-panel="inapp">
+        <p><b>InAppNotificationHandler</b> — writes an in-app record, no external call. <span class="run">supportedChannel() = IN_APP · maxRetries 0</span></p>
+        <ul class="tight">
+          <li><b>Success:</b> always — returns SENT with <code>stored:notif_…</code>.</li>
+          <li><b>isAvailable()</b> is always true; no provider to be down.</li>
+          <li>maxRetries 0 → <code>isRetryable()</code> can never be true (nothing to retry).</li>
+        </ul>
+      </div>
+      <div class="tabpanel" data-panel="beyond">
+        <p>Not in the repo, but the interface makes them drop-in — implement <code>NotificationHandler</code> and register in <code>AppConfig</code>:</p>
+        <ul class="tight">
+          <li><b>WhatsApp / Slack:</b> add a <code>Channel</code> enum value + one handler + one registry entry. Zero changes to the service.</li>
+          <li><b>Circuit breaker:</b> <code>isAvailable()</code> is the hook — flip it false when a provider errors repeatedly so the service skips and re-queues rather than hammering a dead endpoint.</li>
+        </ul>
+      </div>
+    </div>
+    <table>
+      <thead><tr><th>Aspect</th><th>Push</th><th>Email</th><th>SMS</th><th>In-App</th></tr></thead>
+      <tbody>
+        <tr><td>Provider (simulated)</td><td>FCM / APNs</td><td>AWS SES</td><td>Twilio</td><td>in-app store</td></tr>
+        <tr><td>Success rate</td><td>90%</td><td>95%</td><td>85%</td><td>100%</td></tr>
+        <tr><td>Max retries</td><td>5</td><td>5</td><td>3</td><td>0</td></tr>
+        <tr><td>Failure response</td><td>device_not_registered</td><td>bounce_invalid_address</td><td>undeliverable</td><td>n/a</td></tr>
+        <tr><td>External dependency</td><td>yes</td><td>yes</td><td>yes</td><td>no</td></tr>
+      </tbody>
+    </table>
+    <div class="callout"><b>The pattern:</b> <code>NotificationService</code> holds a <code>Map&lt;Channel, NotificationHandler&gt;</code> and never branches on channel type — it does <code>handlers.get(notification.getChannel()).send(notification)</code>, an O(1) dispatch. Adding a channel is a new class + one <code>EnumMap</code> entry in <code>AppConfig</code>, with <b>zero</b> changes to the service, controller, queue, or repository (Open-Closed Principle).</div>
+  </section>
+
+  <!-- D · DATA MODEL -->
+  <section>
+    <div class="sec-h"><span class="n">D</span><h2>Data model detail</h2><span class="tag">Notification · DeliveryAttempt · UserPreference · Template</span></div>
+    <div class="grid g2">
+      <div class="card">
+        <div class="kicker">Notification — the queued entity</div>
+        <pre class="code">id          String   <span class="cm">// 8-char UUID (KEY)</span>
+userId      String
+templateId  String
+channel     Channel     <span class="cm">// PUSH/EMAIL/SMS/IN_APP</span>
+priority    Priority    <span class="cm">// CRITICAL..LOW, orders queue</span>
+status      NotificationStatus
+subject     String   body String
+data        Map&lt;String,String&gt;
+scheduledAt LocalDateTime <span class="cm">// null = immediate</span>
+sentAt / deliveredAt  LocalDateTime
+retryCount  int   maxRetries int
+createdAt   LocalDateTime</pre>
+        <p class="muted"><code>id</code>, required fields and timestamps set through the Builder; only <code>status</code>, <code>subject</code>, <code>body</code>, <code>sentAt</code>, <code>deliveredAt</code>, <code>retryCount</code> mutate. Keyed by <code>id</code> in the <code>ConcurrentHashMap</code> store; <code>implements Comparable</code> on <code>priority.value</code> for the heap.</p>
+      </div>
+      <div class="card">
+        <div class="kicker">DeliveryAttempt — append-only audit</div>
+        <pre class="code">notificationId   String
+attemptNumber    int    <span class="cm">// retryCount + 1</span>
+status           NotificationStatus  <span class="cm">// SENT/FAILED</span>
+providerResponse String <span class="cm">// "FCM:msg_id_ab12cd34"</span>
+timestamp        LocalDateTime</pre>
+        <p class="muted">Fully immutable (all-args constructor, all fields final). Held in DeliveryTracker's <code>Map&lt;notificationId, List&lt;DeliveryAttempt&gt;&gt;</code> — one list per notification, appended on every attempt. In production this is an append-only event stream keyed by <code>notificationId</code>.</p>
+      </div>
+      <div class="card">
+        <div class="kicker">UserPreference — the send gate</div>
+        <pre class="code">userId            String
+channelEnabled    EnumMap&lt;Channel,Boolean&gt;  <span class="cm">// all true by default</span>
+quietHoursStart   int  <span class="cm">// default 22</span>
+quietHoursEnd     int  <span class="cm">// default 8  (wraps midnight)</span>
+dailyFrequencyCap EnumMap&lt;Channel,Integer&gt;  <span class="cm">// PUSH50 EMAIL10 SMS5 INAPP100</span></pre>
+        <p class="muted"><code>isQuietHours(now)</code> handles the overnight wrap (22→08) with an OR test. <code>PreferenceService.canSend()</code> reads only channel-enabled + quiet-hours today; the frequency cap is modelled but not yet enforced.</p>
+      </div>
+      <div class="card">
+        <div class="kicker">NotificationTemplate — content, decoupled</div>
+        <pre class="code">id                String   <span class="cm">// "order-confirmation"</span>
+name              String
+channel           Channel
+subjectTemplate   String   <span class="cm">// "Order {{orderId}} Confirmed"</span>
+bodyTemplate      String   <span class="cm">// "Hi {{name}}, ..."</span>
+requiredVariables List&lt;String&gt; <span class="cm">// ["name","orderId",...]</span></pre>
+        <p class="muted">Stored in TemplateRepository and rendered at send time by SimpleTemplateEngine. <code>subjectTemplate</code> may be null (e.g. the SMS OTP template) — the engine simply returns null for it.</p>
+      </div>
+    </div>
+    <div class="callout tip"><b>Status lifecycle:</b> <code>PENDING → QUEUED → SENDING → SENT → DELIVERED</code> on the happy path; a handler failure goes <code>SENDING → FAILED</code> and, if retries remain, back to <code>QUEUED</code>. <code>NotificationStatus.isTerminal()</code> marks DELIVERED / FAILED / BOUNCED / CANCELLED as done.</div>
+  </section>
+
+  <!-- E · REQUEST SEQUENCES -->
+  <section>
+    <div class="sec-h"><span class="n">E</span><h2>Request handling sequence</h2><span class="tag">which class does what, in order</span></div>
+
+    <div class="collapsible open">
+      <div class="c-head"><h3>POST /api/notifications/send &nbsp;→&nbsp; accept &amp; enqueue</h3></div>
+      <div class="c-body">
+        <pre class="code"><span class="cm">Controller.handleSend(request)</span>
+  └─ NotificationService.send(request)
+       for each userId in request.getUserIds():
+       1  preferenceService.canSend(userId, channel, now)
+            false? → print [SKIP], continue   <span class="cm">// opted out / quiet hours</span>
+       2  templateService.renderTemplate(templateId, data)
+            → validate required vars → [subject, body]
+            (missing template → TemplateNotFoundException)
+       3  maxRetries = switch(channel){PUSH,EMAIL→5; SMS→3; IN_APP→0}
+       4  new Notification.Builder()...build()   <span class="cm">// status PENDING</span>
+       5  repository.save(notification)
+       6  notification.setStatus(QUEUED); queue.enqueue(notification)
+  └─ return  id  |  "batch:N"  |  "none:all_skipped"</pre>
+        <p class="muted">The accept path never delivers — it validates, renders, persists and enqueues, then returns fast. Batch is just the same loop over many <code>userIds</code>; skipped users don't abort the batch.</p>
+      </div>
+    </div>
+
+    <div class="collapsible open">
+      <div class="c-head"><h3>PROCESS &nbsp;→&nbsp; drain the queue &amp; deliver</h3></div>
+      <div class="c-body">
+        <pre class="code"><span class="cm">Controller.handleProcessQueue(maxBatch)</span>
+  └─ NotificationService.processQueue(maxBatch)
+       loop up to maxBatch times:
+       1  notification = queue.dequeue()        <span class="cm">// poll(); null → break</span>
+       2  handler = handlers.get(notification.getChannel())
+            null? → markAsFailed, save, continue
+       3  notification.setStatus(SENDING)
+       4  attempt = handler.send(notification)   <span class="cm">// DeliveryAttempt</span>
+          deliveryTracker.record(attempt)
+       5  attempt.status == SENT ?
+            yes → markAsSent(); markAsDelivered(); save
+            no  → markAsFailed(); incrementRetry(); save
+                  isRetryable()? → queue.enqueue(notification)  <span class="cm">// [RETRY]</span>
+                                 else → [EXHAUSTED]
+  └─ return processed count</pre>
+        <p class="muted">Highest-priority notifications come off the heap first. A re-enqueued retry rejoins the heap at its own priority, so a CRITICAL retry still beats a fresh LOW.</p>
+      </div>
+    </div>
+
+    <div class="collapsible open">
+      <div class="c-head"><h3>POST /api/notifications/retry &nbsp;→&nbsp; sweep failures</h3></div>
+      <div class="c-body">
+        <pre class="code"><span class="cm">Controller.handleRetryFailed()</span>
+  └─ NotificationService.retryFailed()
+       1  repository.findRetryable()   <span class="cm">// FAILED && retryCount < maxRetries</span>
+       2  for each: setStatus(QUEUED); queue.enqueue(n)
+       3  print "Re-enqueued N failed notifications"
+  └─ a later processQueue() picks them up again</pre>
+        <p class="muted">A batch sweep complements the inline retry inside <code>processQueue</code> — it re-collects everything still eligible (e.g. after a provider outage) straight from the repository and puts it back on the queue.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- F · DESIGN PATTERNS -->
+  <section>
+    <div class="sec-h"><span class="n">F</span><h2>Design patterns used</h2><span class="tag">GoF-categorized</span></div>
+    <div class="grid g3">
+      <div class="card">
+        <div class="kicker">Creational</div>
+        <ul class="tight">
+          <li><b>Builder</b> — <code>Notification.Builder</code>. Readable construction of a 15-field entity; <code>build()</code> enforces required <code>userId</code> &amp; <code>channel</code> and defaults id/priority/status.</li>
+          <li><b>Factory</b> — <code>AppConfig</code> builds the <code>EnumMap&lt;Channel,Handler&gt;</code> registry and wires the whole graph (composition root).</li>
+        </ul>
+      </div>
+      <div class="card">
+        <div class="kicker">Behavioral</div>
+        <ul class="tight">
+          <li><b>Strategy</b> — <code>NotificationHandler</code> + Push/Email/Sms/InApp. The centrepiece: swap the channel without touching the service.</li>
+          <li><b>Template Method</b> — the fixed pipeline <code>canSend → render → build → enqueue → send → track</code>; only <code>send()</code> varies per channel.</li>
+          <li><b>Observer</b> — handlers emit a <code>DeliveryAttempt</code> that <code>DeliveryTracker</code> records; in production a Kafka delivery-events topic.</li>
+        </ul>
+      </div>
+      <div class="card">
+        <div class="kicker">Architectural / Concurrency</div>
+        <ul class="tight">
+          <li><b>Producer-Consumer</b> — <code>send()</code> enqueues; <code>processQueue()</code> drains. Accept and deliver are decoupled by the queue.</li>
+          <li><b>Repository</b> — three interfaces (Notification / Preference / Template) over <code>ConcurrentHashMap</code> impls; swap in DynamoDB / Cassandra with no service change.</li>
+          <li><b>Dependency Injection</b> — constructor injection everywhere, wired by hand in AppConfig.</li>
+        </ul>
+      </div>
+    </div>
+    <div class="callout"><b>Why they cluster:</b> Strategy + Factory + DI deliver the Open-Closed Principle — new channels are <i>additions</i>, never edits. Producer-Consumer + <code>PriorityBlockingQueue</code> keep the accept path fast and priority-aware; Observer via DeliveryTracker keeps delivery and tracking separable; Repository keeps storage swappable. <span class="run">→ scaling &amp; the fan-out / DLQ follow-up on canvas 3</span></div>
+  </section>
+
+  <!-- RUN IT -->
+  <section>
+    <div class="sec-h"><span class="n">▶</span><h2>Run it — repo file map</h2><span class="tag">concept → actual Java class</span></div>
+    <table>
+      <thead><tr><th>Concept above</th><th>File in <code>03-notification-system/src/main/java/…/notification/</code></th></tr></thead>
+      <tbody>
+        <tr><td>Composition root / wiring + seeds</td><td><code>config/AppConfig.java</code></td></tr>
+        <tr><td>API endpoints</td><td><code>controller/NotificationController.java</code></td></tr>
+        <tr><td>Orchestrator (send / processQueue / retry)</td><td><code>service/NotificationService.java</code></td></tr>
+        <tr><td>Send gate · template render · attempt log</td><td><code>service/PreferenceService.java</code> · <code>TemplateService.java</code> · <code>DeliveryTracker.java</code></td></tr>
+        <tr><td>Strategy contract (§C)</td><td><code>handler/NotificationHandler.java</code></td></tr>
+        <tr><td>Channel handlers (§C)</td><td><code>handler/PushNotificationHandler.java</code> · <code>EmailNotificationHandler.java</code> · <code>SmsNotificationHandler.java</code> · <code>InAppNotificationHandler.java</code></td></tr>
+        <tr><td>Queue contract + priority impl (§B)</td><td><code>queue/NotificationQueue.java</code> · <code>InMemoryPriorityQueue.java</code></td></tr>
+        <tr><td>Template engine ({{var}})</td><td><code>template/SimpleTemplateEngine.java</code></td></tr>
+        <tr><td>Storage contracts + impls</td><td><code>repository/NotificationRepository.java</code> · <code>PreferenceRepository.java</code> · <code>TemplateRepository.java</code> (+ InMemory impls)</td></tr>
+        <tr><td>Domain models (§D)</td><td><code>model/Notification.java</code> · <code>DeliveryAttempt.java</code> · <code>UserPreference.java</code> · <code>NotificationTemplate.java</code> · <code>NotificationRequest.java</code></td></tr>
+        <tr><td>Enums</td><td><code>model/Channel.java</code> · <code>Priority.java</code> · <code>NotificationStatus.java</code></td></tr>
+        <tr><td>Exceptions</td><td><code>exception/NotificationException.java</code> · <code>TemplateNotFoundException.java</code> · <code>UserOptedOutException.java</code></td></tr>
+        <tr><td>Runnable demo (main)</td><td><code>NotificationApp.java</code></td></tr>
+      </tbody>
+    </table>
+    <div class="callout tip"><b>Run the demo</b> (Gradle <code>application</code> plugin, mainClass <code>NotificationApp</code>, no framework):<br><pre class="code">./gradlew :03-notification-system:run</pre>It walks six scenarios: single email, a CRITICAL SMS OTP, a preference-blocked send (Bob opted out of SMS), push with retries, a batch fan-out (Carol skipped in quiet hours), and an all-four-channels burst — then prints delivery statistics.</div>
+  </section>
+
+  <!-- GLOSSARY -->
+  <section>
+    <div class="sec-h"><span class="n">§</span><h2>Glossary — one-liners</h2><span class="tag">terms used above</span></div>
+    <div class="grid g2">
+      <div class="card"><table><tbody>
+        <tr><td><b>Strategy pattern</b></td><td>family of interchangeable algorithms (one handler per channel) behind one interface</td></tr>
+        <tr><td><b>Builder pattern</b></td><td>fluent step-by-step construction of an immutable object with optional fields</td></tr>
+        <tr><td><b>Template Method</b></td><td>fixed pipeline skeleton where only one step (send) varies per channel</td></tr>
+        <tr><td><b>Producer-Consumer</b></td><td>accept path enqueues, worker path dequeues — decoupled by a buffer</td></tr>
+        <tr><td><b>Repository pattern</b></td><td>interface over data access so storage swaps without touching logic</td></tr>
+      </tbody></table></div>
+      <div class="card"><table><tbody>
+        <tr><td><b>PriorityBlockingQueue</b></td><td>thread-safe heap that dequeues the lowest Comparable value (CRITICAL) first</td></tr>
+        <tr><td><b>Comparable</b></td><td><code>compareTo</code> on priority.value lets the queue order notifications</td></tr>
+        <tr><td><b>Exponential backoff</b></td><td>retry delay doubles each attempt (BASE · 2^n) to spare a flaky provider</td></tr>
+        <tr><td><b>DLQ</b></td><td>Dead-Letter Queue — where notifications land after retries are exhausted</td></tr>
+        <tr><td><b>Quiet hours</b></td><td>per-user window (e.g. 22→08) during which non-critical sends are suppressed</td></tr>
+      </tbody></table></div>
+    </div>
+  </section>
+
+  <footer>
+    <p>Use case 03 · Notification System — Canvas 2 of 3 (LLD). Grounded in <code>03-notification-system/docs/lld/</code>, <code>docs/patterns/</code>, and the Java under <code>src/main/java/com/systemdesign/notification</code>.</p>
+    <p class="run">This use case: <a href="hld.html">Canvas 1 · HLD</a> · LLD · <a href="deepdive.html">Canvas 3 · Deep-dive &amp; Trade-offs</a> &nbsp;|&nbsp; Next → <a href="deepdive.html">Canvas 3 · Deep-dive &amp; Trade-offs</a> &nbsp;|&nbsp; <a href="../index.html">Hub</a></p>
+  </footer>
+
+</div>
+<script src="../assets/canvas.js"></script>
+</body>
+</html>

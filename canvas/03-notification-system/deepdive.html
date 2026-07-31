@@ -1,0 +1,352 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>03 · Notification System — Deep-dive &amp; Trade-offs</title>
+<link rel="stylesheet" href="../assets/canvas.css">
+</head>
+<body>
+<div class="wrap">
+
+  <header class="hero">
+    <h1>Notification System — Deep-dive &amp; Trade-offs</h1>
+    <div class="sub">Use case 03 · Canvas 3 of 3. The hard parts: how to <b>scale</b> Kafka and the workers, the <b>caching</b> details that decide whether an opt-out is honoured, the <b>bottlenecks</b> that break delivery (and their fixes), why this is an <b>AP</b> system with a CP exception for preferences, and a phase-by-phase <b>interview walkthrough</b>. <b>Switch the partition tabs</b> and <b>open the bottleneck cards</b> to explore.</div>
+    <div class="badges">
+      <span class="badge lvl">Use case 03 · Deep-dive</span>
+      <span class="badge">Canvas 3 of 3</span>
+      <span class="badge">interactive</span>
+      <span class="badge">AP · fail-open delivery</span>
+    </div>
+    <div class="legend">
+      <span><i class="dot" style="background:var(--eden)"></i> switch a tab</span>
+      <span><i class="dot" style="background:var(--old)"></i> open a bottleneck</span>
+      <span><i class="dot" style="background:var(--survivor)"></i> chosen option</span>
+      <span><i class="dot" style="background:var(--warn)"></i> failure / risk</span>
+      <span><i class="dot" style="background:var(--gc)"></i> fix / mitigation</span>
+    </div>
+  </header>
+
+  <!-- A · SCALING STRATEGY -->
+  <section>
+    <div class="sec-h"><span class="n">A</span><h2>Scaling strategy</h2><span class="tag">what to partition &amp; how</span></div>
+    <div class="grid g3">
+      <div class="card"><div class="kicker">API + service tier</div><h3>Stateless → horizontal</h3><p class="muted">The API gateway and <code>NotificationService</code> hold no session state, so any instance handles any request. Auto-scale behind the LB toward ~12K/s average and ~50K/s peak; the send call returns <b>202 Accepted</b> and the real work is async on Kafka.</p></div>
+      <div class="card"><div class="kicker">Kafka partitions</div><h3>Key by userId</h3><p class="muted">Each priority topic starts at ~10 partitions and scales to 100+. Partition key = <code>userId</code> so a user's events keep per-user order. Add partitions to raise parallelism; consumers rebalance automatically.</p></div>
+      <div class="card"><div class="kicker">channel workers</div><h3>Independent consumer groups</h3><p class="muted">One consumer group per channel per priority (e.g. <code>push-critical-cg</code>). Scale SMS workers separately from push — SMS is 75× costlier and rate-limited, push is free and bursty. Autoscale on consumer lag.</p></div>
+    </div>
+
+    <div data-tabscope style="margin-top:16px">
+      <div class="kicker">data partitioning — pick a store &amp; strategy</div>
+      <div class="tabs">
+        <button class="tab active" data-tab="cass">Cassandra logs (userId+month)</button>
+        <button class="tab" data-tab="kafka">Kafka topics by priority</button>
+        <button class="tab" data-tab="pg">PostgreSQL prefs (single node)</button>
+      </div>
+
+      <div class="tabpanel active" data-panel="cass">
+        <div class="grid g2">
+          <div class="card">
+            <h3>Notification logs → Cassandra</h3>
+            <p class="muted">Write-heavy, append-only, time-series. Partition by <code>userId + month</code> with a timestamp clustering key so "get my notifications" is a single-partition read, newest first. Row-level TTL auto-expires after 90 days.</p>
+            <pre class="code">PRIMARY KEY ((user_id, yyyymm), created_at)
+  <span class="cm">// single-partition read, DESC clustering</span>
+  <span class="cm">// TTL 90d → no manual cleanup</span></pre>
+          </div>
+          <div class="card">
+            <div class="kicker">verdict</div>
+            <ul class="tight">
+              <li><b>Linear write scaling</b> — the natural fit for 1B writes/day.</li>
+              <li>Month in the key stops any one partition growing unbounded.</li>
+              <li><span style="color:var(--warn)">No joins / ad-hoc queries</span> — but the feed only ever does a point-in-partition scan.</li>
+            </ul>
+          </div>
+        </div>
+      </div>
+
+      <div class="tabpanel" data-panel="kafka">
+        <div class="grid g2">
+          <div class="card">
+            <h3>Priority topics <span class="run">← separate queues</span></h3>
+            <p class="muted">Four topics — <code>notifications.high / medium / low</code> plus <code>dlq.notifications</code> — so a marketing backlog can never block an OTP. Each topic has its own consumer groups and partition count.</p>
+            <pre class="code">notifications.high    <span class="cm">// OTP, 2FA, payment</span>
+notifications.medium  <span class="cm">// order / shipping</span>
+notifications.low     <span class="cm">// marketing, digests</span></pre>
+          </div>
+          <div class="card">
+            <div class="kicker">verdict</div>
+            <ul class="tight">
+              <li><b>Isolation:</b> critical drains first; low-priority is shed under backpressure.</li>
+              <li><code>acks=all</code>, RF=3, <code>min.insync.replicas=2</code> → survive 2 broker losses, no message loss.</li>
+              <li>Consumer <b>replay</b> from any offset recovers a corrupted batch — SQS cannot.</li>
+            </ul>
+          </div>
+        </div>
+      </div>
+
+      <div class="tabpanel" data-panel="pg">
+        <div class="grid g2">
+          <div class="card">
+            <h3>Preferences → PostgreSQL</h3>
+            <p class="muted">~100M users × ~200 B ≈ a small relational dataset. A single primary (with read replicas) handles it, and ACID gives an opt-out that takes effect the instant it commits.</p>
+            <pre class="code">user → channels → preferences  <span class="cm">// FKs, joins</span>
+opt-out = UPDATE ... COMMIT   <span class="cm">// strongly consistent</span></pre>
+          </div>
+          <div class="card">
+            <div class="kicker">verdict</div>
+            <ul class="tight">
+              <li><b>Strong consistency</b> where it legally matters (CAN-SPAM / GDPR).</li>
+              <li>Read replicas absorb the per-send preference lookups; the cache fronts most of them.</li>
+              <li>No sharding needed at this size — resist the urge to over-engineer.</li>
+            </ul>
+          </div>
+        </div>
+      </div>
+
+      <div class="callout tip"><b>Batch fan-out at scale:</b> a 10M-user send is chunked into ~1,000-user segments, each enqueued as one Kafka message; a worker expands the chunk, runs the per-user preference gate, and emits individual sends — so one API call never blocks on 10M synchronous checks.</div>
+    </div>
+  </section>
+
+  <!-- B · CACHING DEEP-DIVE -->
+  <section>
+    <div class="sec-h"><span class="n">B</span><h2>Caching deep-dive</h2><span class="tag">compliance vs latency lives here</span></div>
+    <div class="grid g2">
+      <div class="card">
+        <div class="kicker">two-layer cache — read path</div>
+        <pre class="code"><span class="kw">GET</span> tmpl:{id}:{locale}  <span class="cm">// on every send</span>
+  L1 Caffeine (~1µs) ─ miss →
+  L2 Redis    (~1ms) ─ miss →
+    Cassandra/Postgres (~5–50ms)
+      → populate L2 → populate L1</pre>
+        <p class="muted">Templates are read on <b>every</b> notification and change ~weekly → cache aggressively in both layers (~99% hit). Only hot, rarely-changing, staleness-tolerant data earns an L1 slot.</p>
+      </div>
+      <div class="card">
+        <div class="kicker">what each key looks like</div>
+        <pre class="code">tmpl:{id}:{locale}   L1+L2  no TTL, event-invalidate
+pref:{userId}        L2     TTL 5 min + explicit DEL
+tokens:{userId}      L2     TTL 24h, self-heal on 410
+dedup:{hash}         L2     SET NX, TTL 24h
+ratelimit:{u}:{ch}:{d} L2   INCR, TTL end-of-day</pre>
+        <p class="muted">Preferences skip L1: with N instances you'd get N copies that go stale independently, and a stale opt-out is a violation. Redis is shared → one <code>DEL</code> invalidates everyone.</p>
+      </div>
+    </div>
+
+    <div class="grid g3" style="margin-top:14px">
+      <div class="card">
+        <div class="kicker">the big risk</div>
+        <h3>Stale preferences</h3>
+        <p class="muted">A user opts out at 10:00:00; a 5-min TTL could let a marketing email through at 10:00:02. Fix: the preference write does <b>DB → Redis DEL → 200</b>, so the next send cache-misses to fresh data. TTL is only the safety net.</p>
+        <pre class="code"><span class="cm">// opt-out critical path</span>
+UPDATE prefs; <span class="ty">COMMIT</span>
+Redis <span class="ty">DEL</span> pref:{userId}
+<span class="cm">// marketing sends: skip cache, read DB</span></pre>
+      </div>
+      <div class="card">
+        <div class="kicker">cache stampede</div>
+        <h3>Singleflight lock</h3>
+        <p class="muted">A system-wide alert invalidates <code>tmpl-maintenance-alert</code>; 1,000 workers miss at once. First worker grabs a Redis lock, fetches once, backfills; the rest spin briefly then read the warm cache.</p>
+        <pre class="code">ok = redis.<span class="ty">set</span>(<span class="st">"lock:tmpl:"</span>+id, <span class="st">1</span>, NX, EX 5)
+  ok  → load DB, populate, del lock
+  !ok → short spin, re-GET cache</pre>
+      </div>
+      <div class="card">
+        <div class="kicker">cache warming</div>
+        <h3>Pre-load templates</h3>
+        <p class="muted">Templates have no TTL, so a stampede only follows an explicit invalidation. On deploy, bulk-load all active templates into L1+L2 so the first sends after a rollout don't cold-miss.</p>
+        <pre class="code"><span class="kw">SELECT</span> id, locale, body
+<span class="kw">FROM</span> templates <span class="kw">WHERE</span> active
+<span class="cm">// MSET into Redis + prime Caffeine</span></pre>
+      </div>
+    </div>
+    <div class="callout tip"><b>Redis is not always a cache:</b> dedup keys (<code>SET NX</code>) and rate-limit counters (<code>INCR</code>) treat Redis as the <b>source of truth</b>, not a cache — that's why we chose Redis over Memcached. Delivery <b>status is never cached</b>: it changes rapidly (PENDING→SENT→DELIVERED→READ) and a stale value is a debugging nightmare. <span class="run">→ full layering on canvas 1 · HLD</span></div>
+  </section>
+
+  <!-- C · BOTTLENECKS & SOLUTIONS -->
+  <section>
+    <div class="sec-h"><span class="n">C</span><h2>Bottlenecks &amp; solutions</h2><span class="tag">click a card to open</span></div>
+    <div class="grid" style="gap:10px">
+
+      <div class="card collapsible open">
+        <div class="c-head"><h3>Single queue for all priorities</h3></div>
+        <div class="c-body">
+          <p><b style="color:var(--warn)">Impact:</b> if OTP, order updates and marketing share one topic, a bulk marketing backlog sits in front of a login OTP — the user can't sign in while low-value mail drains.</p>
+          <p><b style="color:var(--gc)">Fix:</b> separate <code>notifications.high / medium / low</code> topics, each with dedicated consumer groups. Critical drains first; under backpressure we stop accepting LOW batches while CRITICAL is always admitted.</p>
+        </div>
+      </div>
+
+      <div class="card collapsible">
+        <div class="c-head"><h3>Synchronous provider call in the request path</h3></div>
+        <div class="c-body">
+          <p><b style="color:var(--warn)">Impact:</b> calling FCM/SES/Twilio inside the API request couples client latency to a flaky third party and caps throughput at provider speed.</p>
+          <p><b style="color:var(--gc)">Fix:</b> return <b>202 Accepted</b> immediately and hand off to Kafka. Channel workers call providers asynchronously; a crash mid-send just redelivers the Kafka message and dedup catches the duplicate.</p>
+        </div>
+      </div>
+
+      <div class="card collapsible">
+        <div class="c-head"><h3>External provider failure / throttling</h3></div>
+        <div class="c-body">
+          <p><b style="color:var(--warn)">Impact:</b> FCM returns 429, SES rate-limits, or Twilio times out — naive retries amplify the overload and stall the whole worker group.</p>
+          <p><b style="color:var(--gc)">Fix:</b> exponential backoff with jitter (1s→2s→4s→8s→16s, 5 tries) and a circuit breaker per provider that opens on 429 and backs off. Permanent errors (invalid token, hard bounce) skip retries and go straight to the DLQ.</p>
+        </div>
+      </div>
+
+      <div class="card collapsible">
+        <div class="c-head"><h3>Thundering herd after a partition heals</h3></div>
+        <div class="c-body">
+          <p><b style="color:var(--warn)">Impact:</b> when a partition heals, a flood of queued notifications hits the workers and downstream providers at once.</p>
+          <p><b style="color:var(--gc)">Fix:</b> consumer-level token-bucket rate limiting per channel, bounded concurrency via <code>max.poll.records</code>, priority draining (OTP first, marketing waits), and per-provider circuit breakers with exponential backoff.</p>
+        </div>
+      </div>
+
+      <div class="card collapsible">
+        <div class="c-head"><h3>Duplicate sends (at-least-once)</h3></div>
+        <div class="c-body">
+          <p><b style="color:var(--warn)">Impact:</b> Kafka commits offsets after a successful provider call, so a worker crash mid-send redelivers the message — the user could get two OTPs.</p>
+          <p><b style="color:var(--gc)">Fix:</b> idempotency key = <code>hash(userId+templateId+channel+timeWindow)</code>, checked with Redis <code>SET NX</code> (24h TTL) before enqueue and before send. For payment SMS, also store a sent-flag in the DB as a second check.</p>
+        </div>
+      </div>
+
+      <div class="card collapsible">
+        <div class="c-head"><h3>Stale preference → compliance violation</h3></div>
+        <div class="c-body">
+          <p><b style="color:var(--warn)">Impact:</b> a user opts out but a cached preference lets a marketing message through — a CAN-SPAM / GDPR breach, not just an annoyance.</p>
+          <p><b style="color:var(--gc)">Fix:</b> the one CP exception — explicit cache invalidation on opt-out (<code>DB → Redis DEL</code>), a 5-min TTL safety net, and for legally-sensitive marketing sends skip the cache entirely and read PostgreSQL directly. <b>Fail-closed:</b> if the preference service is down, do NOT send.</p>
+        </div>
+      </div>
+
+      <div class="card collapsible">
+        <div class="c-head"><h3>DLQ full / silent message loss</h3></div>
+        <div class="c-body">
+          <p><b style="color:var(--warn)">Impact:</b> after max retries, messages pile into the Dead Letter Queue; if it fills or is ignored, failed notifications vanish undetected.</p>
+          <p><b style="color:var(--gc)">Fix:</b> <b>fail-closed</b> on a full DLQ — alert and stop processing rather than drop. Page on-call whenever <code>dlq_depth &gt; 0</code>; a reviewer retries transient errors after an hour and marks permanent ones FAILED.</p>
+        </div>
+      </div>
+
+    </div>
+  </section>
+
+  <!-- D · CAP & CONSISTENCY -->
+  <section>
+    <div class="sec-h"><span class="n">D</span><h2>CAP &amp; consistency — why AP (with one CP exception)</h2><span class="tag">pick two; P is not optional</span></div>
+    <div class="grid g2">
+      <div class="card">
+        <div class="kicker">the choice</div>
+        <p class="muted"><b>P is mandatory</b> in any distributed deployment, so the real decision is A vs C during a partition. For delivery we pick <b>A</b>: a <b>duplicate notification is annoying, a missing one is unacceptable</b> — a lost OTP means the user can't log in, a lost order confirmation triggers a duplicate order.</p>
+        <ul class="tight">
+          <li><b>AP for delivery:</b> during a partition keep sending; reconcile duplicates with idempotency keys.</li>
+          <li><b>Fail-open</b> for dedup cache, rate limiter and template cache — degrade, never stop delivery.</li>
+          <li><b>Fail-closed</b> for opt-out enforcement and a full DLQ — never send to an opted-out user, never silently drop.</li>
+        </ul>
+      </div>
+      <div class="card">
+        <div class="kicker">delivery semantics &amp; idempotency</div>
+        <pre class="code"><span class="cm">// at-least-once + dedup (our default)</span>
+key = <span class="ty">hash</span>(userId+templateId+channel+window)
+Redis <span class="st">SET NX</span> key EX 24h
+  exists → skip   <span class="cm">// duplicate</span>
+  new    → send   <span class="cm">// retry keeps same key</span>
+<span class="cm">// payment/billing → upgrade to exactly-once</span></pre>
+        <p class="muted">Exactly-once everywhere is impossible — external providers (FCM/SES/Twilio) have no transactional "uncommit." We approximate it only where duplication is harmful (payments) with an idempotency key plus a DB sent-flag; everywhere else at-least-once is cheaper and safer.</p>
+      </div>
+    </div>
+    <div class="callout tip"><b>Ordering:</b> global ordering is <b>not</b> required (push and email for one event may arrive in any order). Per-user ordering is nice-to-have for the in-app feed, achieved with Kafka partition key = <code>userId</code>. Causal ordering ("order confirmed" after "order placed") uses sequence numbers where it matters.</div>
+    <table style="margin-top:12px">
+      <thead><tr><th>Data / operation</th><th>C or A</th><th>Reasoning</th></tr></thead>
+      <tbody>
+        <tr><td>Notification delivery</td><td>AP</td><td>Duplicate OK, missing not OK → fail-open</td></tr>
+        <tr><td>Delivery status logs</td><td>AP</td><td>Eventually consistent is fine</td></tr>
+        <tr><td>User preferences (opt-out)</td><td><b>CP</b></td><td>Compliance — read source of truth, invalidate cache immediately</td></tr>
+        <tr><td>Frequency caps</td><td>AP</td><td>Slightly over a cap OK; under-delivering is worse</td></tr>
+        <tr><td>Payment notifications</td><td>leaning CP</td><td>Idempotency key + DB sent-flag → near exactly-once</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <!-- E · TRADE-OFFS SUMMARY -->
+  <section>
+    <div class="sec-h"><span class="n">E</span><h2>Trade-offs summary</h2><span class="tag">decision · chosen · alternative · why</span></div>
+    <table>
+      <thead><tr><th>Decision</th><th>Chosen</th><th>Alternative</th><th>Why this choice</th></tr></thead>
+      <tbody>
+        <tr><td>Consistency model</td><td><b style="color:var(--survivor)">AP · fail-open delivery</b></td><td>CP / strong</td><td>Missing an OTP is far worse than a duplicate; 1 CP exception for opt-out</td></tr>
+        <tr><td>Delivery semantics</td><td><b style="color:var(--survivor)">At-least-once + dedup</b></td><td>exactly-once everywhere</td><td>Providers have no transactional uncommit; upgrade only for payments</td></tr>
+        <tr><td>Message broker</td><td><b style="color:var(--survivor)">Kafka</b></td><td>SQS / RabbitMQ</td><td>Replay via offsets, per-partition order, consumer groups per channel</td></tr>
+        <tr><td>Queue topology</td><td><b style="color:var(--survivor)">Topic per priority</b></td><td>single queue</td><td>OTP never blocked behind a marketing backlog</td></tr>
+        <tr><td>Notification store</td><td><b style="color:var(--survivor)">Cassandra</b></td><td>PostgreSQL</td><td>Write-heavy, time-series, TTL retention, linear scale at 1B/day</td></tr>
+        <tr><td>Preference store</td><td><b style="color:var(--survivor)">PostgreSQL</b></td><td>Cassandra / DynamoDB</td><td>Small dataset, ACID opt-out, joins &amp; reporting</td></tr>
+        <tr><td>Cache / dedup / rate limit</td><td><b style="color:var(--survivor)">Redis</b></td><td>Memcached</td><td>Needs <code>SET NX</code> for dedup and <code>INCR</code> for counters, not just GET/SET</td></tr>
+        <tr><td>Local cache</td><td><b style="color:var(--survivor)">Caffeine (templates only)</b></td><td>L1 for everything</td><td>Per-instance copies would let opt-outs go stale independently</td></tr>
+        <tr><td>Channel handlers</td><td><b style="color:var(--survivor)">Strategy pattern</b></td><td>if/else per channel</td><td>Add a channel = add one handler class; independent scaling</td></tr>
+        <tr><td>API response</td><td><b style="color:var(--survivor)">202 Accepted (async)</b></td><td>200 synchronous</td><td>Decouples client latency from flaky providers</td></tr>
+        <tr><td>Failure handling</td><td><b style="color:var(--survivor)">Backoff + DLQ + alert</b></td><td>drop / infinite retry</td><td>Transient vs permanent split; DLQ depth &gt; 0 pages on-call</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <!-- F · INTERVIEW WALKTHROUGH -->
+  <section>
+    <div class="sec-h"><span class="n">F</span><h2>Interview walkthrough — timing strip</h2><span class="tag">~35 min answer</span></div>
+    <div class="flow">
+      <div class="step eden"><div class="box">Clarify</div><small>P1 · 2–3 min<br>channels · priority · scale</small></div>
+      <div class="step eden"><div class="box">Estimate</div><small>P2 · 2–3 min<br>~12K/s avg · 50K/s peak · 15 TB</small></div>
+      <div class="step surv"><div class="box">API</div><small>P3 · 2 min<br>send/batch/status · 202</small></div>
+      <div class="step surv"><div class="box">Architecture</div><small>P4 · 5–7 min · CORE<br>draw diagram first</small></div>
+      <div class="step old"><div class="box">Handlers &amp; prefs</div><small>P5–6 · strategy · gate</small></div>
+      <div class="step dead"><div class="box">Retry · scale · CAP</div><small>P7–9 · DLQ · batch · AP</small></div>
+    </div>
+    <div class="grid g2" style="margin-top:14px">
+      <div class="card">
+        <div class="kicker">phase-by-phase</div>
+        <ul class="tight">
+          <li><b>P1 Clarify (2–3):</b> channels (push/email/SMS/in-app), priority levels, preferences &amp; quiet hours, ~1B/day, latency SLA (OTP &lt; 5s), at-least-once, batch support.</li>
+          <li><b>P2 Estimate (2–3):</b> ~12K/s avg, ~50K/s peak; 500 B/notif × 1B/day × 30d ≈ 15 TB; ~40 Kafka partitions; ~20 GB Redis for prefs.</li>
+          <li><b>P3 API (2):</b> <code>POST /send</code>, <code>POST /batch</code>, <code>GET /{id}/status</code>, <code>PUT /users/{id}/preferences</code>. Return <b>202 Accepted</b> — async.</li>
+          <li><b>P4 Architecture (5–7 · CORE):</b> Client → API (rate limit) → NotificationService → preference gate → priority Kafka topic → channel worker → provider → DeliveryTracker → DLQ. Draw first, then narrate.</li>
+          <li><b>P5 Handlers (3–4):</b> Strategy pattern — <code>NotificationHandler.send()</code> with Push/Email/Sms/InApp implementations; token lifecycle, bounce handling, SMS cost.</li>
+        </ul>
+      </div>
+      <div class="card">
+        <div class="kicker">…and finish strong</div>
+        <ul class="tight">
+          <li><b>P6 Preferences &amp; templates (3):</b> shouldSend gate (opt-in? quiet hours? frequency cap? blocked?); templates in DB, cached in Redis, rendered by <code>SimpleTemplateEngine</code>.</li>
+          <li><b>P7 Retry &amp; reliability (3–4):</b> exponential backoff + jitter (5 tries) → DLQ; classify transient vs permanent; idempotency <code>SET NX</code>; offset commit after send.</li>
+          <li><b>P8 Scaling &amp; batch (3–4):</b> Kafka partitions by userId, consumer group per channel/priority, autoscale on lag; batch = chunk 1,000 users, fan out, backpressure sheds LOW.</li>
+          <li><b>P9 Trade-offs &amp; CAP (2):</b> AP with fail-open delivery, CP exception for opt-out; Kafka over SQS; Cassandra for logs, Postgres for prefs.</li>
+        </ul>
+      </div>
+    </div>
+    <div class="callout tip"><b>Green flags:</b> separate queues per priority · Strategy pattern for handlers · preference check as a gate · idempotency keys · circuit breaker on providers · fan-out chunking · DLQ with alerting · 202 Accepted. <b>Red flags:</b> synchronous provider call in the request path · single queue for all priorities · no retry / failure handling · ignoring preferences · relational DB for logs at 1B/day.</div>
+  </section>
+
+  <!-- GLOSSARY -->
+  <section>
+    <div class="sec-h"><span class="n">§</span><h2>Glossary — one-liners</h2><span class="tag">terms used above</span></div>
+    <div class="grid g2">
+      <div class="card"><table><tbody>
+        <tr><td><b>AP (CAP)</b></td><td>favour Availability + Partition-tolerance; keep sending during a partition</td></tr>
+        <tr><td><b>Fail-open / fail-closed</b></td><td>on component loss: send anyway (delivery) vs refuse (opt-out, full DLQ)</td></tr>
+        <tr><td><b>At-least-once</b></td><td>retry until acked; may duplicate → dedup on critical paths</td></tr>
+        <tr><td><b>Idempotency key</b></td><td><code>hash(userId+templateId+channel+window)</code> via Redis <code>SET NX</code></td></tr>
+        <tr><td><b>Singleflight</b></td><td>dedupe concurrent misses so only one worker repopulates the cache</td></tr>
+        <tr><td><b>DLQ</b></td><td>Dead Letter Queue for messages that fail after max retries; depth &gt; 0 pages on-call</td></tr>
+      </tbody></table></div>
+      <div class="card"><table><tbody>
+        <tr><td><b>Consumer group</b></td><td>Kafka consumers that jointly read a topic; one group per channel per priority</td></tr>
+        <tr><td><b>Partition key</b></td><td>userId — keeps a user's events on one partition = per-user order</td></tr>
+        <tr><td><b>Priority topic</b></td><td>separate high/medium/low topics so OTP never waits behind marketing</td></tr>
+        <tr><td><b>Frequency cap</b></td><td>Redis <code>INCR</code> per user/channel/day; CRITICAL/HIGH bypass it</td></tr>
+        <tr><td><b>Strategy pattern</b></td><td><code>NotificationHandler</code> per channel — add a channel = add a class</td></tr>
+        <tr><td><b>410 unregistered</b></td><td>FCM/APNs response that self-heals a stale device token by evicting it</td></tr>
+      </tbody></table></div>
+    </div>
+  </section>
+
+  <footer>
+    <p>Use case 03 · Notification System — Canvas 3 of 3 (Deep-dive &amp; Trade-offs). Grounded in <code>03-notification-system/docs/tradeoffs · caching · tech</code> and <code>revision/INTERVIEW_WALKTHROUGH.md</code>.</p>
+    <p class="run">This use case: <a href="hld.html">03a · HLD</a> · <a href="lld.html">03b · LLD</a> · Deep-dive &nbsp;|&nbsp; Next → <a href="../04-chat-system/hld.html">04 · Chat System — HLD</a></p>
+  </footer>
+
+</div>
+<script src="../assets/canvas.js"></script>
+</body>
+</html>

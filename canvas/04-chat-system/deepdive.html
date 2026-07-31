@@ -1,0 +1,359 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>04 · Chat System — Deep-dive &amp; Trade-offs</title>
+<link rel="stylesheet" href="../assets/canvas.css">
+</head>
+<body>
+<div class="wrap">
+
+  <header class="hero">
+    <h1>Chat System — Deep-dive &amp; Trade-offs</h1>
+    <div class="sub">Use case 04 · Canvas 3 of 3. The hard parts: how to <b>scale</b> the stateful connection tier and shard messages, the <b>caching</b> that sits on every message's critical path, the <b>bottlenecks</b> that break real-time delivery (and their fixes), why chat is a <b>mixed-CAP</b> system feature-by-feature, and a phase-by-phase <b>interview walkthrough</b>. <b>Switch the sharding tabs</b> and <b>open the bottleneck cards</b> to explore.</div>
+    <div class="badges">
+      <span class="badge lvl">Use case 04 · Deep-dive</span>
+      <span class="badge">Canvas 3 of 3</span>
+      <span class="badge">interactive</span>
+      <span class="badge">mixed CAP · per-feature</span>
+    </div>
+    <div class="legend">
+      <span><i class="dot" style="background:var(--eden)"></i> switch a tab</span>
+      <span><i class="dot" style="background:var(--old)"></i> open a bottleneck</span>
+      <span><i class="dot" style="background:var(--survivor)"></i> chosen option</span>
+      <span><i class="dot" style="background:var(--warn)"></i> failure / risk</span>
+      <span><i class="dot" style="background:var(--gc)"></i> fix / mitigation</span>
+    </div>
+  </header>
+
+  <!-- A · SCALING STRATEGY -->
+  <section>
+    <div class="sec-h"><span class="n">A</span><h2>Scaling strategy</h2><span class="tag">stateful gateway · what to shard</span></div>
+    <div class="grid g3">
+      <div class="card"><div class="kicker">connection tier (stateful)</div><h3>Shard by connection count</h3><p class="muted">Each connection server holds ~50K WebSockets (Java/Netty). At 200M concurrent connections (~40% of 500M DAU) that is ~4,000 servers — provision 8–10K for headroom. Scale horizontally; the <b>Redis connection registry</b> lets any server route to any user.</p></div>
+      <div class="card"><div class="kicker">message tier (stateless)</div><h3>Auto-scale freely</h3><p class="muted">Validate → assign <code>seq_num</code> → persist is stateless, so any instance serves any message. Scale behind the LB against the ~460K msg/s average (~1.4M peak). No session affinity needed.</p></div>
+      <div class="card"><div class="kicker">Kafka / consumers</div><h3>Add partitions &amp; workers</h3><p class="muted">One partition consumed by exactly one worker in the <code>delivery-workers</code> group. Add workers up to <code>N</code> = partition count to scale delivery in parallel — no duplicate delivery.</p></div>
+    </div>
+
+    <div data-tabscope style="margin-top:16px">
+      <div class="kicker">message sharding — how to partition Cassandra &amp; Kafka</div>
+      <div class="tabs">
+        <button class="tab active" data-tab="hash">Hash on conversation_id</button>
+        <button class="tab" data-tab="range">Time / range-based</button>
+        <button class="tab" data-tab="chash">Consistent hashing</button>
+      </div>
+
+      <div class="tabpanel active" data-panel="hash">
+        <div class="grid g2">
+          <div class="card">
+            <h3>Hash on conversation_id <span class="run">← chosen</span></h3>
+            <p class="muted">Both Cassandra and Kafka partition by <code>conversation_id</code>. All messages for one conversation land on the same node / Kafka partition, which is exactly what preserves <b>per-conversation ordering</b> and co-locates a wide row for pagination.</p>
+            <pre class="code">partition = <span class="ty">hash</span>(conversation_id) % N   <span class="cm">// same convo → same partition</span>
+Cassandra PK (conversation_id, seq_num)     <span class="cm">// wide row, ORDER BY seq_num DESC</span></pre>
+          </div>
+          <div class="card">
+            <div class="kicker">verdict</div>
+            <ul class="tight">
+              <li><b>Ordering for free</b> — Kafka guarantees FIFO within a partition, so messages arrive in <code>seq_num</code> order.</li>
+              <li>Even spread across conversations; a wide row per chat = efficient reverse-chronological reads.</li>
+              <li><span style="color:var(--warn)">Watch the hot group:</span> one partition caps a single conversation at ~10K msg/s — fine for any human chat.</li>
+            </ul>
+          </div>
+        </div>
+      </div>
+
+      <div class="tabpanel" data-panel="range">
+        <div class="grid g2">
+          <div class="card">
+            <h3>Time / range-based partitioning</h3>
+            <p class="muted">Bucket messages by time window (e.g. one partition per day) or by contiguous key ranges. Tempting for a time-series workload, but the newest bucket takes <b>all</b> the write traffic.</p>
+            <pre class="code">2026-07-30 → shard 1
+2026-07-31 → shard 2   <span class="cm">// today's shard is a write hot spot</span></pre>
+          </div>
+          <div class="card">
+            <div class="kicker">verdict — avoid as the primary key</div>
+            <ul class="tight">
+              <li><span style="color:var(--warn)">Hot partition:</span> today's bucket absorbs every write while yesterday's idles.</li>
+              <li>Breaks per-conversation ordering — a conversation's messages scatter across time buckets.</li>
+              <li>Time bucketing is fine only as a <b>secondary</b> lever for TTL/archival, not the shard key.</li>
+            </ul>
+          </div>
+        </div>
+      </div>
+
+      <div class="tabpanel" data-panel="chash">
+        <div class="grid g2">
+          <div class="card">
+            <h3>Consistent hashing (the ring)</h3>
+            <p class="muted">Nodes and <code>conversation_id</code> keys map onto a hash ring; adding or removing a node only remaps the keys in that node's arc. This is how Cassandra partitions natively — hashing on <code>conversation_id</code> rides on top of it.</p>
+            <pre class="code"><span class="cm">// only ~1/N keys move when a node joins/leaves</span>
+node = firstNodeClockwise( <span class="ty">hash</span>(conversation_id) )</pre>
+          </div>
+          <div class="card">
+            <div class="kicker">verdict</div>
+            <ul class="tight">
+              <li><b>Elastic:</b> add nodes for growth with minimal reshuffling — no full-keyspace remap.</li>
+              <li>Virtual nodes smooth uneven arcs and speed rebalancing.</li>
+              <li>Same technique shards the <b>Redis cluster</b> (presence, registry, queues) across nodes.</li>
+            </ul>
+          </div>
+        </div>
+      </div>
+
+      <div class="callout tip"><b>PostgreSQL stays small.</b> Users, groups, membership, contacts and blocks fit a single primary + read replicas — millions of rows, not billions. Route heavy relational queries (group admin, mutual contacts) to replicas so they never compete with membership writes on the fan-out path.</div>
+    </div>
+  </section>
+
+  <!-- B · CACHING DEEP-DIVE -->
+  <section>
+    <div class="sec-h"><span class="n">B</span><h2>Caching deep-dive</h2><span class="tag">Redis is on every message's path</span></div>
+    <div class="grid g2">
+      <div class="card">
+        <div class="kicker">write-through — presence &amp; connection registry</div>
+        <pre class="code"><span class="kw">on</span> heartbeat (every 30s):
+  SETEX presence:{userId} 60 ONLINE        <span class="cm">// TTL = 2× heartbeat</span>
+  SET   connection:{userId} server-N EX 120
+
+<span class="kw">on</span> message send → GET presence:{userId}
+  ├─ ONLINE → GET connection:{userId} → forward to server-N → WebSocket
+  └─ null   → user OFFLINE → RPUSH offline-queue:{userId}</pre>
+        <p class="muted">Redis <b>is</b> the primary store for presence — no DB behind it. TTL is automatic offline detection: miss two heartbeats and the key evaporates. Both keys are ~100% hit rate because every write goes to Redis first.</p>
+      </div>
+      <div class="card">
+        <div class="kicker">cache-aside — recent messages &amp; group members</div>
+        <pre class="code"><span class="kw">open conversation</span> → GET recent-msgs:{conversationId}
+  ├─ HIT  → return last 50            <span class="cm">// ~sub-ms</span>
+  └─ MISS → SELECT … LIMIT 50 (Cassandra) → SETEX 1800
+
+<span class="kw">group send</span> → SMEMBERS group-members:{groupId}   <span class="cm">// O(N) in-memory fan-out</span></pre>
+        <p class="muted">Recent messages: append-on-write (push new message, trim to 50) instead of full invalidation → 80–90% hit rate as users cycle 3–5 active chats. Group set refreshed hourly from PostgreSQL; 95%+ hit rate.</p>
+      </div>
+    </div>
+
+    <div class="grid g3" style="margin-top:14px">
+      <div class="card">
+        <div class="kicker">local L1 cache</div>
+        <h3>Caffeine for profiles</h3>
+        <p class="muted">Sender display-name / avatar is rendered on <b>every</b> message. Profiles change rarely, so each connection server keeps an in-process Caffeine cache — no Redis round-trip per render. 5-min staleness is invisible.</p>
+        <pre class="code">Caffeine.newBuilder()
+  .maximumSize(<span class="st">10_000</span>)
+  .expireAfterWrite(<span class="st">5</span>, MINUTES)
+  .build();   <span class="cm">// LRU, per-server</span></pre>
+      </div>
+      <div class="card">
+        <div class="kicker">what NOT to cache</div>
+        <h3>Skip the volatile</h3>
+        <p class="muted">Some data hurts if cached:</p>
+        <ul class="tight">
+          <li><b>Delivery status</b> — must be real-time accurate; query Cassandra directly.</li>
+          <li><b>Conversation list</b> — reorders on every message → near-zero hit rate.</li>
+          <li><b>Typing indicators</b> — ephemeral, fire-and-forget over WebSocket.</li>
+          <li><b>Media</b> — that is the CDN's job, not app cache.</li>
+        </ul>
+      </div>
+      <div class="card">
+        <div class="kicker">offline queue</div>
+        <h3>Redis List, drained on connect</h3>
+        <p class="muted">Offline users' messages buffer in a bounded list; on reconnect the client sends its last <code>seq_num</code> and the queue is drained + backfilled from Cassandra.</p>
+        <pre class="code">RPUSH offline-queue:{userId} {msg}
+LTRIM offline-queue:{userId} 0 999   <span class="cm">// cap at 1000</span>
+<span class="cm">// on connect:</span>
+LRANGE …0 -1 → DEL → deliver in order</pre>
+      </div>
+    </div>
+    <div class="callout tip"><b>Graceful degradation if Redis fails:</b> a replica promotes in &lt;1s. During failover, presence checks default to OFFLINE (safe — messages queue, never lost), the registry falls back to broadcasting to all connection servers (expensive but correct), and group membership falls back to PostgreSQL. Degrade, don't fail. <span class="run">→ full cache layering on canvas 1 · HLD</span></div>
+  </section>
+
+  <!-- C · BOTTLENECKS & SOLUTIONS -->
+  <section>
+    <div class="sec-h"><span class="n">C</span><h2>Bottlenecks &amp; solutions</h2><span class="tag">click a card to open</span></div>
+    <div class="grid" style="gap:10px">
+
+      <div class="card collapsible open">
+        <div class="c-head"><h3>Stateful connection servers — the core hard part</h3></div>
+        <div class="c-body">
+          <p><b style="color:var(--warn)">Impact:</b> WebSockets are long-lived and pinned to one server. Sticky sessions mean if a server dies, all its users drop and there is no record of where they were. Naive round-robin can't route a reply to the right socket.</p>
+          <p><b style="color:var(--gc)">Fix:</b> keep the gateway stateful but externalize the mapping — a <b>Redis connection registry</b> (<code>connection:{userId} → server-N</code>) so any server routes to any user. L4 LB preserves the TCP upgrade; connection draining sends reconnect signals on deploy. This is the <code>ConnectionRegistry</code> / <code>InMemoryConnectionRegistry</code> abstraction in the codebase.</p>
+        </div>
+      </div>
+
+      <div class="card collapsible">
+        <div class="c-head"><h3>Single Kafka partition for a hot group</h3></div>
+        <div class="c-body">
+          <p><b style="color:var(--warn)">Impact:</b> partitioning by <code>conversation_id</code> caps one conversation at a single partition's throughput (~10K msg/s). A broadcast channel with millions of subscribers would saturate it.</p>
+          <p><b style="color:var(--gc)">Fix:</b> for human groups (≤256 members, rarely &gt;100 msg/s) one partition is plenty. For broadcast scale, keep <b>one partition for ordering</b> then fan out to multiple worker partitions for delivery; workers process sequentially by <code>seq_num</code> so order is preserved.</p>
+        </div>
+      </div>
+
+      <div class="card collapsible">
+        <div class="c-head"><h3>Presence fan-out storm</h3></div>
+        <div class="c-body">
+          <p><b style="color:var(--warn)">Impact:</b> notifying every contact when a user comes online is 500M × ~500 contacts ≈ <b>250B notifications/day</b> just for presence. It does not scale.</p>
+          <p><b style="color:var(--gc)">Fix:</b> pull presence on demand when the app opens; only push updates for conversations currently open; subscribe to <code>presence:{userId}</code> via Redis pub/sub only for visible chats. Presence is AP with a 60s TTL, so eventual is fine.</p>
+        </div>
+      </div>
+
+      <div class="card collapsible">
+        <div class="c-head"><h3>Split-brain — two servers think the user is connected</h3></div>
+        <div class="c-body">
+          <p><b style="color:var(--warn)">Impact:</b> a network blip leaves server-1 believing user-A is still connected while user-A reconnects to server-2. The registry could route to a dead socket.</p>
+          <p><b style="color:var(--gc)">Fix:</b> registry uses overwrite semantics (<code>SET connection:{userId} server-2</code> wins). Server-1's send to its dead WebSocket fails and it self-cleans. Prevention: heartbeat eviction after 2 missed intervals, connection versioning, and Redis pub/sub to notify the old server. At-least-once + client dedup by <code>messageId</code> absorbs any double delivery.</p>
+        </div>
+      </div>
+
+      <div class="card collapsible">
+        <div class="c-head"><h3>Message loss vs duplication</h3></div>
+        <div class="c-body">
+          <p><b style="color:var(--warn)">Impact:</b> retries at the network / Kafka / server layers can deliver a message twice; a naive fire-and-forget could lose one entirely. A lost message is catastrophic.</p>
+          <p><b style="color:var(--gc)">Fix:</b> persist to Cassandra <b>before</b> the <code>SENT</code> ack (message is safe even if Kafka dies), then at-least-once delivery with a client-generated <code>messageId</code> (UUID). Cassandra upserts by primary key (idempotent), clients dedup by <code>messageId</code> → "effectively once" without distributed transactions.</p>
+        </div>
+      </div>
+
+      <div class="card collapsible">
+        <div class="c-head"><h3>Out-of-order delivery</h3></div>
+        <div class="c-body">
+          <p><b style="color:var(--warn)">Impact:</b> clock skew and network delays mean wall-clock timestamps can't order messages; #5 may arrive before #4.</p>
+          <p><b style="color:var(--gc)">Fix:</b> never order by timestamp. Server assigns a monotonic <code>seq_num</code> per conversation (Redis <code>INCR</code> / Kafka offset), Kafka partition-by-<code>conversation_id</code> guarantees FIFO, and the client renders sorted by <code>seq_num</code>, buffering a gap until it fills.</p>
+        </div>
+      </div>
+
+      <div class="card collapsible">
+        <div class="c-head"><h3>Kafka cluster unavailable</h3></div>
+        <div class="c-body">
+          <p><b style="color:var(--warn)">Impact:</b> if the whole cluster is down (rare — RF 3 + ISR handles broker loss), the delivery pipeline stalls.</p>
+          <p><b style="color:var(--gc)">Fix:</b> a broker failure fails the partition leader over automatically. For a full outage, buffer messages in a bounded in-memory queue on the connection server and retry — a temporary AP choice; the message is already durable in Cassandra, so this only delays delivery.</p>
+        </div>
+      </div>
+
+    </div>
+  </section>
+
+  <!-- D · CAP & CONSISTENCY -->
+  <section>
+    <div class="sec-h"><span class="n">D</span><h2>CAP &amp; consistency — mixed, per feature</h2><span class="tag">the key interview insight</span></div>
+    <div class="grid g2">
+      <div class="card">
+        <div class="kicker">the choice</div>
+        <p class="muted"><b>P is mandatory</b> in any distributed system, so the real decision is A vs C during a partition. The mature answer: <b>a chat system does not have one CAP choice</b> — each feature picks its own based on tolerance for staleness vs unavailability.</p>
+        <ul class="tight">
+          <li><b>Presence / read receipts:</b> AP — 30s stale online or a 5s-late receipt is harmless; blocking is worse.</li>
+          <li><b>Message delivery:</b> AP, at-least-once — a duplicate is annoying and filtered; a lost message is unacceptable.</li>
+          <li><b>Message ordering:</b> CP-like — delay delivery rather than deliver out of order.</li>
+          <li><b>Group membership:</b> CP — a user who left must <b>immediately</b> stop receiving messages (privacy/legal).</li>
+        </ul>
+      </div>
+      <div class="card">
+        <div class="kicker">where CP actually bites — group leave</div>
+        <pre class="code"><span class="kw">on</span> user leaves group:
+  1. PostgreSQL DELETE group_members   <span class="cm">// source of truth</span>
+  2. Redis SREM group-members:{gid} u  <span class="cm">// SYNCHRONOUS</span>
+  3. <span class="kw">return</span> success                    <span class="cm">// only after step 2</span>
+
+<span class="cm">// during partition: FAIL the op rather than risk</span>
+<span class="cm">// delivering to someone who left.</span></pre>
+        <p class="muted">Cache invalidation here is synchronous and mandatory — never return success before the <code>SREM</code>. An async window would let a removed user still receive messages, which is a privacy violation. This is why membership lives in PostgreSQL (ACID), not just a cache.</p>
+      </div>
+    </div>
+    <div class="callout tip"><b>How we simulate exactly-once:</b> at-least-once delivery + client-side dedup by <code>messageId</code> = "effectively once". The client generates the UUID <b>before</b> sending, so retries at any layer are safe; Cassandra upserts on the same primary key are a no-op. Ordering never uses wall clocks — only server-assigned <code>seq_num</code>.</div>
+    <table style="margin-top:12px">
+      <thead><tr><th>Feature</th><th>CAP choice</th><th>Reasoning</th></tr></thead>
+      <tbody>
+        <tr><td>Presence (online / last seen)</td><td>AP</td><td>30s stale is harmless; blocking presence is worse UX</td></tr>
+        <tr><td>Message delivery</td><td>AP · at-least-once</td><td>Duplicate is annoying (filtered); lost message is unacceptable</td></tr>
+        <tr><td>Message ordering</td><td>CP-like</td><td>Kafka FIFO by conversation_id + seq_num; delay over disorder</td></tr>
+        <tr><td>Group membership</td><td>CP</td><td>Removed user must stop receiving immediately; fail on partition</td></tr>
+        <tr><td>Read receipts</td><td>AP</td><td>"Read" 5s late is invisible; store in Cassandra, replicate async</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <!-- E · TRADE-OFFS SUMMARY -->
+  <section>
+    <div class="sec-h"><span class="n">E</span><h2>Trade-offs summary</h2><span class="tag">decision · chosen · alternative · why</span></div>
+    <table>
+      <thead><tr><th>Decision</th><th>Chosen</th><th>Alternative</th><th>Why this choice</th></tr></thead>
+      <tbody>
+        <tr><td>Transport</td><td><b style="color:var(--survivor)">WebSocket</b></td><td>HTTP / long polling / SSE</td><td>Full-duplex, lowest latency; long polling only as proxy fallback</td></tr>
+        <tr><td>Consistency model</td><td><b style="color:var(--survivor)">Mixed / per-feature</b></td><td>single AP or CP</td><td>Presence AP, delivery AP, ordering CP-like, membership CP</td></tr>
+        <tr><td>Message store</td><td><b style="color:var(--survivor)">Cassandra</b></td><td>PostgreSQL</td><td>Write-heavy (~460K/s), time-series, wide rows, TTL, linear scale</td></tr>
+        <tr><td>Metadata store</td><td><b style="color:var(--survivor)">PostgreSQL</b></td><td>put it all in Cassandra</td><td>Relational queries + ACID for membership; small dataset</td></tr>
+        <tr><td>Ordering</td><td><b style="color:var(--survivor)">Kafka partition + seq_num</b></td><td>timestamps / global order</td><td>Per-conversation FIFO; clocks skew; global order impossible at scale</td></tr>
+        <tr><td>Message bus</td><td><b style="color:var(--survivor)">Kafka</b></td><td>RabbitMQ / Redis Streams</td><td>Strict per-partition ordering + offset replay</td></tr>
+        <tr><td>Presence + routing</td><td><b style="color:var(--survivor)">Redis (TTL + registry)</b></td><td>DB-backed presence</td><td>Sub-ms lookups on every message; TTL = auto offline</td></tr>
+        <tr><td>Delivery guarantee</td><td><b style="color:var(--survivor)">At-least-once + dedup</b></td><td>exactly-once</td><td>True exactly-once needs distributed txns; UUID dedup is cheaper</td></tr>
+        <tr><td>Group fan-out</td><td><b style="color:var(--survivor)">Fan-out on write</b></td><td>fan-out on read</td><td>Groups ≤256 → write fan-out; read fan-out only for broadcast</td></tr>
+        <tr><td>Media</td><td><b style="color:var(--survivor)">S3 + CDN, pre-signed URLs</b></td><td>proxy through app servers</td><td>Offloads bandwidth; edge caching for hot media</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <!-- F · INTERVIEW WALKTHROUGH -->
+  <section>
+    <div class="sec-h"><span class="n">F</span><h2>Interview walkthrough — timing strip</h2><span class="tag">26–36 min answer</span></div>
+    <div class="flow">
+      <div class="step eden"><div class="box">Clarify</div><small>P1 · 2–3 min<br>1:1 + groups · 500M DAU</small></div>
+      <div class="step eden"><div class="box">Estimate</div><small>P2 · 2–3 min<br>~460K msg/s · 200M conns</small></div>
+      <div class="step surv"><div class="box">API</div><small>P3 · 2–3 min<br>WS events + REST</small></div>
+      <div class="step surv"><div class="box">Architecture</div><small>P4 · 5–7 min · CORE<br>stateful vs stateless</small></div>
+      <div class="step old"><div class="box">Msg flow</div><small>P5 · 5–7 min · MOST ASKED</small></div>
+      <div class="step old"><div class="box">Ordering</div><small>P6 · Kafka + seq_num</small></div>
+      <div class="step dead"><div class="box">Presence · DB · CAP</div><small>P7–9 · wrap</small></div>
+    </div>
+    <div class="grid g2" style="margin-top:14px">
+      <div class="card">
+        <div class="kicker">phase-by-phase</div>
+        <ul class="tight">
+          <li><b>P1 Clarify (2–3):</b> 1:1 + groups (≤256), presence, read receipts, media, offline delivery; mention E2E but don't design it; scale = 500M DAU.</li>
+          <li><b>P2 Estimate (2–3):</b> 500M × 80 msg = 40B/day → ~460K/s, ~1.4M peak; 200M concurrent conns / 50K per server → ~4K servers; ~4 TB/day text, media on CDN.</li>
+          <li><b>P3 API (2–3):</b> WebSocket events (<code>SEND_MESSAGE</code>, <code>NEW_MESSAGE</code>, <code>DELIVERY_ACK</code>, <code>PRESENCE_UPDATE</code>) + REST for history / media upload.</li>
+          <li><b>P4 Architecture (5–7 · CORE):</b> draw the <b>stateful connection gateway</b> vs <b>stateless message service</b> split; Redis registry bridges them; Kafka → router → Cassandra / PostgreSQL / S3.</li>
+          <li><b>P5 Message flow (5–7 · MOST ASKED):</b> Alice→Bob 10 steps — persist before <code>SENT</code> ack, Kafka publish, registry lookup, online vs offline (queue + push). Then group fan-out (batch by server).</li>
+        </ul>
+      </div>
+      <div class="card">
+        <div class="kicker">…and finish strong</div>
+        <ul class="tight">
+          <li><b>P6 Ordering (3–4):</b> timestamps skew → server <code>seq_num</code> + Kafka partition-by-<code>conversation_id</code> FIFO; client buffers gaps.</li>
+          <li><b>P7 Presence (2–3):</b> 30s heartbeat, 60s TTL, auto-offline on expiry; avoid the fan-out storm with pull-on-demand + pub/sub for visible chats.</li>
+          <li><b>P8 DB &amp; storage (3):</b> Cassandra for messages (PK conversation_id, seq_num DESC), PostgreSQL for users/groups, S3 + CDN + pre-signed URLs for media.</li>
+          <li><b>P9 Trade-offs &amp; CAP (2–3):</b> at-least-once + dedup; mixed CAP per feature; memory-vs-connections (Erlang 2M vs Java 50K); fan-out on write vs read.</li>
+          <li><b>If only 25 min:</b> do P1–6 + P9; one-line presence and DB.</li>
+        </ul>
+      </div>
+    </div>
+    <div class="callout tip"><b>Green flags:</b> separate stateful connection layer from stateless processing · Redis registry for WS routing · Kafka partition by conversation_id · client-generated <code>messageId</code> for dedup · heartbeat + TTL presence · pre-signed media URLs. <b>Red flags:</b> HTTP polling · ignoring WebSocket statefulness · one DB for everything · global message ordering · eager presence fan-out · skipping offline delivery.</div>
+  </section>
+
+  <!-- GLOSSARY -->
+  <section>
+    <div class="sec-h"><span class="n">§</span><h2>Glossary — one-liners</h2><span class="tag">terms used above</span></div>
+    <div class="grid g2">
+      <div class="card"><table><tbody>
+        <tr><td><b>Mixed CAP</b></td><td>each feature picks its own A-vs-C tradeoff instead of one system-wide choice</td></tr>
+        <tr><td><b>At-least-once</b></td><td>retry until ACK; may duplicate — deduped on the client</td></tr>
+        <tr><td><b>Effectively-once</b></td><td>at-least-once + <code>messageId</code> dedup ≈ exactly-once, far cheaper</td></tr>
+        <tr><td><b>seq_num</b></td><td>server-assigned monotonic per-conversation counter; the source of truth for ordering</td></tr>
+        <tr><td><b>Connection registry</b></td><td>Redis map <code>userId → serverId</code> so any server routes to any user's WebSocket</td></tr>
+        <tr><td><b>Presence TTL</b></td><td>Redis key with 60s TTL; missed heartbeats expire it → OFFLINE</td></tr>
+      </tbody></table></div>
+      <div class="card"><table><tbody>
+        <tr><td><b>Write-through</b></td><td>every write updates the cache (Redis is the primary store for presence/registry)</td></tr>
+        <tr><td><b>Cache-aside</b></td><td>check cache first; on miss read DB and backfill (recent messages, group members)</td></tr>
+        <tr><td><b>Fan-out on write</b></td><td>push a group message to each member's queue at send time (groups ≤256)</td></tr>
+        <tr><td><b>Split-brain</b></td><td>two servers both believe they hold a user's connection; overwrite + dedup resolve it</td></tr>
+        <tr><td><b>Wide row</b></td><td>one Cassandra partition per conversation, clustered by seq_num DESC for pagination</td></tr>
+        <tr><td><b>Pre-signed URL</b></td><td>S3 grant letting the client upload/download media directly, bypassing app servers</td></tr>
+      </tbody></table></div>
+    </div>
+  </section>
+
+  <footer>
+    <p>Use case 04 · Chat System — Canvas 3 of 3 (Deep-dive &amp; Trade-offs). Grounded in <code>04-chat-system/docs/tradeoffs · caching · tech</code> and <code>revision/INTERVIEW_WALKTHROUGH.md</code>.</p>
+    <p class="run">This use case: <a href="hld.html">04a · HLD</a> · <a href="lld.html">04b · LLD</a> · Deep-dive &nbsp;|&nbsp; Next → <a href="../05-social-media-feed/hld.html">05 · Social Media Feed</a></p>
+  </footer>
+
+</div>
+<script src="../assets/canvas.js"></script>
+</body>
+</html>

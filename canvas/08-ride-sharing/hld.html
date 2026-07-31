@@ -1,0 +1,284 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>08 · Ride Sharing — HLD</title>
+<link rel="stylesheet" href="../assets/canvas.css">
+</head>
+<body>
+<div class="wrap">
+
+  <header class="hero">
+    <h1>Ride Sharing — High-Level Design</h1>
+    <div class="sub">Use case 08 · Canvas 1 of 3. The big picture: requirements, back-of-envelope numbers, and an <b>interactive architecture diagram</b> — click a component to see its role, then step through the ride-request/match flow and the driver-GPS/live-tracking flow.</div>
+    <div class="badges">
+      <span class="badge lvl">Use case 08 · HLD</span>
+      <span class="badge">Canvas 1 of 3</span>
+      <span class="badge">interactive</span>
+      <span class="badge">CP ride-state · AP location</span>
+    </div>
+    <div class="legend">
+      <span><i class="dot" style="background:var(--eden)"></i> click a component</span>
+      <span><i class="dot" style="background:var(--survivor)"></i> write / match path</span>
+      <span><i class="dot" style="background:var(--eden)"></i> current step</span>
+      <span><i class="dot" style="background:var(--old)"></i> data stores</span>
+      <span><i class="dot" style="background:var(--warn)"></i> async / off hot-path</span>
+    </div>
+  </header>
+
+  <!-- A · PROBLEM & REQUIREMENTS -->
+  <section>
+    <div class="sec-h"><span class="n">A</span><h2>Problem &amp; requirements</h2><span class="tag">clarify first</span></div>
+    <div class="grid g2">
+      <div class="card">
+        <div class="kicker">functional</div>
+        <ul class="tight">
+          <li>Rider requests a ride (pickup + dropoff) → system returns a fare estimate and <b>matches the nearest available driver</b> by ETA.</li>
+          <li>Drivers stream GPS every 3–5 s; system keeps a real-time spatial index of all online drivers.</li>
+          <li>Driver <b>accept/reject</b> within a 15 s timeout; cascade to the next best driver on timeout.</li>
+          <li>Ride lifecycle state machine (REQUESTED → MATCHED → EN_ROUTE → ARRIVED → IN_PROGRESS → COMPLETED / CANCELLED).</li>
+          <li>Dynamic <b>surge pricing</b> per zone, fare calc, payment (charge rider, pay driver), push notifications.</li>
+        </ul>
+      </div>
+      <div class="card">
+        <div class="kicker">non-functional</div>
+        <ul class="tight">
+          <li><b>Matching latency</b> &lt; 30 s (request → matched); geo range query &lt; 50 ms.</li>
+          <li><b>Ride-state consistency</b> strong / linearizable — two riders must never get the same driver (→ CP).</li>
+          <li><b>Location freshness</b> &lt; 5 s; stale positions are tolerable (→ AP for location).</li>
+          <li><b>Availability</b> 99.99% · <b>GPS throughput</b> ~200K updates/s sustained · notifications &lt; 2 s.</li>
+          <li><b>Durability</b> — zero ride/payment data loss (financial + legal audit).</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <!-- B · ESTIMATION -->
+  <section>
+    <div class="sec-h"><span class="n">B</span><h2>Back-of-envelope estimation</h2><span class="tag">20M rides/day · 500K online drivers</span></div>
+    <div class="chips">
+      <div class="chip"><span class="k">Daily rides</span><span class="v">20M</span></div>
+      <div class="chip"><span class="k">Online drivers (peak)</span><span class="v">~500K</span></div>
+      <div class="chip"><span class="k">GPS updates/s (peak)</span><span class="v">~167K/s</span></div>
+      <div class="chip"><span class="k">Ride requests (peak)</span><span class="v">~1K/s</span></div>
+      <div class="chip"><span class="k">Location ingest</span><span class="v">~33 MB/s</span></div>
+      <div class="chip"><span class="k">Location data / day</span><span class="v">~2.8 TB</span></div>
+      <div class="chip"><span class="k">Ride data / day</span><span class="v">~40 GB</span></div>
+      <div class="chip"><span class="k">WebSocket servers</span><span class="v">~50+</span></div>
+    </div>
+    <div class="callout tip"><b>Derivation:</b> 500K drivers × (1 ping / 3 s) ≈ 167K updates/s × ~200 B ≈ 33 MB/s ≈ 2.8 TB/day raw (before compaction). 20M rides ÷ 86,400 s ≈ 230/s avg, ~1K/s peak · 20M × 2 KB ≈ 40 GB/day of ride records. At ~10K WebSocket connections/server the GPS firehose alone needs ~50 servers. <span class="run">→ full math on canvas 3 &amp; the estimation cheatsheet</span></div>
+  </section>
+
+  <!-- C · INTERACTIVE ARCHITECTURE -->
+  <section data-flowscope>
+    <div class="sec-h"><span class="n">C</span><h2>Architecture — click components, then step the flows</h2><span class="tag">the design, from the diagram</span></div>
+    <div>
+      <div class="arch">
+        <svg viewBox="0 0 900 480" width="100%" style="max-width:900px" role="img" aria-label="Ride sharing architecture">
+          <defs>
+            <marker id="ah" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" fill="var(--muted)"></path></marker>
+          </defs>
+
+          <!-- arrows (drawn first, under the boxes) -->
+          <!-- WRITE: request a ride & match -->
+          <line class="arrow" x1="108" y1="103" x2="150" y2="216" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"
+                data-flow="write" data-write="1"
+                data-desc-write="Rider taps Request Ride; the app POSTs /rides/request over HTTPS to the API gateway."></line>
+          <line class="arrow" x1="258" y1="240" x2="304" y2="240" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"
+                data-flow="write" data-write="2"
+                data-desc-write="Gateway authenticates the rider, rate-limits, then routes to the Ride Service, which creates the ride in REQUESTED state."></line>
+          <line class="arrow" x1="416" y1="235" x2="470" y2="240" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"
+                data-flow="write" data-write="3"
+                data-desc-write="Ride Service calls Pricing for a fare estimate; Pricing reads the zone's surge multiplier and returns a locked quote."></line>
+          <line class="arrow" x1="404" y1="210" x2="474" y2="128" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"
+                data-flow="write" data-write="4"
+                data-desc-write="Ride Service asks the Matching Service to find the nearest available drivers for the pickup point."></line>
+          <line class="arrow" x1="590" y1="119" x2="648" y2="119" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"
+                data-flow="write" data-write="5"
+                data-desc-write="Matching runs GEOSEARCH FROMLONLAT BYRADIUS 5km on the Redis GeoSet — the K nearest AVAILABLE drivers in O(log N + K)."></line>
+          <line class="arrow" x1="366" y1="275" x2="476" y2="344" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"
+                data-flow="write" data-write="6"
+                data-desc-write="Ride Service persists the ride and every state transition to PostGIS using optimistic locking (CP — no double-booking a driver)."></line>
+          <path class="arrow" d="M590,130 C 646,140 700,220 706,298" fill="none" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"
+                data-flow="write" data-write="7"
+                data-desc-write="Matching picks the best driver by ETA (not raw distance) and hands the offer to the Notification Service."></path>
+          <path class="arrow" d="M690,346 L690,460 L60,460 L60,420" fill="none" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"
+                data-flow="write" data-write="8"
+                data-desc-write="Notification Service pushes the ride offer to the Driver App via FCM/APNS (< 2 s); the driver has 15 s to accept or it cascades to the next driver."></path>
+
+          <!-- READ: driver GPS update & live tracking -->
+          <line class="arrow" x1="108" y1="395" x2="152" y2="268" stroke="var(--muted)" stroke-width="2" stroke-dasharray="4 3" marker-end="url(#ah)"
+                data-flow="read" data-read="1"
+                data-desc-read="Driver App streams a GPS ping every 3–5 s to the API gateway over a persistent WebSocket connection."></line>
+          <line class="arrow" x1="204" y1="275" x2="332" y2="372" stroke="var(--muted)" stroke-width="2" stroke-dasharray="4 3" marker-end="url(#ah)"
+                data-flow="read" data-read="2"
+                data-desc-read="Gateway forwards the frame to the Location Service, which decodes the binary payload, validates GPS accuracy, and rate-limits."></line>
+          <path class="arrow" d="M416,384 C 560,384 656,230 714,144" fill="none" stroke="var(--muted)" stroke-width="2" stroke-dasharray="4 3" marker-end="url(#ah)"
+                data-flow="read" data-read="3"
+                data-desc-read="Location Service issues GEOADD to the Redis GeoSet, updating the driver's last-known position (AP — a ~30 s TTL auto-marks stale drivers offline)."></path>
+          <path class="arrow" d="M416,392 C 540,410 600,250 648,236" fill="none" stroke="var(--muted)" stroke-width="2" stroke-dasharray="4 3" marker-end="url(#ah)"
+                data-flow="read" data-read="4"
+                data-desc-read="Location Service publishes the update to the Kafka driver.location topic — async, off the hot path — for ETA, analytics, and live tracking."></path>
+          <line class="arrow" x1="708" y1="256" x2="708" y2="298" stroke="var(--muted)" stroke-width="2" stroke-dasharray="4 3" marker-end="url(#ah)"
+                data-flow="read" data-read="5"
+                data-desc-read="A consumer reads the stream and asks the Notification Service to push the live driver position to the rider tracking the trip."></line>
+          <path class="arrow" d="M726,300 L726,40 L60,40 L60,80" fill="none" stroke="var(--muted)" stroke-width="2" stroke-dasharray="4 3" marker-end="url(#ah)"
+                data-flow="read" data-read="6"
+                data-desc-read="Notification Service pushes the live driver position to the Rider App map (WebSocket, < 2 s)."></path>
+
+          <text x="440" y="474" fill="var(--faint)" font-size="9">async / off hot-path (dashed)</text>
+
+          <!-- nodes -->
+          <g data-node style="cursor:pointer" data-title="Rider App (mobile)" data-detail="Rider's phone. Requests a ride (POST /rides/request), sees the fare estimate, then watches the matched driver approach on a live map fed by WebSocket push."><rect x="12" y="80" width="96" height="46" rx="9" fill="var(--panel-2)" stroke="var(--eden)"></rect><text x="60" y="102" text-anchor="middle" fill="var(--eden)" font-size="12" font-weight="600">Rider App</text><text x="60" y="116" text-anchor="middle" fill="var(--faint)" font-size="10">mobile</text></g>
+
+          <g data-node style="cursor:pointer" data-title="Driver App (mobile)" data-detail="Driver's phone. Streams a GPS ping every 3–5 s over a persistent WebSocket, receives ride offers via push, and accepts within a 15 s window."><rect x="12" y="372" width="96" height="46" rx="9" fill="var(--panel-2)" stroke="var(--eden)"></rect><text x="60" y="394" text-anchor="middle" fill="var(--eden)" font-size="12" font-weight="600">Driver App</text><text x="60" y="408" text-anchor="middle" fill="var(--faint)" font-size="10">GPS stream</text></g>
+
+          <g data-node style="cursor:pointer" data-title="API Gateway (WebSocket + REST)" data-detail="<b>Role:</b> single entry point — TLS, auth, rate limiting, routing. Holds one long-lived WebSocket per driver/rider for GPS streams and live-map pushes; REST for ride lifecycle calls.<br><b>Scale:</b> stateless, horizontally scaled (~10K connections/server → ~50+ servers for the GPS firehose)."><rect x="150" y="205" width="108" height="70" rx="9" fill="var(--panel-2)" stroke="var(--border)"></rect><text x="204" y="234" text-anchor="middle" fill="var(--text)" font-size="12" font-weight="600">API Gateway</text><text x="204" y="250" text-anchor="middle" fill="var(--faint)" font-size="10">WebSocket</text><text x="204" y="263" text-anchor="middle" fill="var(--faint)" font-size="10">+ REST</text></g>
+
+          <g data-node style="cursor:pointer" data-title="Ride Service (orchestrator)" data-detail="<b>Role:</b> owns the ride lifecycle state machine and coordinates Pricing, Matching, PostGIS and Payment.<br><b>Consistency:</b> every transition is an optimistic-locked UPDATE (WHERE status=? AND version=?) — 0 rows affected → 409 Conflict, so two drivers can never both win a ride.<br><b>Tech:</b> stateless Spring Boot in containers (ECS/EKS)."><rect x="304" y="205" width="112" height="70" rx="9" fill="var(--panel-2)" stroke="var(--border)"></rect><text x="360" y="234" text-anchor="middle" fill="var(--text)" font-size="12" font-weight="600">Ride Service</text><text x="360" y="250" text-anchor="middle" fill="var(--faint)" font-size="10">state machine</text><text x="360" y="263" text-anchor="middle" fill="var(--faint)" font-size="10">orchestrator</text></g>
+
+          <g data-node style="cursor:pointer" data-title="Matching Service" data-detail="<b>Role:</b> find the best available driver — GEOSEARCH the K nearest, then rank by <b>ETA</b> (not raw distance: a closer driver across a jammed one-way street can lose to a farther one on a clear route).<br><b>Offer + cascade:</b> offer to #1 with a 15 s timeout; on reject/timeout, cascade to #2, #3."><rect x="470" y="96" width="120" height="46" rx="9" fill="var(--panel-2)" stroke="var(--border)"></rect><text x="530" y="118" text-anchor="middle" fill="var(--text)" font-size="12" font-weight="600">Matching Svc</text><text x="530" y="132" text-anchor="middle" fill="var(--faint)" font-size="10">rank by ETA · cascade</text></g>
+
+          <g data-node style="cursor:pointer" data-title="Pricing &amp; Surge Engine" data-detail="<b>Pricing:</b> fare = (base + distance×rate + time×rate) × surge + booking fee; surge is locked at request time and honored at completion.<br><b>Surge:</b> per-zone supply/demand ratio recalculated every ~30–120 s, capped (e.g. ≤3–5×), cached in Redis with a short TTL. AP — a slightly stale multiplier is fine."><rect x="470" y="217" width="120" height="46" rx="9" fill="var(--panel-2)" stroke="var(--border)"></rect><text x="530" y="239" text-anchor="middle" fill="var(--text)" font-size="12" font-weight="600">Pricing &amp; Surge</text><text x="530" y="253" text-anchor="middle" fill="var(--faint)" font-size="10">per-zone multiplier</text></g>
+
+          <g data-node style="cursor:pointer" data-title="Database — PostGIS (ride state)" data-detail="<b>Role:</b> source of truth for riders, drivers, rides and payments.<br><b>Why relational:</b> ride state needs ACID + strong consistency (CP) for the optimistic-lock transition guard.<br><b>Scale:</b> Multi-AZ primary + read replicas; high-volume trip history spills to a NoSQL/columnar store."><rect x="470" y="340" width="120" height="46" rx="9" fill="var(--panel-2)" stroke="var(--old)"></rect><text x="530" y="362" text-anchor="middle" fill="var(--old)" font-size="12" font-weight="600">PostGIS (RDS)</text><text x="530" y="376" text-anchor="middle" fill="var(--faint)" font-size="10">ride state · CP</text></g>
+
+          <g data-node style="cursor:pointer" data-title="Location Service" data-detail="<b>Role:</b> ingest the GPS firehose — decode binary frames, run a Kalman filter + speed check (reject teleport jumps &amp; accuracy &gt;100 m), then GEOADD to Redis and publish to Kafka.<br><b>Scale:</b> stateless behind sticky WebSocket servers; ~167K updates/s at peak."><rect x="304" y="372" width="112" height="46" rx="9" fill="var(--panel-2)" stroke="var(--border)"></rect><text x="360" y="394" text-anchor="middle" fill="var(--text)" font-size="12" font-weight="600">Location Svc</text><text x="360" y="408" text-anchor="middle" fill="var(--faint)" font-size="10">GPS ingest</text></g>
+
+          <g data-node style="cursor:pointer" data-title="Redis GeoSet (spatial index)" data-detail="<b>Pattern:</b> GEOADD writes the driver's last-known lng/lat; GEOSEARCH FROMLONLAT BYRADIUS returns nearest drivers in O(log N + K).<br><b>Why:</b> holds only the hot last position (not history), sharded across nodes.<br><b>Freshness:</b> AP — a per-driver key with ~30 s EXPIRE auto-drops drivers who stop pinging."><rect x="648" y="96" width="132" height="46" rx="9" fill="var(--panel-2)" stroke="var(--old)"></rect><text x="714" y="118" text-anchor="middle" fill="var(--old)" font-size="12" font-weight="600">Redis GeoSet</text><text x="714" y="132" text-anchor="middle" fill="var(--faint)" font-size="10">GEOADD · GEOSEARCH</text></g>
+
+          <g data-node style="cursor:pointer" data-title="Kafka / Kinesis (event stream)" data-detail="<b>Role:</b> decouples the GPS firehose from downstream consumers (ETA, surge, analytics/ML, live tracking, ride events).<br><b>Why:</b> writing all of that synchronously per ping would blow the latency budget. Partition by driver_id for per-driver ordering; ~150K records/s at peak."><rect x="648" y="210" width="120" height="46" rx="9" fill="var(--panel-2)" stroke="var(--warn)"></rect><text x="708" y="232" text-anchor="middle" fill="var(--warn)" font-size="12" font-weight="600">Kafka</text><text x="708" y="246" text-anchor="middle" fill="var(--faint)" font-size="10">location · ride events</text></g>
+
+          <g data-node style="cursor:pointer" data-title="Notification Service" data-detail="<b>Role:</b> deliver real-time updates at every state change — ride offers to drivers, live-map position &amp; status to riders.<br><b>Delivery:</b> FCM/APNS push + WebSocket when the app is foregrounded; SMS fallback for critical events. At-least-once with dedup; TTL-drops stale (&gt;5 min) messages."><rect x="648" y="300" width="120" height="46" rx="9" fill="var(--panel-2)" stroke="var(--border)"></rect><text x="708" y="322" text-anchor="middle" fill="var(--text)" font-size="12" font-weight="600">Notification Svc</text><text x="708" y="336" text-anchor="middle" fill="var(--faint)" font-size="10">FCM/APNS · WSS</text></g>
+
+          <g data-node style="cursor:pointer" data-title="Payment Service" data-detail="<b>Role:</b> pre-authorize at request (max possible fare), capture the actual fare on completion, release the hold, and queue the driver payout (fare minus platform fee).<br><b>Tech:</b> Stripe via async functions/workflow; supports split fare and refunds. Exact-to-the-cent, zero data loss."><rect x="648" y="390" width="120" height="46" rx="9" fill="var(--panel-2)" stroke="var(--border)"></rect><text x="708" y="412" text-anchor="middle" fill="var(--text)" font-size="12" font-weight="600">Payment Svc</text><text x="708" y="426" text-anchor="middle" fill="var(--faint)" font-size="10">Stripe · payouts</text></g>
+        </svg>
+      </div>
+      <div class="node-detail"><span class="nd-title">Click any component</span><div class="nd-body">Its role, tech choice, and scaling note appear here. Then use the buttons below to step through a request flow.</div></div>
+
+      <div class="flowctl" data-flowctl>
+        <button class="btn" data-flow="write">Write path (request &amp; match)</button>
+        <button class="btn" data-flow="read">Read path (GPS &amp; live-track)</button>
+        <span style="flex:1"></span>
+        <button class="btn" data-flowstep="prev">◀ Prev</button>
+        <button class="btn" data-flowstep="next">Next ▶</button>
+      </div>
+      <div class="flowlabel" data-flowlabel>Pick <b>Write</b> (a rider requests &amp; is matched) or <b>Read</b> (a driver's GPS ping and the rider's live map), then press “Next ▶” to walk the numbered flow one hop at a time.</div>
+
+      <div class="cloudmap">
+        <div class="kicker" style="margin-top:4px">Managed-service mapping — the same components on each cloud</div>
+        <table class="cloudtable">
+          <thead><tr>
+            <th>Component</th>
+            <th><span class="hdrlogo"><span class="logochip"><img src="../assets/logos/aws.svg" alt="AWS"></span>AWS</span></th>
+            <th><span class="hdrlogo"><span class="logochip"><img src="../assets/logos/gcp.svg" alt="GCP"></span>GCP</span></th>
+            <th><span class="hdrlogo"><span class="logochip"><img src="../assets/logos/azure.svg" alt="Azure"></span>Azure</span></th>
+          </tr></thead>
+          <tbody>
+            <tr><td>API Gateway (WS)</td><td><img class="svcicon" src="../assets/logos/services/aws-apigw.svg" alt="">API Gateway (REST + WebSocket)</td><td><img class="svcicon" src="../assets/logos/services/gcp-apigw.svg" alt="">Cloud Endpoints / Firebase</td><td><img class="svcicon" src="../assets/logos/services/azure-apim.svg" alt="">API Management + SignalR</td></tr>
+            <tr><td>Services (Ride / Matching)</td><td><img class="svcicon" src="../assets/logos/services/aws-ecs.svg" alt="">ECS / EKS (Fargate)</td><td><img class="svcicon" src="../assets/logos/services/gcp-run.svg" alt="">Cloud Run / GKE</td><td><img class="svcicon" src="../assets/logos/services/azure-aks.svg" alt="">AKS</td></tr>
+            <tr><td>Location cache / spatial index</td><td><img class="svcicon" src="../assets/logos/services/aws-elasticache.svg" alt="">ElastiCache Redis (GEO)</td><td><img class="svcicon" src="../assets/logos/services/gcp-memorystore.svg" alt="">Memorystore (Redis)</td><td><img class="svcicon" src="../assets/logos/services/azure-redis.svg" alt="">Cache for Redis</td></tr>
+            <tr><td>Ride-state DB (PostGIS)</td><td><img class="svcicon" src="../assets/logos/services/aws-rds.svg" alt="">RDS PostgreSQL + PostGIS</td><td><img class="svcicon" src="../assets/logos/services/gcp-cloudsql.svg" alt="">Cloud SQL (PostGIS)</td><td><img class="svcicon" src="../assets/logos/services/azure-sql.svg" alt="">DB for PostgreSQL</td></tr>
+            <tr><td>Event stream</td><td><img class="svcicon" src="../assets/logos/services/aws-msk.svg" alt="">Kinesis / MSK (Kafka)</td><td><img class="svcicon" src="../assets/logos/services/gcp-pubsub.svg" alt="">Pub/Sub</td><td><img class="svcicon" src="../assets/logos/services/azure-eventhubs.svg" alt="">Event Hubs</td></tr>
+            <tr><td>Trip history</td><td><img class="svcicon" src="../assets/logos/services/aws-dynamodb.svg" alt="">DynamoDB</td><td><img class="svcicon" src="../assets/logos/services/gcp-bigtable.svg" alt="">Bigtable / Firestore</td><td><img class="svcicon" src="../assets/logos/services/azure-cosmos.svg" alt="">Cosmos DB</td></tr>
+            <tr><td>Push notifications</td><td><img class="svcicon" src="../assets/logos/services/aws-sns.svg" alt="">SNS + SQS</td><td>FCM + Cloud Tasks</td><td><img class="svcicon" src="../assets/logos/services/azure-notifhub.svg" alt="">Notification Hubs</td></tr>
+            <tr><td>Object storage (receipts)</td><td><img class="svcicon" src="../assets/logos/services/aws-s3.svg" alt="">S3</td><td><img class="svcicon" src="../assets/logos/services/gcp-cloudstorage.svg" alt="">Cloud Storage</td><td><img class="svcicon" src="../assets/logos/services/azure-blob.svg" alt="">Blob Storage</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+
+  <!-- D · API -->
+  <section>
+    <div class="sec-h"><span class="n">D</span><h2>API design</h2><span class="tag">REST for lifecycle · WS for GPS</span></div>
+    <table>
+      <thead><tr><th>Endpoint</th><th>Purpose</th><th>Response</th></tr></thead>
+      <tbody>
+        <tr><td><code>POST /api/v1/rides/request</code></td><td>rider requests a ride (pickup, dropoff, ride_type, payment)</td><td>201 + ride_id, status=REQUESTED, fare_estimate (with surge), pickup ETA</td></tr>
+        <tr><td><code>POST /api/v1/rides/{id}/accept</code></td><td>driver accepts an offer (the hot, contended write)</td><td>200 + status=MATCHED / <b>409 Conflict</b> if already matched</td></tr>
+        <tr><td><code>PUT /api/v1/drivers/{id}/location</code></td><td>driver GPS update — in prod a binary WebSocket frame, not REST</td><td>200 LOCATION_UPDATED + server timestamp</td></tr>
+        <tr><td><code>POST /api/v1/rides/{id}/complete</code></td><td>driver ends trip → compute final fare, capture payment</td><td>200 + status=COMPLETED, fare breakdown, payment_status</td></tr>
+        <tr><td><code>GET /api/v1/surge?lat=&amp;lng=</code></td><td>query current surge multiplier for a zone</td><td>200 + zone_id, multiplier, supply/demand, valid_until</td></tr>
+        <tr><td><code>POST /api/v1/rides/{id}/cancel</code></td><td>rider or driver cancels</td><td>200 + status=CANCELLED, cancellation_fee (state-dependent)</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <!-- E · DATA MODEL -->
+  <section>
+    <div class="sec-h"><span class="n">E</span><h2>Data model</h2><span class="tag">relational core + Redis hot layer</span></div>
+    <div class="grid g2">
+      <div class="card">
+        <div class="kicker">rides (source of truth · CP)</div>
+        <pre class="code">ride_id            UUID  <span class="cm">// PK</span>
+rider_id           UUID  <span class="cm">// FK</span>
+driver_id          UUID  <span class="cm">// NULL until matched</span>
+status             ENUM  <span class="cm">// REQUESTED…COMPLETED/CANCELLED</span>
+pickup/dropoff     lat,lng,address
+fare_cents         INT
+surge_multiplier   DECIMAL(3,2)
+estimated_fare_cents INT
+version            INT   <span class="cm">// optimistic lock</span>
+requested_at / matched_at / completed_at  TS</pre>
+        <p class="muted">Index <code>(driver_id, status)</code> &amp; <code>(status, requested_at)</code>. State transitions guard on <code>status</code> + <code>version</code> to block double-booking.</p>
+      </div>
+      <div class="card">
+        <div class="kicker">driver last-location (Redis GeoSet · AP)</div>
+        <pre class="code"><span class="cm">// hot spatial layer — not queried from SQL</span>
+GEOADD drivers &lt;lng&gt; &lt;lat&gt; "driver:{id}"
+GEOSEARCH drivers FROMLONLAT &lt;lng&gt; &lt;lat&gt;
+         BYRADIUS 5 km ASC COUNT 5
+
+driver:{id}:active  EX 30   <span class="cm">// TTL → auto-offline</span>
+
+<span class="cm">// cold history → time-series / NoSQL</span>
+driver_locations(driver_id, lat, lng,
+   heading, speed, ts)  <span class="cm">// partitioned by day</span></pre>
+        <p class="muted">Redis holds only the last known position; the raw stream lands in Kafka → time-series store for 30-day analytics.</p>
+      </div>
+    </div>
+    <p class="muted" style="margin-top:8px">Other tables: <b>riders</b> / <b>drivers</b> (profile, rating, status), <b>payments</b> (auth/capture, platform fee, driver payout), <b>surge_zones</b> (H3 cell, multiplier, supply/demand). <span class="run">→ full schema on canvas 2 · LLD</span></p>
+  </section>
+
+  <!-- F · KEY CHOICES -->
+  <section>
+    <div class="sec-h"><span class="n">F</span><h2>Key design choices (deep-dived on canvas 3)</h2><span class="tag">defend these</span></div>
+    <div class="grid g3">
+      <div class="card"><div class="kicker">spatial index</div><h3>Redis GeoSet / QuadTree → H3</h3><p class="muted">GEOSEARCH gives O(log N + K) nearest-driver queries under 50 ms. QuadTree/GeoHash explain the theory; Uber uses H3 hexagons for uniform zones. <span class="run">→ canvas 3 · Deep-dive</span></p></div>
+      <div class="card"><div class="kicker">consistency per component</div><h3>CP ride-state · AP location</h3><p class="muted">Ride assignment &amp; payments are strongly consistent (optimistic lock → no double-booking); location &amp; surge are AP — 3–5 s staleness is fine. <span class="run">→ canvas 2 · LLD</span></p></div>
+      <div class="card"><div class="kicker">matching</div><h3>Rank by ETA, cascade on timeout</h3><p class="muted">Offer the lowest-ETA driver (not the closest), 15 s timeout, cascade to the next. Balances rider wait against driver utilization. <span class="run">→ canvas 3</span></p></div>
+    </div>
+  </section>
+
+  <!-- GLOSSARY -->
+  <section>
+    <div class="sec-h"><span class="n">§</span><h2>Glossary — one-liners</h2><span class="tag">terms used above</span></div>
+    <div class="grid g2">
+      <div class="card"><table><tbody>
+        <tr><td><b>Redis GeoSet</b></td><td>sorted set with GEOADD/GEOSEARCH for radius queries in O(log N + K)</td></tr>
+        <tr><td><b>QuadTree</b></td><td>recursively splits 2D space into 4 quadrants for spatial range queries</td></tr>
+        <tr><td><b>GeoHash / H3</b></td><td>encode a point into a grid cell (rectangles / Uber's hexagons) for indexing</td></tr>
+        <tr><td><b>Surge multiplier</b></td><td>per-zone price factor from the supply/demand ratio, capped &amp; TTL-cached</td></tr>
+        <tr><td><b>ETA ranking</b></td><td>pick the lowest travel-time driver, not the shortest straight-line distance</td></tr>
+      </tbody></table></div>
+      <div class="card"><table><tbody>
+        <tr><td><b>CP vs AP</b></td><td>ride state favours Consistency; location/surge favour Availability</td></tr>
+        <tr><td><b>Optimistic locking</b></td><td>UPDATE … WHERE version=? — 0 rows means someone else won → 409</td></tr>
+        <tr><td><b>Cascade</b></td><td>on reject/timeout, offer the ride to the next-best driver</td></tr>
+        <tr><td><b>WebSocket</b></td><td>long-lived connection for GPS streams &amp; live-map pushes (no per-ping handshake)</td></tr>
+        <tr><td><b>At-least-once</b></td><td>consumer commits only after delivery; dedup guards against duplicate pushes</td></tr>
+      </tbody></table></div>
+    </div>
+  </section>
+
+  <footer>
+    <p>Use case 08 · Ride Sharing — Canvas 1 of 3 (HLD). Grounded in <code>08-ride-sharing/docs/hld/</code> &amp; <code>docs/cloud/</code>.</p>
+    <p class="run">This use case: HLD · <a href="lld.html">Canvas 2 · LLD</a> · <a href="deepdive.html">Canvas 3 · Deep-dive &amp; Trade-offs</a> &nbsp;|&nbsp; Next → <a href="lld.html">Canvas 2 · LLD</a> &nbsp;|&nbsp; <a href="../index.html">Hub</a></p>
+  </footer>
+
+</div>
+<script src="../assets/canvas.js"></script>
+</body>
+</html>

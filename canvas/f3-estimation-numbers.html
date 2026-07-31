@@ -1,0 +1,387 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>F3 · Estimation, Numbers &amp; Conversions</title>
+<link rel="stylesheet" href="assets/canvas.css">
+</head>
+<body>
+<div class="wrap">
+
+  <header class="hero">
+    <h1>Estimation, Numbers &amp; Conversions</h1>
+    <div class="sub">Foundation reference — the back-of-envelope numbers, conversions and formulas to memorize once and reuse in every system-design interview. Two live calculators below; everything else is a scannable cheat-sheet.</div>
+    <div class="badges">
+      <span class="badge lvl">Foundation · F3 of 3</span>
+      <span class="badge">System Design Basics</span>
+      <span class="badge">interactive</span>
+      <span class="badge">memorize once</span>
+    </div>
+    <div class="legend">
+      <span><i class="dot" style="background:var(--eden)"></i> live calculator</span>
+      <span><i class="dot" style="background:var(--survivor)"></i> conversions</span>
+      <span><i class="dot" style="background:var(--old)"></i> numbers to know</span>
+      <span><i class="dot" style="background:var(--gc)"></i> formulas</span>
+      <span><i class="dot" style="background:var(--warn)"></i> tips</span>
+    </div>
+  </header>
+
+  <!-- A · THE 5 NUMBERS -->
+  <section>
+    <div class="sec-h"><span class="n">A</span><h2>The 5 numbers — memorize only these, derive the rest</h2><span class="tag">start here</span></div>
+    <div class="chips">
+      <div class="chip"><span class="k">seconds / day</span><span class="v">100K</span></div>
+      <div class="chip"><span class="k">seconds / month</span><span class="v">2.5M</span></div>
+      <div class="chip"><span class="k">typical DB row</span><span class="v">300 B</span></div>
+      <div class="chip"><span class="k">cache rule</span><span class="v">80 / 20</span></div>
+      <div class="chip"><span class="k">Base62⁷ keyspace</span><span class="v">3.5 T</span></div>
+    </div>
+    <div class="callout tip"><b>Everything derives from these:</b> QPS from daily = <code>÷ 100K</code>; QPS from monthly = <code>÷ 2.5M</code>; storage ≈ <code>rows × 300 B</code>; cache the hot <b>20%</b> that serves <b>80%</b> of traffic; a 7-char Base62 code covers 3.5 trillion URLs.</div>
+  </section>
+
+  <!-- B · LIVE ESTIMATOR -->
+  <section>
+    <div class="sec-h"><span class="n">B</span><h2>Live capacity estimator</h2><span class="tag">edit the inputs</span></div>
+    <div class="widget">
+      <div class="grid g3">
+        <label class="field">Daily Active Users (DAU)<input id="est-dau" type="number" value="1000000"></label>
+        <label class="field">Write actions / user / day<input id="est-actions" type="number" value="5"></label>
+        <label class="field">Read : Write ratio (reads per write)<input id="est-rw" type="number" value="100"></label>
+        <label class="field">Avg payload / row size (bytes)<input id="est-payload" type="number" value="300"></label>
+        <label class="field">Retention (years)<input id="est-retention" type="number" value="5"></label>
+        <label class="field">Assumptions<input type="text" value="peak = ×3 · replication = ×3" disabled></label>
+      </div>
+      <div class="chips">
+        <div class="chip"><span class="k">Writes</span><span class="v" id="o-writesday">—</span></div>
+        <div class="chip"><span class="k">Reads</span><span class="v" id="o-readsday">—</span></div>
+        <div class="chip"><span class="k">Write QPS</span><span class="v" id="o-wqps">—</span></div>
+        <div class="chip"><span class="k">Read QPS</span><span class="v" id="o-rqps">—</span></div>
+        <div class="chip"><span class="k">Total QPS</span><span class="v" id="o-tqps">—</span></div>
+        <div class="chip"><span class="k">Peak QPS (×3)</span><span class="v" id="o-peak">—</span></div>
+        <div class="chip"><span class="k">Storage / day</span><span class="v" id="o-storeday">—</span></div>
+        <div class="chip"><span class="k">Storage / N yr (×3 repl)</span><span class="v" id="o-storetotal">—</span></div>
+        <div class="chip"><span class="k">Read bandwidth</span><span class="v" id="o-bw">—</span></div>
+      </div>
+    </div>
+    <div class="callout"><b>The method (say it out loud):</b> state assumptions → writes/day = DAU × actions → ÷ 86,400 for QPS → peak = ×3 → storage = rows × row-size → ×3 for replication. Round aggressively; get the order of magnitude and move on.</div>
+  </section>
+
+  <!-- C · BYTE CONVERTER -->
+  <section>
+    <div class="sec-h"><span class="n">C</span><h2>Byte converter — B ↔ KB ↔ MB ↔ GB ↔ TB ↔ PB</h2><span class="tag">1024 vs 1000</span></div>
+    <div class="widget">
+      <div class="row" style="align-items:flex-end;gap:12px">
+        <label class="field" style="flex:1">Value<input id="cv-val" type="number" value="500"></label>
+        <label class="field">Unit
+          <select id="cv-unit">
+            <option>B</option><option>KB</option><option selected>MB</option><option>GB</option><option>TB</option><option>PB</option>
+          </select>
+        </label>
+        <div>
+          <div class="k" style="font-size:11px;color:var(--faint);margin-bottom:5px;text-transform:uppercase;letter-spacing:.06em">Base per step</div>
+          <button class="btn active" data-base="1024">1024 (binary)</button>
+          <button class="btn" data-base="1000">1000 (decimal)</button>
+        </div>
+      </div>
+      <div class="chips">
+        <div class="chip"><span class="k">Bytes</span><span class="v" id="cv-B">—</span></div>
+        <div class="chip"><span class="k">KB</span><span class="v" id="cv-KB">—</span></div>
+        <div class="chip"><span class="k">MB</span><span class="v" id="cv-MB">—</span></div>
+        <div class="chip"><span class="k">GB</span><span class="v" id="cv-GB">—</span></div>
+        <div class="chip"><span class="k">TB</span><span class="v" id="cv-TB">—</span></div>
+        <div class="chip"><span class="k">PB</span><span class="v" id="cv-PB">—</span></div>
+      </div>
+    </div>
+    <div class="callout tip"><b>Interview shortcut:</b> each step is <b>×1024 ≈ ×1000 (10³)</b> — B → KB → MB → GB → TB → PB. Use 1000 for mental math (nobody docks you for it); 1024 is the real binary factor.</div>
+  </section>
+
+  <!-- D · DATA SIZE UNITS -->
+  <section>
+    <div class="sec-h"><span class="n">D</span><h2>Data size units</h2><span class="tag">reference</span></div>
+    <table>
+      <thead><tr><th>Unit</th><th>Value</th><th>≈</th><th>Think of it as</th></tr></thead>
+      <tbody>
+        <tr><td>1 B</td><td>8 bits</td><td>—</td><td>1 character</td></tr>
+        <tr><td>1 KB</td><td>1,024 B</td><td>~10³</td><td>a short email</td></tr>
+        <tr><td>1 MB</td><td>1,024 KB</td><td>~10⁶</td><td>1 photo / 1 min MP3</td></tr>
+        <tr><td>1 GB</td><td>1,024 MB</td><td>~10⁹</td><td>1 movie / 1000 photos</td></tr>
+        <tr><td>1 TB</td><td>1,024 GB</td><td>~10¹²</td><td>a small–medium database</td></tr>
+        <tr><td>1 PB</td><td>1,024 TB</td><td>~10¹⁵</td><td>Netflix / Google scale</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <!-- E · COMMON OBJECT SIZES -->
+  <section>
+    <div class="sec-h"><span class="n">E</span><h2>Common object sizes</h2><span class="tag">for storage math</span></div>
+    <div class="grid g2">
+      <table>
+        <thead><tr><th>Object</th><th>Size</th></tr></thead>
+        <tbody>
+          <tr><td>1 ASCII char</td><td>1 B</td></tr>
+          <tr><td>1 Unicode char (avg)</td><td>3 B</td></tr>
+          <tr><td>int32 / boolean</td><td>4 B / 1 B</td></tr>
+          <tr><td>int64 / long / timestamp</td><td>8 B</td></tr>
+          <tr><td>UUID (36 chars)</td><td>36 B</td></tr>
+          <tr><td>short hash (7 chars)</td><td>7 B</td></tr>
+          <tr><td>a URL</td><td>100–200 B</td></tr>
+          <tr><td>a tweet / SMS</td><td>200–300 B</td></tr>
+        </tbody>
+      </table>
+      <table>
+        <thead><tr><th>Object</th><th>Size</th></tr></thead>
+        <tbody>
+          <tr><td>small JSON payload</td><td>1–5 KB</td></tr>
+          <tr><td>DB row (simple / medium)</td><td>300 B / 500 B–5 KB</td></tr>
+          <tr><td>thumbnail image</td><td>10–50 KB</td></tr>
+          <tr><td>profile photo</td><td>100–500 KB</td></tr>
+          <tr><td>high-res image</td><td>2–5 MB</td></tr>
+          <tr><td>1-min video (720p)</td><td>5–10 MB</td></tr>
+          <tr><td>1-hr video (HD)</td><td>1–3 GB</td></tr>
+          <tr><td>1-hr video (4K)</td><td>5–10 GB</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <!-- F · TIME CONVERSIONS -->
+  <section>
+    <div class="sec-h"><span class="n">F</span><h2>Time conversions &amp; shortcuts</h2><span class="tag">QPS math</span></div>
+    <div class="grid g2">
+      <div class="card">
+        <div class="kicker">the 3 magic numbers</div>
+        <pre class="code">1 day   = 86,400 s    <span class="cm">→ ~100K</span>
+1 month = 2,592,000 s <span class="cm">→ ~2.5M</span>
+3 years = ~100M s</pre>
+        <table>
+          <thead><tr><th>From → To</th><th>Shortcut</th></tr></thead>
+          <tbody>
+            <tr><td>daily → per second</td><td><code>÷ 100K</code></td></tr>
+            <tr><td>monthly → per second</td><td><code>÷ 2.5M</code></td></tr>
+            <tr><td>per second → daily</td><td><code>× 100K</code></td></tr>
+            <tr><td>per second → monthly</td><td><code>× 2.5M</code></td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="card">
+        <div class="kicker">worked examples</div>
+        <pre class="code"><span class="cm">// 300M requests/month → per second</span>
+300M ÷ 2.5M = 120/sec
+
+<span class="cm">// 10B requests/day → per second</span>
+10B ÷ 100K = 100K/sec
+
+<span class="cm">// 1000 req/sec → per month</span>
+1000 × 2.5M = 2.5B/month</pre>
+        <p class="muted">Full ladder: month <code>÷30</code> day <code>÷24</code> hour <code>÷60</code> min <code>÷60</code> sec.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- G · POWERS OF 1000 -->
+  <section>
+    <div class="sec-h"><span class="n">G</span><h2>Scale reference — powers of 1000</h2><span class="tag">order of magnitude</span></div>
+    <table>
+      <thead><tr><th>Notation</th><th>Value</th><th>In system design</th></tr></thead>
+      <tbody>
+        <tr><td>1K</td><td>1,000</td><td>small app's DAU</td></tr>
+        <tr><td>100K</td><td>100,000</td><td>≈ seconds in a day</td></tr>
+        <tr><td>1M</td><td>1,000,000</td><td>decent app's DAU</td></tr>
+        <tr><td>10M</td><td>10,000,000</td><td>large table (still manageable)</td></tr>
+        <tr><td>100M</td><td>100,000,000</td><td>needs indexing + sharding</td></tr>
+        <tr><td>1B</td><td>1,000,000,000</td><td>Google-scale daily events</td></tr>
+        <tr><td>10B</td><td>10,000,000,000</td><td>total URLs on the internet</td></tr>
+        <tr><td>1T</td><td>1,000,000,000,000</td><td>global annual data</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <!-- H · LATENCY NUMBERS -->
+  <section>
+    <div class="sec-h"><span class="n">H</span><h2>Latency numbers every developer should know</h2><span class="tag">ns → µs → ms</span></div>
+    <div class="grid g2">
+      <table>
+        <thead><tr><th>Operation</th><th>Time</th></tr></thead>
+        <tbody>
+          <tr><td>L1 / L2 cache reference</td><td>1 ns / 4 ns</td></tr>
+          <tr><td>RAM reference</td><td>100 ns</td></tr>
+          <tr><td>SSD random read</td><td>16 µs</td></tr>
+          <tr><td>Read 1 MB from SSD</td><td>0.2 ms</td></tr>
+          <tr><td>Same-datacenter round trip</td><td>0.5 ms</td></tr>
+          <tr><td>Redis / Memcached GET</td><td>0.5–1 ms</td></tr>
+        </tbody>
+      </table>
+      <table>
+        <thead><tr><th>Operation</th><th>Time</th></tr></thead>
+        <tbody>
+          <tr><td>DB indexed query</td><td>1–5 ms</td></tr>
+          <tr><td>Read 1 MB over 1 Gbps network</td><td>10 ms</td></tr>
+          <tr><td>HDD random read / read 1 MB</td><td>2–20 ms</td></tr>
+          <tr><td>Cross-region network call</td><td>50–150 ms</td></tr>
+          <tr><td>Internet round trip (cross-continent)</td><td>100–300 ms</td></tr>
+          <tr><td>Cold-start serverless</td><td>100–500 ms</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <div class="callout tip"><b>Trick:</b> RAM = <b>ns</b>, SSD = <b>µs</b>, network &amp; HDD = <b>ms</b>. Memory is ~1,000× faster than SSD, SSD ~1,000× faster than a cross-continent round trip.</div>
+  </section>
+
+  <!-- I · THROUGHPUT + CAPACITY -->
+  <section>
+    <div class="sec-h"><span class="n">I</span><h2>Throughput &amp; capacity anchors</h2><span class="tag">per node</span></div>
+    <div class="grid g2">
+      <table>
+        <thead><tr><th>Component</th><th>Throughput</th></tr></thead>
+        <tbody>
+          <tr><td>Single web server</td><td>1K–10K req/s</td></tr>
+          <tr><td>Load balancer (L7)</td><td>50K–100K req/s</td></tr>
+          <tr><td>Redis node</td><td>100K–200K ops/s</td></tr>
+          <tr><td>MySQL / PostgreSQL (indexed)</td><td>5K–20K q/s</td></tr>
+          <tr><td>Cassandra node</td><td>10K–50K writes/s</td></tr>
+          <tr><td>Kafka broker</td><td>100K–200K msg/s</td></tr>
+        </tbody>
+      </table>
+      <table>
+        <thead><tr><th>Component</th><th>Capacity</th></tr></thead>
+        <tbody>
+          <tr><td>Redis node</td><td>25–50 GB RAM</td></tr>
+          <tr><td>MySQL instance</td><td>1–5 TB</td></tr>
+          <tr><td>Cassandra node</td><td>1–2 TB</td></tr>
+          <tr><td>Single server disk</td><td>1–16 TB SSD</td></tr>
+          <tr><td>S3 bucket / DynamoDB</td><td>effectively unlimited</td></tr>
+          <tr><td>CDN edge cache hit</td><td>1–5 ms</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <!-- J · AVAILABILITY -->
+  <section>
+    <div class="sec-h"><span class="n">J</span><h2>Availability — the nines</h2><span class="tag">downtime budget</span></div>
+    <table>
+      <thead><tr><th>Availability</th><th>Downtime / year</th><th>/ month</th><th>/ day</th></tr></thead>
+      <tbody>
+        <tr><td>99% (two 9s)</td><td>3.65 days</td><td>7.3 hours</td><td>14.4 min</td></tr>
+        <tr><td>99.9% (three 9s)</td><td>8.76 hours</td><td>43.8 min</td><td>1.44 min</td></tr>
+        <tr><td>99.99% (four 9s)</td><td>52.6 min</td><td>4.38 min</td><td>8.6 sec</td></tr>
+        <tr><td>99.999% (five 9s)</td><td>5.26 min</td><td>26.3 sec</td><td>0.86 sec</td></tr>
+      </tbody>
+    </table>
+    <div class="callout"><b>Each extra 9 = 10× less downtime.</b> Most systems target <b>three 9s</b> (99.9%) or <b>four 9s</b> (99.99%). "Five 9s" is expensive and rarely required.</div>
+  </section>
+
+  <!-- K · BASE ENCODING + FORMULAS -->
+  <section>
+    <div class="sec-h"><span class="n">K</span><h2>Base encoding &amp; quick-fire formulas</h2><span class="tag">keyspace + capacity</span></div>
+    <div class="grid g2">
+      <div class="card">
+        <div class="kicker">short-code keyspace</div>
+        <table>
+          <thead><tr><th>Encoding</th><th>Base</th><th>7 chars</th></tr></thead>
+          <tbody>
+            <tr><td>Hex</td><td>16</td><td>268 M</td></tr>
+            <tr><td>Base36</td><td>36</td><td>78 B</td></tr>
+            <tr><td>Base62</td><td>62</td><td><b>3.5 T</b></td></tr>
+            <tr><td>Base64</td><td>64</td><td>4.4 T</td></tr>
+          </tbody>
+        </table>
+        <p class="muted">Base62 × 7 chars = <b>3.5 trillion</b> — enough for almost any system.</p>
+      </div>
+      <div class="card">
+        <div class="kicker">memorize the formulas</div>
+        <pre class="code">QPS (daily)   = daily ÷ 100K
+QPS (monthly) = monthly ÷ 2.5M
+Peak QPS      = avg × 3
+Storage       = records × row_size
+Bandwidth     = QPS × response_size
+Cache memory  = daily × 0.2 × resp_size
+Servers       = peak_QPS ÷ server_QPS
+Shards        = storage ÷ shard_capacity
+Replication   = raw × 3</pre>
+      </div>
+    </div>
+  </section>
+
+  <!-- L · SYSTEM PROFILES -->
+  <section>
+    <div class="sec-h"><span class="n">L</span><h2>Typical system profiles — anchor points</h2><span class="tag">interpolate from these</span></div>
+    <table>
+      <thead><tr><th>System</th><th>Scale</th><th>Write QPS</th><th>R:W</th><th>Read QPS</th><th>Row</th></tr></thead>
+      <tbody>
+        <tr><td>URL Shortener</td><td>100M/mo</td><td>~40/s</td><td>100:1</td><td>~4K/s</td><td>~300 B</td></tr>
+        <tr><td>Twitter</td><td>600M tweets/day</td><td>~7K/s</td><td>10:1</td><td>~70K/s</td><td>~300 B</td></tr>
+        <tr><td>Instagram</td><td>100M photos/day</td><td>~1.2K/s</td><td>100:1</td><td>~120K/s</td><td>~2 MB</td></tr>
+        <tr><td>WhatsApp</td><td>100B msgs/day</td><td>~1.2M/s</td><td>1:1</td><td>~1.2M/s</td><td>~100 B</td></tr>
+        <tr><td>YouTube</td><td>500 hrs/min</td><td>~8/s</td><td>1000:1</td><td>~8K/s</td><td>~50 MB</td></tr>
+        <tr><td>Uber</td><td>20M rides/day</td><td>~230/s</td><td>5:1</td><td>~1.2K/s</td><td>~500 B</td></tr>
+      </tbody>
+    </table>
+    <p class="muted">Memorize 2–3 as anchors and interpolate for a new problem during the interview.</p>
+  </section>
+
+  <!-- M · MATH TIPS -->
+  <section>
+    <div class="sec-h"><span class="n">M</span><h2>Interview math tips</h2><span class="tag">how to sound structured</span></div>
+    <div class="grid g2">
+      <div class="card">
+        <ul class="tight">
+          <li><b>Round aggressively</b> — 86,400 → 100K. Speed &gt; precision.</li>
+          <li><b>Use powers of 10</b> — "about 30M seconds in a year," don't multiply 365×24×3600.</li>
+          <li><b>State assumptions first</b> — "100M users, 10% DAU, 5 actions each."</li>
+          <li><b>Formula first, then plug in</b> — you look structured.</li>
+        </ul>
+      </div>
+      <div class="card">
+        <ul class="tight">
+          <li><b>Convert to per-second early</b> — capacity planning works in QPS.</li>
+          <li><b>Multiply storage by 3</b> — replication factor; always mention it.</li>
+          <li><b>Peak = 3× average</b> — simple default for peak traffic.</li>
+          <li><b>Cap it at ~3 minutes</b> — get the order of magnitude and move on.</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <!-- GLOSSARY -->
+  <section>
+    <div class="sec-h"><span class="n">§</span><h2>Glossary — one-liners</h2><span class="tag">terms used above</span></div>
+    <div class="grid g2">
+      <div class="card">
+        <table>
+          <tbody>
+            <tr><td><b>QPS / RPS</b></td><td>queries (requests) per second — the unit all capacity planning uses</td></tr>
+            <tr><td><b>DAU / MAU</b></td><td>daily / monthly active users — the traffic driver you assume first</td></tr>
+            <tr><td><b>Throughput</b></td><td>how much work per unit time a component handles (req/s, MB/s)</td></tr>
+            <tr><td><b>Latency</b></td><td>time for one operation to complete (ns / µs / ms)</td></tr>
+            <tr><td><b>Bandwidth</b></td><td>data moved per second = QPS × payload size</td></tr>
+            <tr><td><b>Back-of-envelope</b></td><td>a fast, rounded estimate to get the order of magnitude</td></tr>
+            <tr><td><b>Order of magnitude</b></td><td>the power-of-10 bucket (1K vs 1M vs 1B) — what actually matters</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="card">
+        <table>
+          <tbody>
+            <tr><td><b>Replication factor</b></td><td>copies of each record for durability (usually ×3)</td></tr>
+            <tr><td><b>Sharding</b></td><td>splitting data across nodes when it exceeds one machine</td></tr>
+            <tr><td><b>Hot / cold data</b></td><td>frequently vs rarely accessed — the 80/20 cache rule</td></tr>
+            <tr><td><b>p50 / p99</b></td><td>median / 99th-percentile latency — tail latency is what users feel</td></tr>
+            <tr><td><b>Keyspace</b></td><td>total number of distinct keys/codes an encoding can produce</td></tr>
+            <tr><td><b>Nine (availability)</b></td><td>each extra 9 (99→99.9→99.99) means 10× less downtime</td></tr>
+            <tr><td><b>Peak factor</b></td><td>multiplier over average traffic for bursts (default ×3)</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+
+  <footer>
+    <p>Foundation F3 of 3 · System Design Basics — Estimation, Numbers &amp; Conversions. Grounded in <code>docs/ESTIMATION_CHEATSHEET.md</code>.</p>
+    <p class="run">Foundations: <a href="f1-cap-consistency.html">F1 · CAP &amp; Consistency</a> · <a href="f2-must-know-algorithms.html">F2 · Must-Know Algorithms</a> · F3 · Estimation &nbsp;|&nbsp; <a href="index.html">→ Use-case canvases (hub)</a></p>
+  </footer>
+
+</div>
+<script src="assets/canvas.js"></script>
+</body>
+</html>

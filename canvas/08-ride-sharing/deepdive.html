@@ -1,0 +1,352 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>08 · Ride Sharing — Deep-dive &amp; Trade-offs</title>
+<link rel="stylesheet" href="../assets/canvas.css">
+</head>
+<body>
+<div class="wrap">
+
+  <header class="hero">
+    <h1>Ride Sharing — Deep-dive &amp; Trade-offs</h1>
+    <div class="sub">Use case 08 · Canvas 3 of 3. The hard parts: how to <b>shard the spatial firehose</b>, the <b>geospatial caching</b> that keeps nearby-driver queries sub-ms, the <b>bottlenecks</b> that break a ride platform (and their fixes), why this is a <b>split CAP</b> system — <b>CP</b> for ride state, <b>AP</b> for location — and a phase-by-phase <b>interview walkthrough</b>. <b>Switch the sharding tabs</b> and <b>open the bottleneck cards</b> to explore.</div>
+    <div class="badges">
+      <span class="badge lvl">Use case 08 · Deep-dive</span>
+      <span class="badge">Canvas 3 of 3</span>
+      <span class="badge">interactive</span>
+      <span class="badge">Split CAP · CP ride state + AP location</span>
+    </div>
+    <div class="legend">
+      <span><i class="dot" style="background:var(--eden)"></i> switch a tab</span>
+      <span><i class="dot" style="background:var(--old)"></i> open a bottleneck</span>
+      <span><i class="dot" style="background:var(--survivor)"></i> chosen option</span>
+      <span><i class="dot" style="background:var(--warn)"></i> failure / risk</span>
+      <span><i class="dot" style="background:var(--gc)"></i> fix / mitigation</span>
+    </div>
+  </header>
+
+  <!-- A · SCALING STRATEGY -->
+  <section>
+    <div class="sec-h"><span class="n">A</span><h2>Scaling strategy</h2><span class="tag">what to shard &amp; how</span></div>
+    <div class="grid g3">
+      <div class="card"><div class="kicker">location tier</div><h3>Write firehose</h3><p class="muted">200K–500K drivers each streaming GPS every 3–5 s = <b>~50K–165K writes/s</b>. Stateless Location Service instances behind the LB fan GPS into Redis GEO; <code>GEOADD</code> overwrites the driver's member, so the set never grows past N drivers.</p></div>
+      <div class="card"><div class="kicker">matching tier</div><h3>Read + compute</h3><p class="muted">Only <b>~35 ride requests/s</b> at peak, but each is a spatial query plus ETA ranking. Separate from Location Service so the write-heavy firehose and the read-heavy matcher scale on independent profiles.</p></div>
+      <div class="card"><div class="kicker">ride-state tier</div><h3>CP core, kept small</h3><p class="muted">Ride Service owns the state machine and driver assignment in PostGIS with row locks. Low volume (a few writes per ride, not per second) so a single-leader RDBMS holds — replicas serve history/analytics off the hot path.</p></div>
+    </div>
+
+    <div data-tabscope style="margin-top:16px">
+      <div class="kicker">location sharding — pick a partition strategy for the GPS firehose</div>
+      <div class="tabs">
+        <button class="tab active" data-tab="geo">Geohash / cell owner</button>
+        <button class="tab" data-tab="hash">Hash on driver_id</button>
+        <button class="tab" data-tab="range">Range-based</button>
+      </div>
+
+      <div class="tabpanel active" data-panel="geo">
+        <div class="grid g2">
+          <div class="card">
+            <h3>Cell-based ownership <span class="run">← chosen for dispatch</span></h3>
+            <p class="muted">Partition the map into geohash / H3 cells and assign each cell to exactly <b>one</b> owner node (consistent hashing, Uber's Ringpop). All requests in a cell serialize on that owner — no split-brain, no cross-node lock for assignment.</p>
+            <pre class="code"><span class="cm">// each cell has exactly one owner node</span>
+owner = ring.node( <span class="ty">geohash</span>(lat, lng, <span class="st">5</span>) )   <span class="cm">// ~5 km cell</span></pre>
+          </div>
+          <div class="card">
+            <div class="kicker">verdict</div>
+            <ul class="tight">
+              <li><b>Locality:</b> nearby-driver queries and assignments stay on one node → cheap serialization.</li>
+              <li><b>Handoff:</b> when a driver crosses a cell boundary, ownership is handed off (release → acquire) with no gap/overlap.</li>
+              <li><span style="color:var(--warn)">Hot cells:</span> airports/stadiums concentrate load → over-provision + cache warming.</li>
+            </ul>
+          </div>
+        </div>
+      </div>
+
+      <div class="tabpanel" data-panel="hash">
+        <div class="grid g2">
+          <div class="card">
+            <h3>Hash on driver_id</h3>
+            <p class="muted">Route each GPS write by <code>hash(driver_id) % N</code>. Spreads the 50K writes/s evenly and matches Kafka's <code>driver_id</code> partitioning for the location-update topic.</p>
+            <pre class="code">shard = <span class="ty">hash</span>(driver_id) % N   <span class="cm">// even write spread</span></pre>
+          </div>
+          <div class="card">
+            <div class="kicker">verdict</div>
+            <ul class="tight">
+              <li><b>Even ingest:</b> perfect for the write firehose and per-driver event ordering.</li>
+              <li><span style="color:var(--warn)">Scatter-gather reads:</span> a "nearby drivers" query must fan out to <b>every</b> shard — a spatial query has no single driver_id.</li>
+              <li>Great for ingestion, wrong for proximity search.</li>
+            </ul>
+          </div>
+        </div>
+      </div>
+
+      <div class="tabpanel" data-panel="range">
+        <div class="grid g2">
+          <div class="card">
+            <h3>Range-based (by lat or region)</h3>
+            <p class="muted">Assign contiguous coordinate ranges to shards (e.g. all of downtown → shard 1). Simple to reason about and keeps a whole city on one node.</p>
+            <pre class="code">lat 37.70–37.80 → shard 1
+lat 37.80–37.90 → shard 2   <span class="cm">// dense cities pile up</span></pre>
+          </div>
+          <div class="card">
+            <div class="kicker">verdict — careful</div>
+            <ul class="tight">
+              <li><span style="color:var(--warn)">Hot partitions:</span> downtown/airport ranges get orders of magnitude more traffic than suburbs.</li>
+              <li>Boundary queries still need neighbor shards (the same edge effect as geohash cells).</li>
+              <li>Only worth it when a region cleanly maps to one datacenter for latency.</li>
+            </ul>
+          </div>
+        </div>
+      </div>
+
+      <div class="callout tip"><b>Replicas off the hot path:</b> point PostGIS read replicas at <b>ride history</b> and <b>surge computation</b> so heavy aggregations never compete with the row-locked assignment path. The Redis GEO cluster shards driver locations across nodes; each city fits in ~175 MB, so a 3-node cluster is plenty.</div>
+  </section>
+
+  <!-- B · CACHING DEEP-DIVE -->
+  <section>
+    <div class="sec-h"><span class="n">B</span><h2>Caching deep-dive</h2><span class="tag">sub-ms nearby queries live here</span></div>
+    <div class="grid g2">
+      <div class="card">
+        <div class="kicker">L1 → L2 → L3 hierarchy</div>
+        <pre class="code">L1  In-app buffer  <span class="cm">// 5 GPS pts, batch upload 3–5 s</span>
+L2  Redis GEO      <span class="cm">// GEOADD/GEOSEARCH, TTL 10 s, 100K ops/s</span>
+L3  PostGIS        <span class="cm">// source of truth, polygon / geofence</span></pre>
+        <p class="muted">Step 3 reads <b>location</b> from Redis GEO (stale OK). Step 4 reads <b>availability</b> from the DB (must be fresh). That split — cache location, never cache availability — is the whole trick.</p>
+      </div>
+      <div class="card">
+        <div class="kicker">geohash cache keys — the hit-rate trick</div>
+        <pre class="code"><span class="cm">// BAD: every coordinate is a unique key → ~0% hits</span>
+nearby:37.7749:-122.4194:5km
+<span class="cm">// GOOD: geohash prefix → all riders in a ~5km cell share it</span>
+nearby:9q8yy:5   <span class="cm">// 70–80% hit rate in dense areas</span></pre>
+        <p class="muted">Precision-5 geohash ≈ 5 km cell = perfect for a 5 km radius query. On miss, query the target cell <b>plus its 8 neighbors</b> to catch drivers just across a boundary, then filter by exact Haversine distance.</p>
+      </div>
+    </div>
+
+    <div class="grid g3" style="margin-top:14px">
+      <div class="card">
+        <div class="kicker">TTL by data class</div>
+        <h3>Extreme diversity</h3>
+        <p class="muted">Every cache line has a different freshness budget. <b>No cache at all</b> for ride state or driver availability — stale there means double-booking.</p>
+        <pre class="code">driver GPS    → <span class="st">10 s</span>  <span class="cm">// 2–3× update interval</span>
+nearby query  → <span class="st">5 s</span>   (+0–2 s jitter)
+surge zone    → <span class="st">30 s</span>  <span class="cm">// recomputed each cycle</span>
+ride state    → <span class="st">NONE</span>  <span class="cm">// DB is source of truth</span></pre>
+      </div>
+      <div class="card">
+        <div class="kicker">available vs busy sets</div>
+        <h3>No stale availability</h3>
+        <p class="muted">Never cache a boolean flag. Keep two Redis GEO sets and move a driver atomically on assignment, so a BUSY driver never shows up in a search.</p>
+        <pre class="code"><span class="kw">MULTI</span>
+  ZREM  drivers:available <span class="st">"D1"</span>
+  GEOADD drivers:busy lng lat <span class="st">"D1"</span>
+<span class="kw">EXEC</span>   <span class="cm">// atomic move, no window</span></pre>
+      </div>
+      <div class="card">
+        <div class="kicker">hot-spot thundering herd</div>
+        <h3>Airport / stadium</h3>
+        <p class="muted">500 requests/min on one cell. Layer four defenses so the DB sees ≤1 query per miss.</p>
+        <pre class="code"><span class="cm">// 1</span> warm known hot spots every 3 s
+<span class="cm">// 2</span> TTL jitter 5–7 s (no sync expiry)
+<span class="cm">// 3</span> XFetch probabilistic early refresh
+<span class="cm">// 4</span> singleflight coalesces misses</pre>
+      </div>
+    </div>
+    <div class="callout tip"><b>Surge cache miss:</b> return <b>last known</b> multiplier and trigger async recompute (never block a ride request 50–100 ms to compute surge), falling back to <code>1.0×</code> only when nothing is cached. <span class="run">→ full layering on canvas 1 · HLD</span></div>
+  </section>
+
+  <!-- C · BOTTLENECKS & SOLUTIONS -->
+  <section>
+    <div class="sec-h"><span class="n">C</span><h2>Bottlenecks &amp; solutions</h2><span class="tag">click a card to open</span></div>
+    <div class="grid" style="gap:10px">
+
+      <div class="card collapsible open">
+        <div class="c-head"><h3>GPS write firehose overwhelms storage</h3></div>
+        <div class="c-body">
+          <p><b style="color:var(--warn)">Impact:</b> 50K–165K location updates/s would flatten any single-leader SQL primary; synchronous writes queue up and drivers show 30 s behind on the map.</p>
+          <p><b style="color:var(--gc)">Fix:</b> ingest into Redis GEO (100K+ ops/s per node, overwrite-in-place so no growth), shard by geohash cell, batch 3–5 GPS points per WebSocket/gRPC message, and mirror to Kafka (partitioned by <code>driver_id</code>) for analytics/history off the hot path.</p>
+        </div>
+      </div>
+
+      <div class="card collapsible">
+        <div class="c-head"><h3>Double-booking a driver</h3></div>
+        <div class="c-body">
+          <p><b style="color:var(--warn)">Impact:</b> two riders request at once, both read driver D-017 as AVAILABLE, both get assigned — two riders wait for one car. A retry storm makes it cascade.</p>
+          <p><b style="color:var(--gc)">Fix:</b> ride state is CP. Use optimistic locking — a single atomic <code>UPDATE ... SET status='MATCHED' WHERE id=? AND status='AVAILABLE' AND version=?</code>; <code>rows_affected=0</code> means someone won first, so cascade to the next driver. Or <code>SELECT ... FOR UPDATE</code> / a Redis Lua CAS. Cell-based ownership serializes assignments locally to avoid cross-node coordination.</p>
+        </div>
+      </div>
+
+      <div class="card collapsible">
+        <div class="c-head"><h3>Stale availability from over-caching</h3></div>
+        <div class="c-body">
+          <p><b style="color:var(--warn)">Impact:</b> caching an available/busy flag with even a 3 s TTL means a just-assigned driver still reads AVAILABLE — the classic route to a double booking that no lock catches.</p>
+          <p><b style="color:var(--gc)">Fix:</b> never cache availability. Maintain <code>drivers:available</code> and <code>drivers:busy</code> GEO sets, move members atomically with <code>MULTI/EXEC</code> on each state change, and query only the available set. Availability transitions are event-driven off the ride state machine.</p>
+        </div>
+      </div>
+
+      <div class="card collapsible">
+        <div class="c-head"><h3>Hot spot / thundering herd</h3></div>
+        <div class="c-body">
+          <p><b style="color:var(--warn)">Impact:</b> an airport arrivals surge or a stadium letting out sends hundreds of identical nearby-driver queries at one geohash cell; when its cache line expires they stampede PostGIS simultaneously.</p>
+          <p><b style="color:var(--gc)">Fix:</b> cache warming for known hot spots (background job every 3 s), staggered TTL (5–7 s jitter), probabilistic early expiration (XFetch), and request coalescing (singleflight) so only one request per key hits the DB. For scheduled events, pre-warm surge and expand the search radius ahead of time.</p>
+        </div>
+      </div>
+
+      <div class="card collapsible">
+        <div class="c-head"><h3>Ghost drivers on the map</h3></div>
+        <div class="c-body">
+          <p><b style="color:var(--warn)">Impact:</b> a driver whose app crashes or loses signal keeps appearing at their last position; riders get matched to a car that isn't moving.</p>
+          <p><b style="color:var(--gc)">Fix:</b> heartbeat TTL — <code>SET driver:{id}:heartbeat 1 EX 10</code> refreshed on every GPS update; the GEO location auto-expires ~10 s after the last update. Mark STALE at 30 s, OFFLINE at 2 min; if offline mid-ride &gt;10 min, auto-cancel with no charge and offer re-match.</p>
+        </div>
+      </div>
+
+      <div class="card collapsible">
+        <div class="c-head"><h3>Nearest-by-distance picks the wrong driver</h3></div>
+        <div class="c-body">
+          <p><b style="color:var(--warn)">Impact:</b> the closest driver by straight-line distance can be 8 min away through traffic while a driver 3 km down the highway is 3 min away. Riders wait longer than the "nearest" promised.</p>
+          <p><b style="color:var(--gc)">Fix:</b> rank the K nearest candidates by <b>ETA</b>, not raw distance — Haversine straight-line as a first pass, then a routing API for road-network ETA in production. Send to the best ETA with a 15 s timeout and cascade to the next on decline/timeout.</p>
+        </div>
+      </div>
+
+      <div class="card collapsible">
+        <div class="c-head"><h3>Geohash boundary misses</h3></div>
+        <div class="c-body">
+          <p><b style="color:var(--warn)">Impact:</b> a driver 1 m across a cell boundary has a different geohash prefix, so a single-cell query silently misses them — the nearest driver is invisible.</p>
+          <p><b style="color:var(--gc)">Fix:</b> always query the target cell plus its <b>8 neighbors</b> (9 cells total), then filter by exact Haversine distance. H3 hexagons reduce this to 6 equidistant neighbors with no corner artifacts — what Uber uses for zones.</p>
+        </div>
+      </div>
+
+      <div class="card collapsible">
+        <div class="c-head"><h3>Cross-region partition &amp; split-brain</h3></div>
+        <div class="c-body">
+          <p><b style="color:var(--warn)">Impact:</b> a partition between two regional Ride Services lets both independently assign a driver who crosses the boundary — the CP guarantee breaks if driver state is regional.</p>
+          <p><b style="color:var(--gc)">Fix:</b> keep driver state in a single-leader DB (not per-region), route cross-region assignment through the leader, or shard drivers to exactly one region at a time with a handoff protocol at the boundary. During a partition, the CP side refuses new assignments ("high demand, try again") while in-progress rides continue.</p>
+        </div>
+      </div>
+
+    </div>
+  </section>
+
+  <!-- D · CAP & CONSISTENCY -->
+  <section>
+    <div class="sec-h"><span class="n">D</span><h2>CAP &amp; consistency — a split system</h2><span class="tag">CP ride state · AP location</span></div>
+    <div class="grid g2">
+      <div class="card">
+        <div class="kicker">the choice</div>
+        <p class="muted"><b>P is mandatory</b>, so each component picks A vs C on its own terms. Ride-sharing is neither pure CP nor pure AP — it's <b>split</b>. Assignment and payment are CP (double-booking / double-charging are unacceptable); location and surge are AP (a 3–5 s-old GPS fix is inherently approximate anyway, and unavailable location makes matching impossible).</p>
+        <ul class="tight">
+          <li><b>CP (ride state):</b> during a partition, refuse to assign rather than risk a double-book.</li>
+          <li><b>AP (location):</b> serve slightly stale GPS and stay available — staleness (5 s ≈ 67 m at 30 mph) is fine.</li>
+          <li>In-progress rides continue through a partition; only <b>new</b> assignments pause.</li>
+        </ul>
+      </div>
+      <div class="card">
+        <div class="kicker">PACELC — normal operation too</div>
+        <pre class="code"><span class="cm">// if Partition: A or C  ·  Else: L or C</span>
+ride assignment → <span class="st">PC/EC</span>   <span class="cm">// row lock, ~15 ms, accept latency</span>
+location track  → <span class="st">PA/EL</span>   <span class="cm">// async to Redis GEO, ~1 ms write</span>
+surge pricing   → <span class="st">PA/EL</span>   <span class="cm">// precomputed, cached, bounded 60 s</span>
+payment         → <span class="st">PC/EC</span>   <span class="cm">// ACID, exactly-once</span></pre>
+        <p class="muted">The principle: <b>CP where correctness beats speed</b> (assignment, payment), <b>AP where freshness is already bounded by the real world</b> (GPS interval, 30 s surge window). Location can't be CP anyway — 165K consensus rounds/s would swamp Raft.</p>
+      </div>
+    </div>
+    <div class="callout tip"><b>How Uber does it:</b> Ringpop consistent hashing makes each geofence cell owned by one node (CP dispatch, no distributed lock); Cassandra for location (AP, millions of writes/s); Redis for surge (AP, bounded staleness); MySQL+Vitess for payment (CP, ACID).</div>
+    <table style="margin-top:12px">
+      <thead><tr><th>Operation</th><th>CAP · PACELC</th><th>Reasoning</th></tr></thead>
+      <tbody>
+        <tr><td>Ride assignment</td><td>CP · PC/EC</td><td>Double-booking is catastrophic → row lock / optimistic CAS</td></tr>
+        <tr><td>Driver availability</td><td>CP · PC/EC</td><td>Stale = phantom driver → read from DB, never cache the flag</td></tr>
+        <tr><td>Location tracking</td><td>AP · PA/EL</td><td>3–5 s stale GPS is inherent; availability &gt; freshness</td></tr>
+        <tr><td>Surge pricing</td><td>AP · PA/EL</td><td>Bounded 60 s staleness fine; no surge = revenue loss</td></tr>
+        <tr><td>Payment</td><td>CP · PC/EC</td><td>Double-charge / miss = financial loss → ACID</td></tr>
+        <tr><td>Notifications</td><td>AP · PA/EL</td><td>At-least-once; a duplicate push beats a missed one</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <!-- E · TRADE-OFFS SUMMARY -->
+  <section>
+    <div class="sec-h"><span class="n">E</span><h2>Trade-offs summary</h2><span class="tag">decision · chosen · alternative · why</span></div>
+    <table>
+      <thead><tr><th>Decision</th><th>Chosen</th><th>Alternative</th><th>Why this choice</th></tr></thead>
+      <tbody>
+        <tr><td>Consistency model</td><td><b style="color:var(--survivor)">Split — CP state + AP location</b></td><td>all-CP / all-AP</td><td>All-CP kills GPS throughput; all-AP double-books drivers</td></tr>
+        <tr><td>Spatial index</td><td><b style="color:var(--survivor)">QuadTree (interview) / Redis GEO (prod)</b></td><td>R-Tree · KD-Tree · brute force</td><td>O(log N + K) range query, dynamic updates, sub-ms</td></tr>
+        <tr><td>Zone system</td><td><b style="color:var(--survivor)">Geohash · H3 hexagons</b></td><td>raw lat/lng cells</td><td>Prefix locality; H3 = uniform area, 6 equidistant neighbors</td></tr>
+        <tr><td>Distance formula</td><td><b style="color:var(--survivor)">Haversine</b></td><td>Euclidean · Vincenty</td><td>Accounts for curvature; Euclidean errs 40%+ at high latitude</td></tr>
+        <tr><td>Location store</td><td><b style="color:var(--survivor)">Redis GEO + PostGIS</b></td><td>PostGIS only</td><td>Redis = hot sub-ms reads; PostGIS = durable + polygon geofence</td></tr>
+        <tr><td>Ride state store</td><td><b style="color:var(--survivor)">PostgreSQL (row lock)</b></td><td>NoSQL / cache</td><td>ACID transitions, no double-booking, low write volume</td></tr>
+        <tr><td>Matching rank</td><td><b style="color:var(--survivor)">ETA-based</b></td><td>nearest by distance</td><td>Traffic-aware; nearest ≠ fastest in dense cities</td></tr>
+        <tr><td>Location transport</td><td><b style="color:var(--survivor)">WebSocket / gRPC stream</b></td><td>HTTP polling</td><td>Persistent, 2–6 B/frame, server push; polling = 250 MB/s overhead</td></tr>
+        <tr><td>Availability cache</td><td><b style="color:var(--survivor)">available/busy GEO sets</b></td><td>cached boolean flag</td><td>Atomic move, no stale window → no double-book</td></tr>
+        <tr><td>Ride events</td><td><b style="color:var(--survivor)">Kafka (key = ride_id)</b></td><td>direct service calls</td><td>Ordered per-ride, N independent consumers, replayable</td></tr>
+        <tr><td>Hot-spot protection</td><td><b style="color:var(--survivor)">warm + jitter + XFetch + singleflight</b></td><td>none</td><td>Airport/stadium herds would stampede the DB</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <!-- F · INTERVIEW WALKTHROUGH -->
+  <section>
+    <div class="sec-h"><span class="n">F</span><h2>Interview walkthrough — timing strip</h2><span class="tag">~35 min answer</span></div>
+    <div class="flow">
+      <div class="step eden"><div class="box">Clarify</div><small>P1 · 2–3 min<br>rides/day · tracking · surge · pool?</small></div>
+      <div class="step surv"><div class="box">Architecture</div><small>P2 · 5–7 min<br>5 services · CP vs AP split</small></div>
+      <div class="step old"><div class="box">Spatial index</div><small>P3 · 8–10 min<br>QuadTree · GeoHash · why not SQL</small></div>
+      <div class="step surv"><div class="box">Matching &amp; surge</div><small>P4 · 5–7 min<br>ETA rank · timeout · surge formula</small></div>
+      <div class="step old"><div class="box">Scaling &amp; edges</div><small>P5 · 5–8 min<br>50K GPS/s · double-book · offline</small></div>
+      <div class="step dead"><div class="box">Trade-offs</div><small>P6 · 3–5 min<br>QuadTree vs GeoHash vs H3 · CAP</small></div>
+    </div>
+    <div class="grid g2" style="margin-top:14px">
+      <div class="card">
+        <div class="kicker">phase-by-phase</div>
+        <ul class="tight">
+          <li><b>P1 Clarify (2–3):</b> rides/day (1M? 10M?), real-time tracking, surge, pool rides, matching = nearest vs ETA, cancellations. Scope = request · match · track · surge · lifecycle · fare.</li>
+          <li><b>P2 Architecture (5–7):</b> five services — Location (ingest GPS), Matching (K-nearest + ETA), Pricing (surge), Ride (state machine, ACID), Notification. Call out CP ride state vs AP location.</li>
+          <li><b>P3 Spatial (8–10 · CORE):</b> QuadTree recursive quadrants, O(log N + K) range query, GeoHash base32 prefix + 9-cell boundary fix; why not SQL (full scan at 35 req/s + 50K writes/s).</li>
+        </ul>
+      </div>
+      <div class="card">
+        <div class="kicker">…and finish strong</div>
+        <ul class="tight">
+          <li><b>P4 Matching &amp; surge (5–7):</b> GEOSEARCH K nearest → filter available → rank by ETA → send with 15 s timeout → cascade. Surge = demand/supply ratio per zone, recomputed every 30 s, capped 3×.</li>
+          <li><b>P5 Scaling (5–8):</b> 200K drivers × 1/4 s = 50K GPS/s → Redis GEO + Kafka; double-booking → optimistic locking CAS; driver offline → heartbeat TTL, STALE 30 s / OFFLINE 2 min.</li>
+          <li><b>P6 Trade-offs (3–5):</b> QuadTree vs GeoHash vs H3; ETA vs nearest; split CP/AP with clear reasoning. Elevator pitch in &lt;30 s.</li>
+        </ul>
+      </div>
+    </div>
+    <div class="callout tip"><b>Green flags:</b> draw QuadTree subdivision · GeoHash boundary edge case (query 9 cells) · Haversine not Euclidean · separate CP state from AP location · proactively raise double-booking · ETA over nearest · reference H3 · show the 50K writes/s math. <b>Red flags:</b> "just query the DB for nearby drivers" · everything CP (kills perf) or everything AP (double-books) · ignoring GPS scale · forgetting timeout/cascade · allowing REQUESTED → COMPLETED · Euclidean on lat/lng.</div>
+  </section>
+
+  <!-- GLOSSARY -->
+  <section>
+    <div class="sec-h"><span class="n">§</span><h2>Glossary — one-liners</h2><span class="tag">terms used above</span></div>
+    <div class="grid g2">
+      <div class="card"><table><tbody>
+        <tr><td><b>Split CAP</b></td><td>different components choose different CAP sides — CP ride state, AP location</td></tr>
+        <tr><td><b>PACELC</b></td><td>on Partition pick A/C; Else pick Latency/Consistency — here PC/EC for state, PA/EL for location</td></tr>
+        <tr><td><b>QuadTree</b></td><td>recursive 4-quadrant spatial tree; O(log N + K) range query for nearby drivers</td></tr>
+        <tr><td><b>GeoHash</b></td><td>base32 string encoding lat/lng; shared prefix = same region, used as cache key</td></tr>
+        <tr><td><b>H3</b></td><td>Uber's hexagonal grid — uniform area, 6 equidistant neighbors, no corner artifacts</td></tr>
+        <tr><td><b>Haversine</b></td><td>great-circle distance on a sphere; correct for lat/lng unlike Euclidean</td></tr>
+      </tbody></table></div>
+      <div class="card"><table><tbody>
+        <tr><td><b>Redis GEO</b></td><td>sorted set with geohash scores; GEOADD/GEOSEARCH at 100K+ ops/s, sub-ms</td></tr>
+        <tr><td><b>Cell ownership</b></td><td>consistent-hash each map cell to one node (Ringpop) so assignments serialize locally</td></tr>
+        <tr><td><b>Optimistic locking</b></td><td>atomic UPDATE with WHERE status/version check; rows_affected=0 → cascade</td></tr>
+        <tr><td><b>Singleflight</b></td><td>coalesce concurrent misses so only one query per key hits the DB</td></tr>
+        <tr><td><b>XFetch</b></td><td>probabilistic early cache refresh as TTL nears expiry — beats stampedes</td></tr>
+        <tr><td><b>Heartbeat TTL</b></td><td>per-driver expiring key refreshed by GPS; expiry removes ghost drivers</td></tr>
+      </tbody></table></div>
+    </div>
+  </section>
+
+  <footer>
+    <p>Use case 08 · Ride Sharing — Canvas 3 of 3 (Deep-dive &amp; Trade-offs). Grounded in <code>08-ride-sharing/docs/tradeoffs · caching · tech</code> and <code>revision/INTERVIEW_WALKTHROUGH.md</code>.</p>
+    <p class="run">This use case: <a href="hld.html">08a · HLD</a> · <a href="lld.html">08b · LLD</a> · Deep-dive &nbsp;|&nbsp; Next → <a href="../09-search-autocomplete/hld.html">09 · Search Autocomplete</a></p>
+  </footer>
+
+</div>
+<script src="../assets/canvas.js"></script>
+</body>
+</html>

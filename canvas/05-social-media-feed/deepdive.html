@@ -1,0 +1,380 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>05 · Social Media Feed — Deep-dive &amp; Trade-offs</title>
+<link rel="stylesheet" href="../assets/canvas.css">
+</head>
+<body>
+<div class="wrap">
+
+  <header class="hero">
+    <h1>Social Media Feed — Deep-dive &amp; Trade-offs</h1>
+    <div class="sub">Use case 05 · Canvas 3 of 3. The hard parts: how to <b>shard</b> each tier and add <b>replicas</b>, the <b>caching</b> layers that make a feed load in &lt;200 ms (and the <b>thundering herd</b> on celebrity tweets), the <b>bottlenecks</b> that break the design (and their fixes), why this is an <b>AP</b> system with a few <b>strong-consistency</b> islands, and a phase-by-phase <b>interview walkthrough</b>. <b>Switch the sharding tabs</b> and <b>open the bottleneck cards</b> to explore.</div>
+    <div class="badges">
+      <span class="badge lvl">Use case 05 · Deep-dive</span>
+      <span class="badge">Canvas 3 of 3</span>
+      <span class="badge">interactive</span>
+      <span class="badge">AP · eventual · fan-out-heavy</span>
+    </div>
+    <div class="legend">
+      <span><i class="dot" style="background:var(--eden)"></i> switch a tab</span>
+      <span><i class="dot" style="background:var(--old)"></i> open a bottleneck</span>
+      <span><i class="dot" style="background:var(--survivor)"></i> chosen option</span>
+      <span><i class="dot" style="background:var(--warn)"></i> failure / risk</span>
+      <span><i class="dot" style="background:var(--gc)"></i> fix / mitigation</span>
+    </div>
+  </header>
+
+  <!-- A · SCALING STRATEGY -->
+  <section>
+    <div class="sec-h"><span class="n">A</span><h2>Scaling strategy</h2><span class="tag">what to shard &amp; how</span></div>
+    <div class="grid g3">
+      <div class="card"><div class="kicker">app / feed tier</div><h3>Stateless → horizontal</h3><p class="muted">Feed &amp; Tweet services hold no session state, so any instance serves any request. Auto-scale behind the LB on CPU / p99. At ~35K feed reads/s (3B/day) that is dozens of instances round-robined; the merge+rank work is CPU-bound and parallelisable.</p></div>
+      <div class="card"><div class="kicker">fan-out workers</div><h3>Scale on Kafka lag</h3><p class="muted">The fan-out consumer group (~32 instances over 128 partitions) auto-scales on <b>consumer lag</b> — the critical metric. Sustained load is ~1.16M timeline writes/s (100B/day), so workers scale out when a burst of tweets pushes lag past 60 s.</p></div>
+      <div class="card"><div class="kicker">read replicas</div><h3>Redis replicas absorb reads</h3><p class="muted">The celebrity-tweet key is read by millions at once — a master + <b>read replicas</b> spreads those reads so the master only takes writes. Cassandra runs <b>RF=3</b> so any of three replicas serves a tweet read; PostgreSQL user store gets read replicas for profile lookups.</p></div>
+    </div>
+
+    <div data-tabscope style="margin-top:16px">
+      <div class="kicker">sharding — every tier partitions differently, pick a tier</div>
+      <div class="tabs">
+        <button class="tab active" data-tab="timeline">Redis timeline · by userId</button>
+        <button class="tab" data-tab="cass">Cassandra tweets · by userId</button>
+        <button class="tab" data-tab="kafka">Kafka fan-out · by poster</button>
+      </div>
+
+      <div class="tabpanel active" data-panel="timeline">
+        <div class="grid g2">
+          <div class="card">
+            <h3>Timeline cache — shard on <code>userId</code></h3>
+            <p class="muted">Each home timeline is a Redis Sorted Set <code>timeline:{userId}</code> capped at 200 items. Consistent-hash the <code>userId</code> across the ~40–80 shard cluster so any Feed-service instance and any fan-out worker land on the same shard for a given user.</p>
+            <pre class="code">shard = <span class="ty">consistentHash</span>(userId)   <span class="cm">// ~1 TB / 25 GB ≈ 40 shards</span>
+<span class="kw">ZADD</span> timeline:{userId} {ts} {tweetId}</pre>
+          </div>
+          <div class="card">
+            <div class="kicker">verdict <span class="run">← chosen</span></div>
+            <ul class="tight">
+              <li><b>Even spread:</b> user IDs are effectively random keys → no hot shard from the timeline itself.</li>
+              <li>200-item cap keeps every shard's per-user footprint at ~10 KB — memory is predictable.</li>
+              <li>Elastic: consistent hashing means adding a shard remaps only ~1/N keys, not the whole cluster.</li>
+            </ul>
+          </div>
+        </div>
+      </div>
+
+      <div class="tabpanel" data-panel="cass">
+        <div class="grid g2">
+          <div class="card">
+            <h3>Tweet store — partition on <code>user_id</code></h3>
+            <p class="muted">Cassandra table <code>tweets_by_user</code> partitions by <code>user_id</code>, clustered by <code>created_at DESC</code>. One partition read returns all of a user's recent tweets — exactly what fan-out-on-read (celebrity pull) needs. Masterless, RF=3, linear scale-out.</p>
+            <pre class="code"><span class="kw">PRIMARY KEY</span> ((user_id), created_at, tweet_id)
+  <span class="kw">WITH CLUSTERING ORDER BY</span> (created_at <span class="kw">DESC</span>)</pre>
+          </div>
+          <div class="card">
+            <div class="kicker">verdict</div>
+            <ul class="tight">
+              <li><b>Time-series friendly:</b> wide rows, newest-first, append-only — natural for tweets.</li>
+              <li><span style="color:var(--warn)">Celebrity partition is huge:</span> a 90M-follower account's row is enormous → we read only the recent slice (<code>LIMIT</code>) and TTL old tweets at 90 days.</li>
+              <li>Consistent hashing across nodes; no leader, no failover election.</li>
+            </ul>
+          </div>
+        </div>
+      </div>
+
+      <div class="tabpanel" data-panel="kafka">
+        <div class="grid g2">
+          <div class="card">
+            <h3>Fan-out topic — partition on <code>poster userId</code></h3>
+            <p class="muted"><code>tweet.published</code> has 128 partitions keyed by the <b>poster's</b> userId, so all of one user's tweets stay ordered and no two workers fan out the same tweet at once. A worker reads one message and writes to many follower timelines.</p>
+            <pre class="code"><span class="cm">// partition = hash(posterUserId) % 128</span>
+<span class="cm">// NOT follower id — one tweet → millions of followers</span></pre>
+          </div>
+          <div class="card">
+            <div class="kicker">verdict</div>
+            <ul class="tight">
+              <li><b>Ordering per poster</b> preserved; consumer groups let trending, search &amp; notifications read the same stream independently.</li>
+              <li>Replay from offset recovers a stalled pipeline — no lost tweets.</li>
+              <li>Partitioning by follower would be impossible: a single tweet spans millions of follower keys.</li>
+            </ul>
+          </div>
+        </div>
+      </div>
+
+      <div class="callout tip"><b>Celebrity split saves the write budget:</b> normal-user tweets fan out on write; celebrity (≥10K followers) tweets skip fan-out and are pulled at read time — this is what keeps the ~1.16M writes/s from becoming 50M writes on a single celebrity tweet. <span class="run">→ full fan-out design on canvas 1 · HLD</span></div>
+    </div>
+  </section>
+
+  <!-- B · CACHING DEEP-DIVE -->
+  <section>
+    <div class="sec-h"><span class="n">B</span><h2>Caching deep-dive</h2><span class="tag">&lt;200 ms feed lives here</span></div>
+    <div class="grid g2">
+      <div class="card">
+        <div class="kicker">read path — feed generation</div>
+        <pre class="code"><span class="kw">GET</span> /feed?userId=user-42
+  1. <span class="kw">ZREVRANGEBYSCORE</span> timeline:{user}   <span class="cm">// pushed tweets, ~2 ms</span>
+  2. <span class="kw">SMEMBERS</span> celebrity-followees:{user} <span class="cm">// who to pull</span>
+  3. per celeb: ZREVRANGEBYSCORE celebrity-tweets:{id}
+  4. hydrate: <span class="kw">GET</span> tweet:{id}  (90% Redis hit)
+  5. merge + dedup + rank → return top N</pre>
+        <p class="muted">Cache <b>hit</b> path is all Redis: ~12 ms p99. The timeline cache is THE core cache — one Sorted Set per user, populated by fan-out-on-write for normal posters; celebrity tweets are merged in from a shared per-celebrity key.</p>
+      </div>
+      <div class="card">
+        <div class="kicker">write path — populate on publish</div>
+        <pre class="code"><span class="kw">POST</span> /tweets
+  normal poster  → Kafka → fan-out worker
+                   <span class="kw">ZADD</span> timeline:{follower} …  <span class="cm">// write-through</span>
+  celebrity      → <span class="kw">ZADD</span> celebrity-tweets:{id}
+                   <span class="kw">SET</span> tweet:{id} (content)   <span class="cm">// pre-warm, no fan-out</span>
+  own timeline   → <span class="kw">ZADD</span> timeline:{author}  <span class="cm">// sync: read-your-writes</span></pre>
+        <p class="muted">Author's own timeline is written <b>synchronously</b> so they see their tweet instantly; follower fan-out is async. Celebrity keys are pre-warmed <b>before</b> the Kafka event fires, so followers never cold-miss a viral tweet.</p>
+      </div>
+    </div>
+
+    <div class="grid g3" style="margin-top:14px">
+      <div class="card">
+        <div class="kicker">thundering herd — the big one</div>
+        <h3>Shared celebrity key</h3>
+        <p class="muted">@taylorswift tweets → 5M followers open feeds in 60 s. Without a cache that's 5M Cassandra reads of one tweet. Instead, <b>one</b> Redis Sorted Set per celebrity serves every follower — 5M cheap Redis reads, ~0 Cassandra reads.</p>
+        <pre class="code"><span class="kw">ZREVRANGEBYSCORE</span>
+  celebrity-tweets:{celebId}
+  +inf -inf <span class="kw">LIMIT</span> <span class="st">0</span> <span class="st">10</span>   <span class="cm">// max 20 items kept</span></pre>
+      </div>
+      <div class="card">
+        <div class="kicker">cache stampede</div>
+        <h3>Singleflight mutex</h3>
+        <p class="muted">If a celebrity key is missing, 5M simultaneous misses would stampede Cassandra. First reader grabs a lock, loads once, backfills; the rest wait 50 ms and re-read. Read replicas spread the 5M reads across the cluster.</p>
+        <pre class="code"><span class="ty">SETNX</span> lock:celebrity-tweets:{id} 1 EX 5
+  ok  → load Cassandra, ZADD, del lock
+  !ok → sleep 50ms, re-read cache</pre>
+      </div>
+      <div class="card">
+        <div class="kicker">cold start / warming</div>
+        <h3>Rebuild from Cassandra</h3>
+        <p class="muted">A dormant user's <code>timeline:{userId}</code> has expired. Cold start pulls recent tweets for every followee, merges, ranks, writes back the top 200. On deploy / Redis failover we pre-warm DAU timelines so this stays off the hot path.</p>
+        <pre class="code"><span class="kw">SMEMBERS</span> following:{userId}
+per followee: SELECT … tweets_by_user
+merge → rank → <span class="kw">ZADD</span> top 200
+  <span class="cm">// 500 ms–2 s cold · &lt;50 ms warm</span></pre>
+      </div>
+    </div>
+
+    <div class="grid g2" style="margin-top:14px">
+      <div class="card">
+        <div class="kicker">two-tier profile cache</div>
+        <p class="muted">User profiles change rarely, so a per-instance <b>Caffeine L1</b> (1-min TTL, 10K entries) fronts <b>Redis L2</b> (5-min TTL) fronts PostgreSQL. L1 is sub-ms with no network hop; staleness of a minute is invisible for a name/bio.</p>
+        <pre class="code">L1 Caffeine (1 min) → L2 Redis (5 min) → Postgres
+  hit L1 → &lt;1 ms · hit L2 → ~1 ms · miss → ~5 ms</pre>
+      </div>
+      <div class="card">
+        <div class="kicker">trending — precompute, don't compute per request</div>
+        <p class="muted">A background job runs <code>ZUNIONSTORE</code> across time windows (recent hours weighted more) every 1–5 min and caches the <b>top-10 as one key</b>. Requests do a single <code>GET trending:top10</code> (~0.1 ms) instead of a 5 ms union each — at 100K req/s that's the difference between possible and not.</p>
+        <pre class="code"><span class="kw">GET</span> trending:top10   <span class="cm">// 0.1 ms, refreshed by job</span></pre>
+      </div>
+    </div>
+    <div class="callout tip"><b>Multi-layer:</b> CDN edge (media images) → Caffeine L1 (profiles) → Redis L2 (timelines · celebrity tweets · social graph · trending) → Cassandra / PostgreSQL. Total Redis footprint ≈ 2 TB across ~80 shards. <span class="run">→ full cache map on canvas 2 · LLD</span></div>
+  </section>
+
+  <!-- C · BOTTLENECKS & SOLUTIONS -->
+  <section>
+    <div class="sec-h"><span class="n">C</span><h2>Bottlenecks &amp; solutions</h2><span class="tag">click a card to open</span></div>
+    <div class="grid" style="gap:10px">
+
+      <div class="card collapsible open">
+        <div class="c-head"><h3>Celebrity fan-out explosion</h3></div>
+        <div class="c-body">
+          <p><b style="color:var(--warn)">Impact:</b> pushing one celebrity tweet to 50M follower timelines is 50M Redis writes — ~50 s of fan-out at 1M ops/s, and it starves normal users' fan-out behind it. This is why pure fan-out-on-write breaks.</p>
+          <p><b style="color:var(--gc)">Fix:</b> hybrid model — accounts ≥10K followers skip fan-out entirely; their tweets live in one shared <code>celebrity-tweets:{id}</code> key and are pulled + merged at read time. Zero follower writes per celebrity tweet.</p>
+        </div>
+      </div>
+
+      <div class="card collapsible">
+        <div class="c-head"><h3>Thundering herd on a viral tweet</h3></div>
+        <div class="c-body">
+          <p><b style="color:var(--warn)">Impact:</b> millions of followers request the same celebrity tweet within seconds; naive reads hammer one Cassandra partition / one Redis key and melt it.</p>
+          <p><b style="color:var(--gc)">Fix:</b> one shared Redis key serves all followers; pre-warm the key at post time (before Kafka fires); Redis read replicas distribute the read load; singleflight mutex (<code>SETNX lock … EX 5</code>) prevents stampede on a miss.</p>
+        </div>
+      </div>
+
+      <div class="card collapsible">
+        <div class="c-head"><h3>Fan-out lag (workers fall behind)</h3></div>
+        <div class="c-body">
+          <p><b style="color:var(--warn)">Impact:</b> a burst of tweets pushes Kafka consumer lag past 60 s — followers stop seeing new tweets promptly, hurting the "feed feels live" experience.</p>
+          <p><b style="color:var(--gc)">Fix:</b> fan-out lag is the headline alert; workers auto-scale on consumer lag; Kafka's 128 partitions absorb the burst durably; a "surprise viral" normal user is dynamically promoted to the celebrity (pull) tier so their pending fan-out stops amplifying.</p>
+        </div>
+      </div>
+
+      <div class="card collapsible">
+        <div class="c-head"><h3>Cold-start feed (dormant user)</h3></div>
+        <div class="c-body">
+          <p><b style="color:var(--warn)">Impact:</b> a user returns after 30 days; their <code>timeline:{userId}</code> was evicted, so the first feed load must rebuild from scratch — 500 ms–2 s if they follow many accounts.</p>
+          <p><b style="color:var(--gc)">Fix:</b> cache warming pre-loads DAU timelines on deploy / after Redis failover; on a live miss, rebuild pulls recent tweets per followee, ranks, and writes back top 200 so all subsequent reads are &lt;50 ms.</p>
+        </div>
+      </div>
+
+      <div class="card collapsible">
+        <div class="c-head"><h3>Read fan-out on the pull path</h3></div>
+        <div class="c-body">
+          <p><b style="color:var(--warn)">Impact:</b> if a user follows 500 celebrities, naive pull is 500 store reads per feed request — at 3B reads/day that dwarfs the write cost.</p>
+          <p><b style="color:var(--gc)">Fix:</b> a per-user <code>celebrity-followees:{userId}</code> Set returns only the celebrity subset (usually a handful), so we pull from a small set; each pull hits the shared celebrity cache, not Cassandra; pulls run in parallel and merge with the pre-computed timeline.</p>
+        </div>
+      </div>
+
+      <div class="card collapsible">
+        <div class="c-head"><h3>Duplicate delivery (at-least-once Kafka)</h3></div>
+        <div class="c-body">
+          <p><b style="color:var(--warn)">Impact:</b> a fan-out worker crashes between the <code>ZADD</code> and the offset commit; the message is redelivered and the tweet could land twice in a timeline.</p>
+          <p><b style="color:var(--gc)">Fix:</b> Redis <code>ZADD</code> is idempotent for the same member — re-adding a tweetId just updates its score, so no duplicate. The pull path dedups at merge time with a <code>LinkedHashMap</code> keyed by tweetId.</p>
+        </div>
+      </div>
+
+      <div class="card collapsible">
+        <div class="c-head"><h3>Store / partition failure</h3></div>
+        <div class="c-body">
+          <p><b style="color:var(--warn)">Impact:</b> a Kafka broker, a Redis shard, or a Cassandra node drops mid-traffic.</p>
+          <p><b style="color:var(--gc)">Fix:</b> graceful degradation — Kafka down → feed still serves via the pull path; timeline cache lost → rebuild from Cassandra; Cassandra partition → serve stale content from the Redis tweet cache; social-graph Redis down → pause fan-out with backoff, keep serving cached timelines. The feed never shows an error page.</p>
+        </div>
+      </div>
+
+      <div class="card collapsible">
+        <div class="c-head"><h3>Hot / oversized Cassandra partition</h3></div>
+        <div class="c-body">
+          <p><b style="color:var(--warn)">Impact:</b> a celebrity's <code>tweets_by_user</code> partition grows unbounded; full-partition scans get slow.</p>
+          <p><b style="color:var(--gc)">Fix:</b> only ever read the recent slice with <code>created_at &gt; ?</code> + <code>LIMIT</code>; TTL tweets at ~90 days (<code>USING TTL</code>) so old data auto-expires; the celebrity cache absorbs nearly all reads so the partition is rarely touched directly.</p>
+        </div>
+      </div>
+
+    </div>
+  </section>
+
+  <!-- D · CAP & CONSISTENCY -->
+  <section>
+    <div class="sec-h"><span class="n">D</span><h2>CAP &amp; consistency — why AP</h2><span class="tag">pick two; P is not optional</span></div>
+    <div class="grid g2">
+      <div class="card">
+        <div class="kicker">the choice</div>
+        <p class="muted"><b>P is mandatory</b> across data centres, so the real decision is A vs C during a partition. A tweet appearing 5–10 s late is invisible; a feed that <b>fails to load</b> is lost engagement and lost ad revenue. So the feed is <b>AP</b> — serve slightly-stale rather than error.</p>
+        <ul class="tight">
+          <li><b>AP:</b> during a partition, serve the cached timeline rather than time out.</li>
+          <li>Strong consistency for 500M users would make every tweet write wait on a cross-DC quorum — seconds, not milliseconds.</li>
+          <li>Two followers legitimately see different feeds for a few seconds — by design, per-user eventual consistency.</li>
+        </ul>
+      </div>
+      <div class="card">
+        <div class="kicker">strong-consistency islands</div>
+        <p class="muted">Not everything tolerates staleness. Two places lean <b>CP</b>:</p>
+        <ul class="tight">
+          <li><b>Follow / unfollow graph:</b> written synchronously (Redis <code>MULTI</code> dual-write). A stale graph means the <b>next fan-out</b> is wrong — sending tweets to someone who unfollowed, or missing someone who just followed.</li>
+          <li><b>Read-your-own-writes:</b> the author's own timeline is written synchronously before the async fan-out, so a poster always sees their tweet immediately.</li>
+        </ul>
+        <pre class="code"><span class="kw">MULTI</span>
+  <span class="ty">SADD</span> followers:{B} {A}
+  <span class="ty">SADD</span> following:{A} {B}   <span class="cm">// atomic, strong</span>
+<span class="kw">EXEC</span></pre>
+      </div>
+    </div>
+    <div class="callout tip"><b>Tweet deletion is eventual + safe:</b> soft-delete flag set immediately in Cassandra, async <code>ZREM</code> from timelines via Kafka, and every feed read checks <code>isDeleted()</code> as a read-time safety net — so a deleted tweet is filtered out even before the ZREM lands.</div>
+    <table style="margin-top:12px">
+      <thead><tr><th>Operation</th><th>Consistency</th><th>Reasoning</th></tr></thead>
+      <tbody>
+        <tr><td>Feed timeline read</td><td>AP · eventual (&lt;5 s)</td><td>Fan-out is async; users never notice a few seconds' lag</td></tr>
+        <tr><td>Tweet creation (own view)</td><td>Strong · read-your-writes</td><td>Sync write to author's own timeline before fan-out</td></tr>
+        <tr><td>Follow / unfollow</td><td>Strong (immediate)</td><td>Wrong graph = wrong future fan-out</td></tr>
+        <tr><td>Like / retweet counts</td><td>AP · eventual</td><td>Approximate counts are fine ("12.3K likes")</td></tr>
+        <tr><td>Tweet deletion</td><td>Eventual + soft-delete</td><td>Flag immediately, async ZREM, read-time filter</td></tr>
+        <tr><td>Trending topics</td><td>Eventual (1–5 min)</td><td>Approximate, periodic refresh</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <!-- E · TRADE-OFFS SUMMARY -->
+  <section>
+    <div class="sec-h"><span class="n">E</span><h2>Trade-offs summary</h2><span class="tag">decision · chosen · alternative · why</span></div>
+    <table>
+      <thead><tr><th>Decision</th><th>Chosen</th><th>Alternative</th><th>Why this choice</th></tr></thead>
+      <tbody>
+        <tr><td>Fan-out model</td><td><b style="color:var(--survivor)">Hybrid (push + pull)</b></td><td>pure push / pure pull</td><td>Push is O(1) reads but 50M writes per celebrity; pull is free writes but 500 reads per feed. Hybrid is the only thing that scales.</td></tr>
+        <tr><td>Consistency model</td><td><b style="color:var(--survivor)">AP · eventual</b></td><td>CP / strong</td><td>Feed must always load; 5–10 s staleness is invisible</td></tr>
+        <tr><td>Timeline cache</td><td><b style="color:var(--survivor)">Redis Sorted Set</b></td><td>Memcached / List</td><td>O(log N) scored inserts, range queries, free ZADD dedup</td></tr>
+        <tr><td>Timeline cap</td><td><b style="color:var(--survivor)">200 items / user</b></td><td>unlimited</td><td>Bounds memory (~10 KB/user); users rarely scroll past 200</td></tr>
+        <tr><td>Tweet store</td><td><b style="color:var(--survivor)">Cassandra</b></td><td>DynamoDB / SQL</td><td>Write-heavy time-series, wide rows, masterless RF=3, TTL</td></tr>
+        <tr><td>Fan-out pipeline</td><td><b style="color:var(--survivor)">Kafka</b></td><td>SQS / SNS / RabbitMQ</td><td>Ordering per key, replay, multiple consumer groups</td></tr>
+        <tr><td>Social graph</td><td><b style="color:var(--survivor)">Redis Sets</b></td><td>Neo4j / SQL</td><td>O(1) SISMEMBER/SCARD; no graph traversals needed</td></tr>
+        <tr><td>User profiles</td><td><b style="color:var(--survivor)">PostgreSQL + 2-tier cache</b></td><td>Cassandra</td><td>Small relational dataset, ACID, complex queries</td></tr>
+        <tr><td>Pagination</td><td><b style="color:var(--survivor)">Cursor (timestamp)</b></td><td>offset-based</td><td>Offset breaks when new tweets shift the list</td></tr>
+        <tr><td>Feed ranking</td><td><b style="color:var(--survivor)">Engagement + time-decay</b></td><td>pure chronological</td><td>Higher engagement; decay stops old virals dominating</td></tr>
+        <tr><td>Trending scoring</td><td><b style="color:var(--survivor)">Velocity</b></td><td>raw volume</td><td>#SuperBowl 1K→500K in 5 min beats always-popular #love</td></tr>
+        <tr><td>Dedup</td><td><b style="color:var(--survivor)">Read-time (ZADD idempotent)</b></td><td>write-time</td><td>Keeps write-time dedup latency out of the fan-out path</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <!-- F · INTERVIEW WALKTHROUGH -->
+  <section>
+    <div class="sec-h"><span class="n">F</span><h2>Interview walkthrough — timing strip</h2><span class="tag">~30 min answer</span></div>
+    <div class="flow">
+      <div class="step eden"><div class="box">Clarify</div><small>P1 · 2 min<br>scope + non-functional</small></div>
+      <div class="step eden"><div class="box">Estimation</div><small>P2 · 2–3 min<br>say "100B fan-out/day"</small></div>
+      <div class="step surv"><div class="box">API</div><small>P3 · 2 min<br>cursor pagination</small></div>
+      <div class="step surv"><div class="box">Architecture</div><small>P4 · 3–4 min<br>draw the diagram</small></div>
+      <div class="step old"><div class="box">FAN-OUT</div><small>P5 · 8–10 min<br>THE interview</small></div>
+      <div class="step old"><div class="box">Rank · Trending</div><small>P6–7 · decay · velocity</small></div>
+      <div class="step dead"><div class="box">DB · Edge · CAP</div><small>P8–10 · AP · wrap</small></div>
+    </div>
+    <div class="grid g2" style="margin-top:14px">
+      <div class="card">
+        <div class="kicker">phase-by-phase</div>
+        <ul class="tight">
+          <li><b>P1 Clarify (2):</b> post + feed + follow + trending + ranking; 300M MAU / 150M DAU; &lt;500 ms p99; eventual consistency OK. Out: DMs, ads, media pipeline.</li>
+          <li><b>P2 Estimate (2–3):</b> 500M tweets/day, 3B feed reads/day; avg 200 followers → <b>100B fan-out ops/day ≈ 1.16M/s</b> — the dominant number; ~55 TB/yr tweets; ~3.6 TB timeline cache.</li>
+          <li><b>P3 API (2):</b> <code>POST /tweets</code>, <code>GET /feed?cursor=</code> (cursor, not offset!), follow/unfollow, <code>GET /trending</code>.</li>
+          <li><b>P4 Architecture (3–4 · draw first):</b> Client → Gateway → Tweet Svc → Kafka → fan-out workers → Redis timelines; Feed Svc reads timeline + celebrity cache → merge → rank.</li>
+          <li><b>P5 Fan-out (8–10 · THE CORE):</b> push vs pull vs <b>hybrid</b>; celebrity threshold 10K; the merge step; dynamic promotion of surprise-viral users.</li>
+        </ul>
+      </div>
+      <div class="card">
+        <div class="kicker">…and finish strong</div>
+        <ul class="tight">
+          <li><b>P6 Ranking (2–3):</b> engagement score = likes·1 + RT·2 + replies·1.5, times a time-decay; re-score top 200 every 5–10 min as the ZSET score.</li>
+          <li><b>P7 Trending (2–3):</b> ZINCRBY per hashtag per window; score on <b>velocity</b> not volume; spam filter + count unique users.</li>
+          <li><b>P8 DB &amp; caching (2–3):</b> Cassandra tweets, PostgreSQL users, Redis ZSET timelines + Sets graph; thundering-herd celebrity cache.</li>
+          <li><b>P9 Edge cases (2–3):</b> deletion (read-time null-check), unfollow (age-out), cold start, duplicate delivery (dedup by tweetId).</li>
+          <li><b>P10 CAP (2):</b> AP, eventual; strong only for follow-graph &amp; read-your-writes; 200-item cap; cursor pagination.</li>
+        </ul>
+      </div>
+    </div>
+    <div class="callout tip"><b>Green flags:</b> raise the celebrity problem <i>before</i> being asked · quantify "100B fan-out ops/day" · explain the merge step · velocity-based trending · time-decay ranking · dynamic celebrity detection. <b>Red flags:</b> only fan-out-on-write · SQL for tweets at 500M writes/day · offset pagination · no caching · forgetting the merge · "just use a queue."</div>
+  </section>
+
+  <!-- GLOSSARY -->
+  <section>
+    <div class="sec-h"><span class="n">§</span><h2>Glossary — one-liners</h2><span class="tag">terms used above</span></div>
+    <div class="grid g2">
+      <div class="card"><table><tbody>
+        <tr><td><b>Fan-out-on-write (push)</b></td><td>at post time, ZADD the tweet into every follower's timeline</td></tr>
+        <tr><td><b>Fan-out-on-read (pull)</b></td><td>at feed time, pull a followee's recent tweets from a shared cache</td></tr>
+        <tr><td><b>Hybrid fan-out</b></td><td>push for normal users, pull for celebrities (≥10K followers)</td></tr>
+        <tr><td><b>Fan-out lag</b></td><td>time from publish to the last follower's timeline update — the key metric</td></tr>
+        <tr><td><b>Thundering herd</b></td><td>millions read the same celebrity key at once → shared cache + replicas absorb it</td></tr>
+        <tr><td><b>Singleflight</b></td><td>SETNX mutex so only one miss repopulates a hot key</td></tr>
+      </tbody></table></div>
+      <div class="card"><table><tbody>
+        <tr><td><b>AP (CAP)</b></td><td>favour Availability + Partition-tolerance; feed must always load</td></tr>
+        <tr><td><b>Read-your-own-writes</b></td><td>author's own timeline written synchronously so they see their tweet</td></tr>
+        <tr><td><b>ZADD idempotency</b></td><td>re-adding the same tweetId updates its score → free dedup</td></tr>
+        <tr><td><b>Cursor pagination</b></td><td>page by timestamp, not offset, so real-time inserts don't shift the page</td></tr>
+        <tr><td><b>Velocity (trending)</b></td><td>rate of change of a hashtag, not raw volume</td></tr>
+        <tr><td><b>Cold start</b></td><td>missing timeline rebuilt from Cassandra (500 ms–2 s) then cached</td></tr>
+      </tbody></table></div>
+    </div>
+  </section>
+
+  <footer>
+    <p>Use case 05 · Social Media Feed — Canvas 3 of 3 (Deep-dive &amp; Trade-offs). Grounded in <code>05-social-media-feed/docs/tradeoffs · caching · tech</code> and <code>revision/INTERVIEW_WALKTHROUGH.md</code>.</p>
+    <p class="run">This use case: <a href="hld.html">05a · HLD</a> · <a href="lld.html">05b · LLD</a> · Deep-dive &nbsp;|&nbsp; Next → <a href="../index.html">Hub</a></p>
+  </footer>
+
+</div>
+<script src="../assets/canvas.js"></script>
+</body>
+</html>

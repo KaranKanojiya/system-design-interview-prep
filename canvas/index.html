@@ -1,0 +1,74 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>System Design Canvases — Hub</title>
+<link rel="stylesheet" href="assets/canvas.css">
+<style>
+  /* hub-only: non-linked "coming" tiles */
+  .tile.soon{opacity:.6;cursor:default}
+  .tile.soon:hover{border-color:var(--border);transform:none}
+  .soonpill{display:inline-block;font-size:10px;padding:1px 7px;border-radius:999px;border:1px solid var(--border);color:var(--faint);margin-top:6px}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <header class="hero">
+    <h1>System Design Canvases</h1>
+    <div class="sub">Interactive, diagram-driven study sheets for the System Design repo. Start with the three <b>Foundations</b> (CAP, algorithms, estimation), then each of the 20 use cases gets its own set of canvases. Open any canvas in a browser or Cursor (Live Preview); the diagrams are clickable and the calculators are live.</div>
+    <div class="badges">
+      <span class="badge lvl">3 foundations + 20 use cases</span>
+      <span class="badge">interactive · diagram-driven</span>
+      <span class="badge">Java 21 · Gradle</span>
+    </div>
+    <div class="legend">
+      <span><i class="dot" style="background:var(--eden)"></i> click components</span>
+      <span><i class="dot" style="background:var(--survivor)"></i> step the flow</span>
+      <span><i class="dot" style="background:var(--old)"></i> deep dive</span>
+      <span><i class="dot" style="background:var(--gc)"></i> live calculators</span>
+      <span><i class="dot" style="background:var(--warn)"></i> trade-offs</span>
+    </div>
+  </header>
+
+  <div class="lvlband">Foundations — the basics behind every design</div>
+  <div class="hub">
+    <a class="tile" href="f1-cap-consistency.html"><div class="num">Foundation · F1</div><div class="tt">CAP &amp; Consistency</div><div class="dd">interactive CAP triangle, PACELC, consistency models, quorum (W+R&gt;N), CP vs AP databases, and which of the 20 systems lands where.</div></a>
+    <a class="tile" href="f2-must-know-algorithms.html"><div class="num">Foundation · F2</div><div class="tt">Must-Know Algorithms</div><div class="dd">clickable map: consistent hashing (ring), quorum, bloom/HLL/count-min, rate limiting, leader election, LRU/LFU, merkle, gossip, geohash, Snowflake IDs.</div></a>
+    <a class="tile" href="f3-estimation-numbers.html"><div class="num">Foundation · F3</div><div class="tt">Estimation, Numbers &amp; Conversions</div><div class="dd">live capacity estimator + byte converter, the 5 numbers, latency table, powers of 1000, availability nines, formulas, math tips.</div></a>
+  </div>
+
+  <div class="lvlband">Use cases — 3 canvases each (HLD · LLD · Deep-dive &amp; Trade-offs), coming next</div>
+  <div class="hub">
+    <a class="tile" href="01-url-shortener/hld.html"><div class="num">01 · ready</div><div class="tt">URL Shortener</div><div class="dd">HLD (interactive diagram + flow-stepper) · LLD (class map + strategies) · Deep-dive (scaling, CAP, trade-offs). Cloud-service annotated.</div></a>
+    <a class="tile" href="02-rate-limiter/hld.html"><div class="num">02 · ready</div><div class="tt">Rate Limiter</div><div class="dd">Token/leaky/sliding algorithms · interactive diagram · LLD class map · deep-dive. 3 canvases.</div></a>
+    <a class="tile" href="03-notification-system/hld.html"><div class="num">03 · ready</div><div class="tt">Notification System</div><div class="dd">Multi-channel fan-out, queues, retries · interactive diagram · LLD · deep-dive. 3 canvases.</div></a>
+    <a class="tile" href="04-chat-system/hld.html"><div class="num">04 · ready</div><div class="tt">Chat System</div><div class="dd">WebSockets, presence, fan-out, ordering · interactive diagram · LLD · deep-dive. 3 canvases.</div></a>
+    <a class="tile" href="05-social-media-feed/hld.html"><div class="num">05 · ready</div><div class="tt">Social Media Feed</div><div class="dd">Fan-out on write vs read, ranking, CDN · interactive diagram · LLD · deep-dive. 3 canvases.</div></a>
+    <a class="tile" href="06-parking-lot/hld.html"><div class="num">06 · ready</div><div class="tt">Parking Lot</div><div class="dd">OOP-heavy: spots, pricing strategy, floors · interactive diagram · LLD class map · deep-dive. 3 canvases.</div></a>
+    <a class="tile" href="07-distributed-cache/hld.html"><div class="num">07 · ready</div><div class="tt">Distributed Cache</div><div class="dd">Consistent hashing, LRU/LFU/TTL eviction, replication · interactive diagram · LLD · deep-dive. 3 canvases.</div></a>
+    <a class="tile" href="08-ride-sharing/hld.html"><div class="num">08 · ready</div><div class="tt">Ride Sharing</div><div class="dd">Geo matching (geohash/quadtree), dispatch, surge · interactive diagram · LLD · deep-dive. 3 canvases.</div></a>
+    <a class="tile" href="09-search-autocomplete/hld.html"><div class="num">09 · ready</div><div class="tt">Search Autocomplete</div><div class="dd">Trie, top-K ranking, prefix sharding · interactive diagram · LLD · deep-dive. 3 canvases.</div></a>
+    <div class="tile soon"><div class="num">10</div><div class="tt">E-Commerce</div><span class="soonpill">3 canvases · soon</span></div>
+    <div class="tile soon"><div class="num">11</div><div class="tt">Payment System</div><span class="soonpill">3 canvases · soon</span></div>
+    <div class="tile soon"><div class="num">12</div><div class="tt">News Feed</div><span class="soonpill">3 canvases · soon</span></div>
+    <div class="tile soon"><div class="num">13</div><div class="tt">Video Streaming</div><span class="soonpill">3 canvases · soon</span></div>
+    <div class="tile soon"><div class="num">14</div><div class="tt">Real-time Collaboration</div><span class="soonpill">3 canvases · soon</span></div>
+    <div class="tile soon"><div class="num">15</div><div class="tt">File Storage</div><span class="soonpill">3 canvases · soon</span></div>
+    <div class="tile soon"><div class="num">16</div><div class="tt">Stock Trading</div><span class="soonpill">3 canvases · soon</span></div>
+    <div class="tile soon"><div class="num">17</div><div class="tt">Distributed Task Scheduler</div><span class="soonpill">3 canvases · soon</span></div>
+    <div class="tile soon"><div class="num">18</div><div class="tt">Observability Platform</div><span class="soonpill">3 canvases · soon</span></div>
+    <div class="tile soon"><div class="num">19</div><div class="tt">API Gateway &amp; Service Mesh</div><span class="soonpill">3 canvases · soon</span></div>
+    <div class="tile soon"><div class="num">20</div><div class="tt">Distributed Message Queue</div><span class="soonpill">3 canvases · soon</span></div>
+  </div>
+
+  <footer>
+    System Design — Study Canvases · shared <code>assets/canvas.css</code> + <code>assets/canvas.js</code> ·
+    open in a browser or Cursor (Live Preview) · <code>Cmd/Ctrl+P</code> exports to PDF ·
+    use-case canvases (3 each: HLD / LLD / Deep-dive &amp; Trade-offs) are built in approved batches.
+  </footer>
+
+</div>
+</body>
+</html>

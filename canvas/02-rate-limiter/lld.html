@@ -1,0 +1,377 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>02 · Rate Limiter — LLD</title>
+<link rel="stylesheet" href="../assets/canvas.css">
+</head>
+<body>
+<div class="wrap">
+
+  <header class="hero">
+    <h1>Rate Limiter — Low-Level Design</h1>
+    <div class="sub">Use case 02 · Canvas 2 of 3. From boxes to classes: the actual Java object model. Start with the <b>interactive class map</b> — click a class to see its responsibility and how <code>AppConfig → Controller → RateLimiterService → Strategy/Repository</code> is wired — then dig into the Token-Bucket algorithm, the five pluggable strategies, and the request sequences.</div>
+    <div class="badges">
+      <span class="badge lvl">Use case 02 · LLD</span>
+      <span class="badge">Canvas 2 of 3</span>
+      <span class="badge">interactive</span>
+      <span class="badge">OOP · Strategy · Builder · Repository</span>
+    </div>
+    <div class="legend">
+      <span><i class="dot" style="background:var(--eden)"></i> entry / composition root</span>
+      <span><i class="dot" style="background:var(--survivor)"></i> interface / contract</span>
+      <span><i class="dot" style="background:var(--old)"></i> concrete implementation</span>
+      <span><i class="dot" style="background:var(--warn)"></i> domain model</span>
+      <span><i class="dot" style="background:var(--muted)"></i> click a class for its role</span>
+    </div>
+  </header>
+
+  <!-- A · CLASS DESIGN (interactive class map) -->
+  <section>
+    <div class="sec-h"><span class="n">A</span><h2>Class design — click a class in the map</h2><span class="tag">the object model, wired</span></div>
+    <div>
+      <div class="arch">
+        <svg viewBox="0 0 790 430" width="100%" style="max-width:790px" role="img" aria-label="Rate limiter class map">
+          <defs>
+            <marker id="ah" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" fill="var(--muted)"></path></marker>
+          </defs>
+
+          <!-- wiring arrows -->
+          <line class="arrow" x1="90" y1="66" x2="90" y2="120" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"></line>
+          <line class="arrow" x1="160" y1="143" x2="218" y2="143" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"></line>
+          <line class="arrow" x1="372" y1="132" x2="428" y2="72" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"></line>
+          <line class="arrow" x1="372" y1="150" x2="428" y2="224" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"></line>
+          <line class="arrow" x1="372" y1="233" x2="428" y2="233" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"></line>
+          <line class="arrow" x1="592" y1="58" x2="626" y2="40" stroke="var(--muted)" stroke-width="2" stroke-dasharray="4 3" marker-end="url(#ah)"></line>
+          <line class="arrow" x1="592" y1="62" x2="626" y2="86" stroke="var(--muted)" stroke-width="2" stroke-dasharray="4 3" marker-end="url(#ah)"></line>
+          <line class="arrow" x1="592" y1="66" x2="626" y2="134" stroke="var(--muted)" stroke-width="2" stroke-dasharray="4 3" marker-end="url(#ah)"></line>
+          <line class="arrow" x1="592" y1="70" x2="626" y2="184" stroke="var(--muted)" stroke-width="2" stroke-dasharray="4 3" marker-end="url(#ah)"></line>
+          <line class="arrow" x1="592" y1="74" x2="626" y2="234" stroke="var(--muted)" stroke-width="2" stroke-dasharray="4 3" marker-end="url(#ah)"></line>
+          <line class="arrow" x1="592" y1="233" x2="626" y2="316" stroke="var(--muted)" stroke-width="2" stroke-dasharray="4 3" marker-end="url(#ah)"></line>
+          <line class="arrow" x1="510" y1="300" x2="510" y2="170" stroke="var(--muted)" stroke-width="2" stroke-dasharray="4 3" marker-end="url(#ah)"></line>
+          <text x="98" y="98" fill="var(--faint)" font-size="9">wires</text>
+          <text x="168" y="137" fill="var(--faint)" font-size="9">uses</text>
+
+          <!-- nodes -->
+          <g data-node style="cursor:pointer" data-title="AppConfig  (config)" data-detail="<b>Role:</b> composition root / poor-man's DI container (Factory pattern) — a utility class with a private constructor.<br><b>Wiring:</b> <code>createStrategies()</code> builds an <code>EnumMap&lt;Algorithm,RateLimiterStrategy&gt;</code> of all five algorithms; <code>createDefaultRule()</code> makes the fallback rule; <code>createDefaultService()</code> news-up InMemoryRuleRepository + strategy map + default rule → RateLimiterService; <code>createController()</code> wraps that in a RateLimiterController.<br><b>Constants:</b> DEFAULT_MAX_REQUESTS=10, DEFAULT_WINDOW_MS=60000, DEFAULT_ALGORITHM=TOKEN_BUCKET. The one place wiring changes."><rect x="20" y="20" width="140" height="46" rx="9" fill="var(--panel-2)" stroke="var(--eden)"></rect><text x="90" y="41" text-anchor="middle" fill="var(--eden)" font-size="12" font-weight="600">AppConfig</text><text x="90" y="56" text-anchor="middle" fill="var(--faint)" font-size="10">composition root</text></g>
+
+          <g data-node style="cursor:pointer" data-title="RateLimiterController  (middleware)" data-detail="<b>Role:</b> framework-free stand-in for a Servlet Filter / Spring HandlerInterceptor.<br><b>handleRequest(ctx):</b> calls <code>rateLimiterService.checkRateLimit(ctx)</code>, prints the <code>X-RateLimit-*</code> headers from <code>result.getHeaders()</code>, then logs <b>200 OK</b> or <b>429 Too Many Requests</b> and returns the RateLimitResult.<br>Holds only a reference to the service — no business logic of its own."><rect x="20" y="120" width="140" height="46" rx="9" fill="var(--panel-2)" stroke="var(--border)"></rect><text x="90" y="141" text-anchor="middle" fill="var(--text)" font-size="12" font-weight="600">Controller</text><text x="90" y="156" text-anchor="middle" fill="var(--faint)" font-size="10">simulated middleware</text></g>
+
+          <g data-node style="cursor:pointer" data-title="RateLimiterService  (service)" data-detail="<b>Role:</b> the orchestrator. Holds a <code>RuleRepository</code>, a <code>Map&lt;Algorithm,RateLimiterStrategy&gt;</code>, and a <code>defaultRule</code>.<br><b>checkRateLimit(ctx):</b> key = <code>ctx.getRateLimitKey()</code> → <code>ruleRepository.findByKey(key).orElse(defaultRule)</code> → if <code>!rule.isEnabled()</code> allow → else <code>strategies.get(rule.getAlgorithm())</code> → <code>strategy.tryConsume(key, rule)</code>.<br><b>resetLimit(key):</b> fans out reset to every strategy. Static <code>createDefault()</code> mirrors AppConfig wiring."><rect x="220" y="120" width="150" height="46" rx="9" fill="var(--panel-2)" stroke="var(--border)"></rect><text x="295" y="141" text-anchor="middle" fill="var(--text)" font-size="12" font-weight="600">RateLimiterService</text><text x="295" y="156" text-anchor="middle" fill="var(--faint)" font-size="10">orchestrator</text></g>
+
+          <g data-node style="cursor:pointer" data-title="RuleService  (service)" data-detail="<b>Role:</b> CRUD over rules, kept separate from the hot rate-limit path (Single Responsibility).<br><b>Methods:</b> createRule (rejects blank keys), getRule / deleteRule / updateRule (throw <code>RuleNotFoundException</code> when the key is absent via <code>repository.exists</code>), getAllRules.<br>Talks only to the <code>RuleRepository</code> interface."><rect x="220" y="210" width="150" height="46" rx="9" fill="var(--panel-2)" stroke="var(--border)"></rect><text x="295" y="231" text-anchor="middle" fill="var(--text)" font-size="12" font-weight="600">RuleService</text><text x="295" y="246" text-anchor="middle" fill="var(--faint)" font-size="10">rule CRUD</text></g>
+
+          <g data-node style="cursor:pointer" data-title="RequestContext  (model)" data-detail="<b>Role:</b> immutable metadata about one incoming request.<br><b>Fields:</b> clientId, ipAddress, endpoint, timestamp (all final). A convenience constructor stamps <code>System.currentTimeMillis()</code>.<br><b>getRateLimitKey():</b> returns the composite <code>clientId + &quot;:&quot; + endpoint</code> — the key every strategy buckets on."><rect x="220" y="320" width="150" height="46" rx="9" fill="var(--panel-2)" stroke="var(--warn)"></rect><text x="295" y="341" text-anchor="middle" fill="var(--warn)" font-size="12" font-weight="600">RequestContext</text><text x="295" y="356" text-anchor="middle" fill="var(--faint)" font-size="10">request metadata</text></g>
+
+          <g data-node style="cursor:pointer" data-title="RateLimiterStrategy  «interface»" data-detail="<b>Role:</b> the Strategy contract — <code>RateLimitResult tryConsume(String key, RateLimitRule rule)</code>, <code>void reset(String key)</code>, <code>Algorithm algorithm()</code>.<br><b>Why:</b> the Service depends on this interface only and dispatches by <code>rule.getAlgorithm()</code>, so the throttling algorithm swaps per-rule without touching service code (Open-Closed Principle). Five implementations ship today."><rect x="430" y="40" width="160" height="46" rx="9" fill="var(--panel-2)" stroke="var(--survivor)"></rect><text x="510" y="61" text-anchor="middle" fill="var(--survivor)" font-size="12" font-weight="600">RateLimiterStrategy</text><text x="510" y="76" text-anchor="middle" fill="var(--faint)" font-size="10">«interface»</text></g>
+
+          <g data-node style="cursor:pointer" data-title="Algorithm  «enum»" data-detail="<b>Role:</b> the five supported algorithms, each carrying a human-readable description.<br><b>Values:</b> TOKEN_BUCKET, LEAKY_BUCKET, FIXED_WINDOW, SLIDING_WINDOW_LOG, SLIDING_WINDOW_COUNTER.<br>It is the <b>key</b> of the service's strategy map and a field on every RateLimitRule — the link that drives Strategy selection at runtime."><rect x="430" y="124" width="160" height="46" rx="9" fill="var(--panel-2)" stroke="var(--warn)"></rect><text x="510" y="145" text-anchor="middle" fill="var(--warn)" font-size="12" font-weight="600">Algorithm</text><text x="510" y="160" text-anchor="middle" fill="var(--faint)" font-size="10">«enum» 5 values</text></g>
+
+          <g data-node style="cursor:pointer" data-title="RuleRepository  «interface»" data-detail="<b>Role:</b> the data-access contract for rules — <code>findByKey</code>, <code>findAll</code>, <code>save</code>, <code>delete</code>, <code>exists</code>.<br><b>Why:</b> the Service and RuleService talk to this interface, so rule storage (in-memory today; Redis / Postgres tomorrow) swaps without logic changes. Repository pattern / Dependency Inversion."><rect x="430" y="210" width="160" height="46" rx="9" fill="var(--panel-2)" stroke="var(--survivor)"></rect><text x="510" y="231" text-anchor="middle" fill="var(--survivor)" font-size="12" font-weight="600">RuleRepository</text><text x="510" y="246" text-anchor="middle" fill="var(--faint)" font-size="10">«interface»</text></g>
+
+          <g data-node style="cursor:pointer" data-title="RateLimitRule  (model · Builder)" data-detail="<b>Role:</b> the config entity — how many requests, over what window, using which algorithm — built via the <b>Builder pattern</b> (<code>RateLimitRule.builder(key, maxRequests, windowSizeMs)…build()</code>).<br><b>Fields:</b> id (defaults to key), key, maxRequests, windowSizeMs, algorithm (default TOKEN_BUCKET), burstCapacity (sentinel <code>-1</code> → maxRequests), enabled (default true).<br><b>build()</b> validates maxRequests&gt;0 and windowSizeMs&gt;0."><rect x="430" y="300" width="160" height="46" rx="9" fill="var(--panel-2)" stroke="var(--warn)"></rect><text x="510" y="321" text-anchor="middle" fill="var(--warn)" font-size="12" font-weight="600">RateLimitRule</text><text x="510" y="336" text-anchor="middle" fill="var(--faint)" font-size="10">«Builder» config</text></g>
+
+          <g data-node style="cursor:pointer" data-title="RateLimitResult  (model)" data-detail="<b>Role:</b> immutable outcome of one check, built through static factories <code>allowed(remaining, limit, resetAtMs)</code> and <code>rejected(limit, retryAfterMs, resetAtMs)</code> (private constructor).<br><b>Fields:</b> allowed, remaining, retryAfterMs, limit, resetAtMs.<br><b>getHeaders():</b> emits <code>X-RateLimit-Limit / -Remaining / -Reset</code> and, when denied, <code>Retry-After</code>."><rect x="430" y="360" width="160" height="46" rx="9" fill="var(--panel-2)" stroke="var(--warn)"></rect><text x="510" y="381" text-anchor="middle" fill="var(--warn)" font-size="12" font-weight="600">RateLimitResult</text><text x="510" y="396" text-anchor="middle" fill="var(--faint)" font-size="10">check outcome</text></g>
+
+          <g data-node style="cursor:pointer" data-title="TokenBucketStrategy" data-detail="<b>Role:</b> tokens accumulate at <code>maxRequests/windowSizeMs</code> per ms up to <code>burstCapacity</code>; each request consumes one. Per-key state in a <code>ConcurrentHashMap&lt;String,TokenBucket&gt;</code>, guarded by <code>synchronized(bucket)</code>.<br><b>algorithm()</b> = TOKEN_BUCKET. Allows controlled bursts — the API-gateway default. See section B for the worked example."><rect x="630" y="16" width="140" height="44" rx="9" fill="var(--panel-2)" stroke="var(--old)"></rect><text x="700" y="35" text-anchor="middle" fill="var(--old)" font-size="11" font-weight="600">TokenBucket</text><text x="700" y="50" text-anchor="middle" fill="var(--faint)" font-size="10">bursts + refill</text></g>
+
+          <g data-node style="cursor:pointer" data-title="LeakyBucketStrategy" data-detail="<b>Role:</b> a FIFO queue drained at a constant rate; requests enqueue, overflow is rejected. Smooths bursts entirely — output rate is constant.<br><b>algorithm()</b> = LEAKY_BUCKET. Per-key <code>LeakyQueue</code> in a ConcurrentHashMap. Best for traffic shaping."><rect x="630" y="66" width="140" height="44" rx="9" fill="var(--panel-2)" stroke="var(--old)"></rect><text x="700" y="85" text-anchor="middle" fill="var(--old)" font-size="11" font-weight="600">LeakyBucket</text><text x="700" y="100" text-anchor="middle" fill="var(--faint)" font-size="10">FIFO drain</text></g>
+
+          <g data-node style="cursor:pointer" data-title="FixedWindowCounterStrategy" data-detail="<b>Role:</b> one <code>AtomicInteger</code> per key per fixed window (<code>windowStart = now/windowMs*windowMs</code>); resets when the window advances.<br><b>algorithm()</b> = FIXED_WINDOW. Simple and O(1) memory, but suffers the boundary-burst problem (up to 2× the limit across a window edge)."><rect x="630" y="116" width="140" height="44" rx="9" fill="var(--panel-2)" stroke="var(--old)"></rect><text x="700" y="135" text-anchor="middle" fill="var(--old)" font-size="11" font-weight="600">FixedWindow</text><text x="700" y="150" text-anchor="middle" fill="var(--faint)" font-size="10">counter / window</text></g>
+
+          <g data-node style="cursor:pointer" data-title="SlidingWindowLogStrategy" data-detail="<b>Role:</b> keeps a sorted log of every request timestamp; evicts entries older than the window, counts the rest, admits if under the limit.<br><b>algorithm()</b> = SLIDING_WINDOW_LOG. Most accurate — no boundary problem — but O(N) memory per key. Best for precise billing."><rect x="630" y="166" width="140" height="44" rx="9" fill="var(--panel-2)" stroke="var(--old)"></rect><text x="700" y="185" text-anchor="middle" fill="var(--old)" font-size="11" font-weight="600">SlidingWindowLog</text><text x="700" y="200" text-anchor="middle" fill="var(--faint)" font-size="10">timestamp log</text></g>
+
+          <g data-node style="cursor:pointer" data-title="SlidingWindowCounterStrategy" data-detail="<b>Role:</b> two counters (previous + current window); the weighted count is <code>prev*(1-overlap)+current</code>. O(1) memory with near-exact accuracy (~0.003% off true sliding window).<br><b>algorithm()</b> = SLIDING_WINDOW_COUNTER. Catches the boundary spike Fixed Window misses. The production sweet spot (Cloudflare)."><rect x="630" y="216" width="140" height="44" rx="9" fill="var(--panel-2)" stroke="var(--old)"></rect><text x="700" y="235" text-anchor="middle" fill="var(--old)" font-size="10.5" font-weight="600">SlidingWindowCounter</text><text x="700" y="250" text-anchor="middle" fill="var(--faint)" font-size="10">weighted 2-window</text></g>
+
+          <g data-node style="cursor:pointer" data-title="InMemoryRuleRepository" data-detail="<b>Role:</b> the MVP implementation. <code>ConcurrentHashMap&lt;String,RateLimitRule&gt;</code> keyed by rule key → lock-free reads, safe concurrent writes.<br><b>Mapping:</b> save = put, findByKey = ofNullable(get), delete = remove, exists = containsKey, findAll = copy of values. Swap for Redis/DB with no service change."><rect x="630" y="300" width="140" height="46" rx="9" fill="var(--panel-2)" stroke="var(--old)"></rect><text x="700" y="321" text-anchor="middle" fill="var(--old)" font-size="10.5" font-weight="600">InMemoryRuleRepo</text><text x="700" y="336" text-anchor="middle" fill="var(--faint)" font-size="10">ConcurrentHashMap</text></g>
+        </svg>
+      </div>
+      <div class="node-detail"><span class="nd-title">Click any class</span><div class="nd-body">Its responsibility, key methods, and how it is wired appear here. The dashed arrows are <i>implements</i> / <i>references</i>; solid arrows are <i>uses</i>. Notice the Service depends only on the two <b>«interface»</b> boxes and the <code>Algorithm</code> enum — that is what makes the five strategies and the rule store swappable.</div></div>
+    </div>
+  </section>
+
+  <!-- B · TOKEN BUCKET ALGORITHM -->
+  <section>
+    <div class="sec-h"><span class="n">B</span><h2>Token Bucket — the core algorithm</h2><span class="tag">TokenBucketStrategy</span></div>
+    <div class="grid g2">
+      <div class="card">
+        <div class="kicker">the code (verbatim)</div>
+        <pre class="code"><span class="kw">public</span> RateLimitResult <span class="ty">tryConsume</span>(String key, RateLimitRule rule) {
+  TokenBucket b = buckets.computeIfAbsent(key,
+    k -&gt; <span class="kw">new</span> TokenBucket(rule.getBurstCapacity(),
+                        rule.getMaxRequests(),
+                        rule.getWindowSizeMs()));
+  <span class="kw">synchronized</span> (b) {                 <span class="cm">// per-key lock</span>
+    <span class="kw">long</span> now = System.currentTimeMillis();
+    b.refill(now);                     <span class="cm">// += elapsed * rate</span>
+    <span class="kw">if</span> (b.tokens &gt;= <span class="num">1.0</span>) {
+      b.tokens -= <span class="num">1.0</span>;
+      <span class="kw">int</span> rem = (<span class="kw">int</span>) b.tokens;
+      <span class="kw">return</span> RateLimitResult.allowed(rem, ...);
+    } <span class="kw">else</span> {
+      <span class="kw">long</span> retry = (<span class="kw">long</span>)((<span class="num">1.0</span> - b.tokens) / b.refillRatePerMs);
+      <span class="kw">return</span> RateLimitResult.rejected(..., retry, ...);
+    }
+  }
+}</pre>
+        <p class="muted"><code>refillRatePerMs = maxRequests / windowSizeMs</code>; the bucket starts <b>full</b> at <code>capacity = burstCapacity</code> (which defaults to maxRequests).</p>
+      </div>
+      <div class="card">
+        <div class="kicker">worked example — rule: 5 req / 10 s, 7 rapid hits</div>
+        <pre class="code"><span class="cm">// capacity=5, rate = 5/10000 = 0.0005 tok/ms</span>
+<span class="cm">// bucket starts full: tokens = 5.0</span>
+
+req 1  tokens 5.0 &gt;= 1 → <span class="st">ALLOW</span>  tokens=4.0
+req 2  tokens 4.0 &gt;= 1 → <span class="st">ALLOW</span>  tokens=3.0
+req 3  tokens 3.0 &gt;= 1 → <span class="st">ALLOW</span>  tokens=2.0
+req 4  tokens 2.0 &gt;= 1 → <span class="st">ALLOW</span>  tokens=1.0
+req 5  tokens 1.0 &gt;= 1 → <span class="st">ALLOW</span>  tokens=0.0
+req 6  tokens 0.0 &lt; 1  → <span class="st">DENY</span>   429
+         retryAfter = (1-0)/0.0005 = <span class="num">2000</span> ms
+req 7  tokens 0.0 &lt; 1  → <span class="st">DENY</span>   429
+
+result → <b>5 allowed, 2 denied</b></pre>
+        <p class="muted">Wait 2 s and one token refills (<code>2000ms × 0.0005 = 1.0</code>), so the next request is allowed again. Bursts up to capacity are absorbed; the long-run rate stays at 5 / 10 s.</p>
+      </div>
+    </div>
+    <div class="callout tip"><b>Why Token Bucket as the default?</b> It gives the smooth long-term rate of a leaky bucket <i>plus</i> a configurable burst allowance (<code>burstCapacity</code>), all in O(1) state per key — just a token count and a last-refill timestamp. Refill is computed lazily on read (<code>elapsed × rate</code>) rather than by a background thread, so there is nothing to schedule. That combination is why AWS API Gateway, Stripe, and most gateways reach for it first.</div>
+  </section>
+
+  <!-- C · STRATEGIES COMPARED (tabs) -->
+  <section>
+    <div class="sec-h"><span class="n">C</span><h2>The five algorithms (Strategy pattern)</h2><span class="tag">swap the algorithm, not the service</span></div>
+    <div data-tabscope>
+      <div class="tabs">
+        <button class="tab active" data-tab="tb">Token Bucket</button>
+        <button class="tab" data-tab="lb">Leaky Bucket</button>
+        <button class="tab" data-tab="fw">Fixed Window</button>
+        <button class="tab" data-tab="swl">Sliding Log</button>
+        <button class="tab" data-tab="swc">Sliding Counter</button>
+      </div>
+      <div class="tabpanel active" data-panel="tb">
+        <p><b>TokenBucketStrategy</b> — tokens refill at a steady rate up to capacity; each request spends one. <span class="run">algorithm() = TOKEN_BUCKET · the default rule uses it</span></p>
+        <ul class="tight">
+          <li><b>Bursts:</b> yes — up to <code>burstCapacity</code>, then throttled to the refill rate.</li>
+          <li><b>Memory:</b> O(1) per key (token count + last-refill time).</li>
+          <li><b>Best for:</b> API gateways that want smooth average rate with headroom for spikes.</li>
+        </ul>
+      </div>
+      <div class="tabpanel" data-panel="lb">
+        <p><b>LeakyBucketStrategy</b> — a FIFO queue drained at a constant rate; overflow is rejected. <span class="run">algorithm() = LEAKY_BUCKET</span></p>
+        <ul class="tight">
+          <li><b>Bursts:</b> no — output is perfectly smoothed to a constant rate.</li>
+          <li><b>Memory:</b> O(N) per key — holds queued request timestamps.</li>
+          <li><b>Best for:</b> traffic shaping / protecting a downstream that needs a steady feed.</li>
+        </ul>
+      </div>
+      <div class="tabpanel" data-panel="fw">
+        <p><b>FixedWindowCounterStrategy</b> — one counter per fixed window; reset on window rollover. <span class="run">algorithm() = FIXED_WINDOW</span></p>
+        <ul class="tight">
+          <li><b>Accuracy:</b> low — the <b>boundary spike</b> lets a client push up to 2× the limit across a window edge.</li>
+          <li><b>Memory:</b> O(1) per key — a single <code>AtomicInteger</code> + window start.</li>
+          <li><b>Best for:</b> simple, cheap counters where approximate limits are fine.</li>
+        </ul>
+      </div>
+      <div class="tabpanel" data-panel="swl">
+        <p><b>SlidingWindowLogStrategy</b> — a sorted timestamp log; evict-then-count on every request. <span class="run">algorithm() = SLIDING_WINDOW_LOG</span></p>
+        <ul class="tight">
+          <li><b>Accuracy:</b> exact — no boundary problem at all.</li>
+          <li><b>Memory:</b> O(N) per key — one entry per in-window request (can be millions).</li>
+          <li><b>Best for:</b> precise billing / quotas where every request must be counted exactly.</li>
+        </ul>
+      </div>
+      <div class="tabpanel" data-panel="swc">
+        <p><b>SlidingWindowCounterStrategy</b> — weighted blend of the previous and current window counts. <span class="run">algorithm() = SLIDING_WINDOW_COUNTER</span></p>
+        <ul class="tight">
+          <li><b>Accuracy:</b> high — <code>prev*(1-overlap)+current</code> catches the spike, within ~0.003% of an exact log.</li>
+          <li><b>Memory:</b> O(1) per key — just two counters and a window start.</li>
+          <li><b>Best for:</b> production APIs — the accuracy of a log at the cost of a fixed window.</li>
+        </ul>
+      </div>
+    </div>
+    <table>
+      <thead><tr><th>Algorithm</th><th>Memory / key</th><th>Accuracy</th><th>Bursts?</th><th>Best for</th></tr></thead>
+      <tbody>
+        <tr><td>Token Bucket</td><td>O(1)</td><td>approx</td><td>yes (to capacity)</td><td>API gateways</td></tr>
+        <tr><td>Leaky Bucket</td><td>O(N)</td><td>exact rate</td><td>no (smoothed)</td><td>traffic shaping</td></tr>
+        <tr><td>Fixed Window</td><td>O(1)</td><td>low (boundary)</td><td>at edges</td><td>simple counters</td></tr>
+        <tr><td>Sliding Window Log</td><td>O(N)</td><td>exact</td><td>no</td><td>precise billing</td></tr>
+        <tr><td>Sliding Window Counter</td><td>O(1)</td><td>high</td><td>smoothed</td><td>production APIs</td></tr>
+      </tbody>
+    </table>
+    <div class="callout"><b>The pattern:</b> <code>RateLimiterService</code> holds a <code>Map&lt;Algorithm,RateLimiterStrategy&gt;</code> and never branches on algorithm type — it just does <code>strategies.get(rule.getAlgorithm()).tryConsume(key, rule)</code>. Adding a sixth algorithm is a new class + one <code>put</code> in <code>AppConfig.createStrategies()</code>, with <b>zero</b> changes to the service, controller, or repository (Open-Closed Principle). Because the algorithm is read from the rule per request, an admin can even switch a key's algorithm live — the next request picks the new strategy.</div>
+  </section>
+
+  <!-- D · DATA MODEL -->
+  <section>
+    <div class="sec-h"><span class="n">D</span><h2>Data model detail</h2><span class="tag">RateLimitRule · RateLimitResult · RequestContext</span></div>
+    <div class="grid g2">
+      <div class="card">
+        <div class="kicker">RateLimitRule — the config entity (Builder)</div>
+        <pre class="code">id            String   <span class="cm">// defaults to key</span>
+key           String   <span class="cm">// "clientId:endpoint"</span>
+maxRequests   int      <span class="cm">// &gt; 0 (validated)</span>
+windowSizeMs  long     <span class="cm">// &gt; 0 (validated)</span>
+algorithm     Algorithm <span class="cm">// default TOKEN_BUCKET</span>
+burstCapacity int      <span class="cm">// -1 → maxRequests</span>
+enabled       boolean  <span class="cm">// default true</span></pre>
+        <p class="muted">Fully immutable — set once through <code>builder(key, maxRequests, windowSizeMs)</code> and never mutated. <code>build()</code> enforces the two positivity invariants; the <code>-1</code> burst sentinel means "no separate burst, use maxRequests". In a SQL store this is a <code>rules</code> table with <code>PRIMARY KEY(key)</code>.</p>
+      </div>
+      <div class="card">
+        <div class="kicker">RateLimitResult — the check outcome</div>
+        <pre class="code">allowed       boolean
+remaining     int      <span class="cm">// tokens/slots left</span>
+retryAfterMs  long     <span class="cm">// 0 when allowed</span>
+limit         int      <span class="cm">// rule.maxRequests</span>
+resetAtMs     long     <span class="cm">// epoch ms of reset</span>
+
+<span class="cm">// factories</span>
+allowed(remaining, limit, resetAtMs)
+rejected(limit, retryAfterMs, resetAtMs)</pre>
+        <p class="muted">Immutable, private constructor, two named factories. <code>getHeaders()</code> maps the fields to <code>X-RateLimit-Limit / -Remaining / -Reset</code> and adds <code>Retry-After</code> only when denied — the exact headers the controller writes back.</p>
+      </div>
+    </div>
+    <div class="callout tip"><b>The key is the whole game:</b> <code>RequestContext.getRateLimitKey()</code> returns <code>clientId + ":" + endpoint</code>, so limits are per-user-per-endpoint by default. That same string is the lookup key into the rule store <i>and</i> the per-key bucket/counter map inside each strategy — one identifier threads through resolution, rule lookup, and state. Change the key shape (IP-based, API-key-based, per-tenant) and the entire granularity of the limiter changes with it.</div>
+  </section>
+
+  <!-- E · REQUEST SEQUENCES -->
+  <section>
+    <div class="sec-h"><span class="n">E</span><h2>Request handling sequence</h2><span class="tag">which class does what, in order</span></div>
+
+    <div class="collapsible open">
+      <div class="c-head"><h3>Request ALLOWED &nbsp;→&nbsp; 200 OK</h3></div>
+      <div class="c-body">
+        <pre class="code"><span class="cm">Controller.handleRequest(ctx)</span>
+  └─ Service.checkRateLimit(ctx)
+       1  key = ctx.getRateLimitKey()      <span class="cm">// "alice:/api/orders"</span>
+       2  rule = ruleRepository.findByKey(key)
+              .orElse(defaultRule)          <span class="cm">// fall back if unset</span>
+       3  rule.isEnabled()? no → allowed(max, max, 0)
+       4  strategy = strategies.get(rule.getAlgorithm())
+              null? → IllegalStateException  <span class="cm">// config error</span>
+       5  strategy.tryConsume(key, rule):
+              computeIfAbsent(key) → bucket
+              synchronized(bucket): refill → tokens &gt;= 1
+              tokens -= 1 → RateLimitResult.allowed(rem, ...)
+  └─ result.getHeaders() → X-RateLimit-* printed
+  └─ [200 OK]  remaining = rem</pre>
+      </div>
+    </div>
+
+    <div class="collapsible open">
+      <div class="c-head"><h3>Request REJECTED &nbsp;→&nbsp; 429 Too Many Requests</h3></div>
+      <div class="c-body">
+        <pre class="code"><span class="cm">Controller.handleRequest(ctx)</span>
+  └─ Service.checkRateLimit(ctx)
+       1  key = ctx.getRateLimitKey()
+       2  rule = ruleRepository.findByKey(key).orElse(defaultRule)
+       3  strategy.tryConsume(key, rule):
+              synchronized(bucket): refill → tokens &lt; 1.0
+              retryAfter = (1 - tokens) / refillRatePerMs
+              return RateLimitResult.rejected(limit, retryAfter, resetAt)
+  └─ headers include Retry-After: &lt;ms&gt;
+  └─ [429 Too Many Requests]</pre>
+        <p class="muted">Note the controller returns the <code>RateLimitResult</code> either way — it is the caller (a real filter) that would short-circuit the chain on 429 and never invoke business logic. The service itself is pure: context in, result out, no side effects beyond the per-key counter.</p>
+      </div>
+    </div>
+
+    <div class="collapsible">
+      <div class="c-head"><h3>Admin switches a key's algorithm &nbsp;→&nbsp; live, no restart</h3></div>
+      <div class="c-body">
+        <pre class="code"><span class="cm">RuleService.updateRule(key, newRule)</span>   <span class="cm">// algorithm=SLIDING_WINDOW_COUNTER</span>
+  1  repository.exists(key)? no → RuleNotFoundException
+  2  repository.save(newRule)                <span class="cm">// map.put(key, newRule)</span>
+
+<span class="cm">═══ next request from that key ═══</span>
+Service.checkRateLimit(ctx)
+  → findByKey(key) = newRule
+  → strategies.get(SLIDING_WINDOW_COUNTER)   <span class="cm">// different impl</span>
+  → tryConsume(...)                          <span class="cm">// new algorithm in effect</span></pre>
+        <p class="muted">Because the strategy is resolved per request from the rule's <code>algorithm</code> field, changing the rule instantly changes the algorithm — no redeploy, no restart.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- F · DESIGN PATTERNS -->
+  <section>
+    <div class="sec-h"><span class="n">F</span><h2>Design patterns used</h2><span class="tag">GoF-categorized</span></div>
+    <div class="grid g3">
+      <div class="card">
+        <div class="kicker">Creational</div>
+        <ul class="tight">
+          <li><b>Builder</b> — <code>RateLimitRule.builder(key, max, window)</code>. Required fields via constructor, optional fields with defaults, validation in <code>build()</code>.</li>
+          <li><b>Factory</b> — <code>AppConfig</code> static methods (<code>createStrategies</code>, <code>createDefaultService</code>, <code>createController</code>) centralise all wiring — the composition root.</li>
+        </ul>
+      </div>
+      <div class="card">
+        <div class="kicker">Behavioral</div>
+        <ul class="tight">
+          <li><b>Strategy</b> — <code>RateLimiterStrategy</code> + the five algorithms. The centrepiece: swap the algorithm per rule without touching the service.</li>
+          <li><b>Chain of Responsibility</b> — the limiter is one link (auth → rate-limit → authorization → business logic); a 429 short-circuits the chain. Conceptual here, a Filter/Interceptor in production.</li>
+          <li><b>Template Method</b> — every <code>tryConsume</code> follows the same skeleton: get-or-create state → refill/rotate → decide → build result.</li>
+        </ul>
+      </div>
+      <div class="card">
+        <div class="kicker">Architectural (not GoF)</div>
+        <ul class="tight">
+          <li><b>Repository</b> — <code>RuleRepository</code> → <code>InMemoryRuleRepository</code>. Decouples logic from storage; swap in Redis/Postgres with no service change (Dependency Inversion).</li>
+          <li><b>Dependency Injection</b> — constructor injection throughout, wired by hand in AppConfig (Spring @Configuration in production).</li>
+        </ul>
+      </div>
+    </div>
+    <div class="callout"><b>Why they cluster:</b> Strategy + Repository + DI together deliver the Open-Closed Principle — new algorithms and new rule stores are <i>additions</i>, never edits. Builder keeps the rule immutable and self-validating; the <code>ConcurrentHashMap</code> + per-key <code>synchronized</code>/<code>AtomicInteger</code> keep each key's counter thread-safe without a global lock. <span class="run">→ distributed counters (Redis + Lua) &amp; fail-open vs fail-closed on canvas 3</span></div>
+  </section>
+
+  <!-- RUN IT -->
+  <section>
+    <div class="sec-h"><span class="n">▶</span><h2>Run it — repo file map</h2><span class="tag">concept → actual Java class</span></div>
+    <table>
+      <thead><tr><th>Concept above</th><th>File in <code>02-rate-limiter/src/main/java/…/ratelimiter/</code></th></tr></thead>
+      <tbody>
+        <tr><td>Composition root / wiring</td><td><code>config/AppConfig.java</code></td></tr>
+        <tr><td>Simulated middleware</td><td><code>controller/RateLimiterController.java</code></td></tr>
+        <tr><td>Orchestrator (key → rule → strategy)</td><td><code>service/RateLimiterService.java</code></td></tr>
+        <tr><td>Rule CRUD</td><td><code>service/RuleService.java</code></td></tr>
+        <tr><td>Strategy contract</td><td><code>strategy/RateLimiterStrategy.java</code></td></tr>
+        <tr><td>Algorithms (§B, §C)</td><td><code>strategy/TokenBucketStrategy.java</code> · <code>LeakyBucketStrategy.java</code> · <code>FixedWindowCounterStrategy.java</code> · <code>SlidingWindowLogStrategy.java</code> · <code>SlidingWindowCounterStrategy.java</code></td></tr>
+        <tr><td>Rule store contract + impl</td><td><code>repository/RuleRepository.java</code> · <code>InMemoryRuleRepository.java</code></td></tr>
+        <tr><td>Domain models (§D)</td><td><code>model/RateLimitRule.java</code> · <code>RateLimitResult.java</code> · <code>RequestContext.java</code> · <code>Algorithm.java</code></td></tr>
+        <tr><td>Exceptions</td><td><code>exception/RuleNotFoundException.java</code> · <code>RateLimitExceededException.java</code></td></tr>
+        <tr><td>Time / window math</td><td><code>util/TimeUtils.java</code></td></tr>
+        <tr><td>Runnable demo (main)</td><td><code>RateLimiterApp.java</code></td></tr>
+      </tbody>
+    </table>
+    <div class="callout tip"><b>Run the demo</b> (Gradle <code>application</code> plugin, mainClass <code>RateLimiterApp</code>, no framework):<br><pre class="code">./gradlew :02-rate-limiter:run</pre>It fires a Token-Bucket burst (5 allowed / 2 denied), demonstrates the Fixed-Window boundary spike, shows the Sliding-Window Counter catching it, compares all five algorithms, and runs multiple clients to prove per-key isolation.</div>
+  </section>
+
+  <!-- GLOSSARY -->
+  <section>
+    <div class="sec-h"><span class="n">§</span><h2>Glossary — one-liners</h2><span class="tag">terms used above</span></div>
+    <div class="grid g2">
+      <div class="card"><table><tbody>
+        <tr><td><b>Strategy pattern</b></td><td>family of interchangeable algorithms behind one interface, chosen at runtime</td></tr>
+        <tr><td><b>Builder pattern</b></td><td>fluent construction of an immutable object with required + optional fields</td></tr>
+        <tr><td><b>Repository pattern</b></td><td>interface over data access so the store can be swapped without touching logic</td></tr>
+        <tr><td><b>Chain of Responsibility</b></td><td>handlers passed a request in order; any link can short-circuit (429)</td></tr>
+        <tr><td><b>Open-Closed Principle</b></td><td>open to extension (new strategy classes), closed to modification (no edits)</td></tr>
+      </tbody></table></div>
+      <div class="card"><table><tbody>
+        <tr><td><b>Token Bucket</b></td><td>tokens refill at a steady rate up to capacity; each request spends one</td></tr>
+        <tr><td><b>Boundary spike</b></td><td>fixed-window flaw: ~2× the limit by clustering across a window edge</td></tr>
+        <tr><td><b>Weighted count</b></td><td>sliding counter's <code>prev*(1-overlap)+current</code> approximation</td></tr>
+        <tr><td><b>ConcurrentHashMap</b></td><td>lock-striped map giving safe concurrent per-key reads/writes</td></tr>
+        <tr><td><b>Per-key locking</b></td><td><code>synchronized(bucket)</code> / AtomicInteger — no global bottleneck</td></tr>
+      </tbody></table></div>
+    </div>
+  </section>
+
+  <footer>
+    <p>Use case 02 · Rate Limiter — Canvas 2 of 3 (LLD). Grounded in <code>02-rate-limiter/docs/lld/</code>, <code>docs/patterns/</code>, and the Java under <code>src/main/java/com/systemdesign/ratelimiter</code>.</p>
+    <p class="run">This use case: <a href="hld.html">Canvas 1 · HLD</a> · LLD · <a href="deepdive.html">Canvas 3 · Deep-dive &amp; Trade-offs</a> &nbsp;|&nbsp; Next → <a href="deepdive.html">Canvas 3 · Deep-dive &amp; Trade-offs</a> &nbsp;|&nbsp; <a href="../index.html">Hub</a></p>
+  </footer>
+
+</div>
+<script src="../assets/canvas.js"></script>
+</body>
+</html>

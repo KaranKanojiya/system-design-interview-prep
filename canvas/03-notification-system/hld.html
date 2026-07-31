@@ -1,0 +1,271 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>03 · Notification System — HLD</title>
+<link rel="stylesheet" href="../assets/canvas.css">
+</head>
+<body>
+<div class="wrap">
+
+  <header class="hero">
+    <h1>Notification System — High-Level Design</h1>
+    <div class="sub">Use case 03 · Canvas 1 of 3. The big picture: requirements, back-of-envelope numbers, and an <b>interactive architecture diagram</b> — click a component to see its role, then step through the send (write) and in-app/tracking (read) request flows.</div>
+    <div class="badges">
+      <span class="badge lvl">Use case 03 · HLD</span>
+      <span class="badge">Canvas 1 of 3</span>
+      <span class="badge">interactive</span>
+      <span class="badge">AP · at-least-once · 1B/day</span>
+    </div>
+    <div class="legend">
+      <span><i class="dot" style="background:var(--eden)"></i> click a component</span>
+      <span><i class="dot" style="background:var(--survivor)"></i> orchestrator / write path</span>
+      <span><i class="dot" style="background:var(--eden)"></i> current step</span>
+      <span><i class="dot" style="background:var(--old)"></i> data stores</span>
+      <span><i class="dot" style="background:var(--warn)"></i> async / off hot-path</span>
+    </div>
+  </header>
+
+  <!-- A · PROBLEM & REQUIREMENTS -->
+  <section>
+    <div class="sec-h"><span class="n">A</span><h2>Problem &amp; requirements</h2><span class="tag">clarify first</span></div>
+    <div class="grid g2">
+      <div class="card">
+        <div class="kicker">functional</div>
+        <ul class="tight">
+          <li><b>Multi-channel send</b> — push (FCM/APNs), email (SES/SendGrid), SMS (Twilio), in-app; one or many channels per request.</li>
+          <li><b>Preferences</b> — opt-in/out per channel, quiet hours (no non-critical 10 PM–8 AM), per-channel frequency caps.</li>
+          <li><b>Templates</b> with <code>{{variable}}</code> substitution &amp; localization; <b>priority</b> CRITICAL/HIGH/MEDIUM/LOW.</li>
+          <li>Scheduled delivery, retry w/ backoff, delivery tracking, batch (segment) send, idempotent dedup.</li>
+        </ul>
+      </div>
+      <div class="card">
+        <div class="kicker">non-functional</div>
+        <ul class="tight">
+          <li><b>Delivery guarantee</b> at-least-once — a missed OTP is unacceptable; a duplicate is tolerable (→ AP system).</li>
+          <li><b>Latency</b> CRITICAL &lt; 1 s end-to-end · HIGH &lt; 5 s · MEDIUM/LOW &lt; 30 s.</li>
+          <li><b>Throughput</b> 50K/s at peak · <b>availability</b> 99.9%.</li>
+          <li>Dedup via idempotency key (24 h TTL); global ordering not required; horizontal scaling everywhere.</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <!-- B · ESTIMATION -->
+  <section>
+    <div class="sec-h"><span class="n">B</span><h2>Back-of-envelope estimation</h2><span class="tag">1B notifications/day</span></div>
+    <div class="chips">
+      <div class="chip"><span class="k">Notifications/day</span><span class="v">1 B</span></div>
+      <div class="chip"><span class="k">Avg throughput</span><span class="v">~12K/s</span></div>
+      <div class="chip"><span class="k">Peak throughput</span><span class="v">~50K/s</span></div>
+      <div class="chip"><span class="k">Channel split</span><span class="v">P60 · E25 · S10 · A5</span></div>
+      <div class="chip"><span class="k">Payload</span><span class="v">~200 B</span></div>
+      <div class="chip"><span class="k">Storage / day</span><span class="v">~200 GB</span></div>
+      <div class="chip"><span class="k">Hot (30 d)</span><span class="v">~6 TB</span></div>
+      <div class="chip"><span class="k">Critical SLA</span><span class="v">&lt; 1 s</span></div>
+    </div>
+    <div class="callout tip"><b>Derivation:</b> 1B/day ÷ 86,400 s ≈ ~12K/s average, peaking ~50K/s (~4×). Payload 1B × 200 B ≈ 200 GB/day → ~6 TB per 30-day hot window (+ ~5.4 TB delivery logs), ~73 TB/yr. Split: push 60% (600M) · email 25% (250M) · SMS 10% (100M) · in-app 5%. SMS is only 10% of volume but dominates cost (~$750K/mo). <span class="run">→ full math on canvas 3 &amp; F · Estimation</span></div>
+  </section>
+
+  <!-- C · INTERACTIVE ARCHITECTURE -->
+  <section data-flowscope>
+    <div class="sec-h"><span class="n">C</span><h2>Architecture — click components, then step the flows</h2><span class="tag">the design, from the diagram</span></div>
+    <div>
+      <div class="arch">
+        <svg viewBox="0 0 860 384" width="100%" style="max-width:860px" role="img" aria-label="Notification system architecture">
+          <defs>
+            <marker id="ah" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" fill="var(--muted)"></path></marker>
+          </defs>
+
+          <!-- arrows (drawn first, under the boxes) -->
+          <line class="arrow" x1="106" y1="200" x2="126" y2="200" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"
+                data-flow="write read" data-write="1" data-read="1"
+                data-desc-write="An upstream service (Order, Auth, Marketing…) POSTs /send to the API Gateway with an idempotency key." data-desc-read="A client requests GET /notifications/{user} (in-app inbox) or a status lookup through the gateway."></line>
+          <line class="arrow" x1="226" y1="200" x2="246" y2="200" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"
+                data-flow="write read" data-write="2" data-read="2"
+                data-desc-write="Gateway does auth, rate-limiting and load-balancing, then routes to a stateless Notification Service instance." data-desc-read="Gateway routes the read to a Notification Service instance."></line>
+          <line class="arrow" x1="300" y1="176" x2="302" y2="86" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"
+                data-flow="write" data-write="3"
+                data-desc-write="Dedup check in Redis: SET dedup:{key} NX EX 86400. If the key already exists → return 409, no work done."></line>
+          <line class="arrow" x1="330" y1="176" x2="418" y2="86" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"
+                data-flow="write" data-write="4"
+                data-desc-write="Preference check via Preference Service: channel enabled? quiet hours? frequency cap? Blocked → silently dropped (200)."></line>
+          <line class="arrow" x1="348" y1="178" x2="542" y2="86" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"
+                data-flow="write" data-write="5"
+                data-desc-write="Resolve the template (Template Service, Redis-cached) and substitute {{variables}} into subject/body server-side."></line>
+          <line class="arrow" x1="358" y1="200" x2="430" y2="200" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"
+                data-flow="write" data-write="6"
+                data-desc-write="Publish the ready message to the Kafka topic for its priority (critical/high/medium/low) — decouples ingest from delivery."></line>
+          <line class="arrow" x1="546" y1="200" x2="596" y2="200" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"
+                data-flow="write" data-write="7"
+                data-desc-write="The channel's consumer group (Push/Email/SMS/In-App worker) pulls the message; groups scale independently per priority."></line>
+          <line class="arrow" x1="700" y1="200" x2="738" y2="200" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"
+                data-flow="write" data-write="8"
+                data-desc-write="Worker calls the external provider (FCM/APNs, SES/SendGrid, Twilio). Transient error → backoff retry; permanent → DLQ."></line>
+          <path class="arrow" d="M624,224 L624,278 L320,278 L320,308" fill="none" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"
+                data-flow="write" data-write="9"
+                data-desc-write="On success the worker writes a delivery_log row and sets notification status = SENT in Cassandra."></path>
+
+          <line class="arrow" x1="302" y1="224" x2="302" y2="308" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"
+                data-flow="read" data-read="3"
+                data-desc-read="For an in-app inbox / status read, the service queries Cassandra by (user_id, day) — the notification store."></line>
+          <path class="arrow" d="M782,224 L782,286 L662,286 L662,308" fill="none" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"
+                data-flow="read" data-read="4"
+                data-desc-read="Providers call back via webhooks (SES→SNS, Twilio status callback, FCM receipts) into the Delivery Tracker."></path>
+          <path class="arrow" d="M596,346 L596,372 L352,372 L352,346" fill="none" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"
+                data-flow="read" data-read="5"
+                data-desc-read="Delivery Tracker updates notification status → DELIVERED / BOUNCED / FAILED and appends to delivery_log."></path>
+          <path class="arrow" d="M246,188 C 180,150 110,150 62,178" fill="none" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"
+                data-flow="read" data-read="6"
+                data-desc-read="Service returns the notification list (with unreadCount) or the per-channel status object to the client (200 OK)."></path>
+
+          <!-- static / off-hot-path arrows -->
+          <path class="arrow" d="M780,84 C 660,140 570,150 500,170" fill="none" stroke="var(--muted)" stroke-width="2" stroke-dasharray="4 3" marker-end="url(#ah)"></path>
+          <path class="arrow" d="M636,224 L636,294 L500,294 L500,308" fill="none" stroke="var(--muted)" stroke-width="2" stroke-dasharray="4 3" marker-end="url(#ah)"></path>
+          <line x1="476" y1="62" x2="614" y2="62" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"></line>
+          <text x="612" y="120" fill="var(--faint)" font-size="9">scheduled → due</text>
+          <text x="512" y="292" fill="var(--faint)" font-size="9">permanent fail</text>
+
+          <!-- nodes -->
+          <g data-node style="cursor:pointer" data-title="Clients / upstream services" data-detail="Order, Auth, Social, Marketing services plus the Scheduler (cron). Each POSTs /send or /batch with an <b>X-Idempotency-Key</b>. The system is shared infrastructure — like auth or logging — so every team reuses one pipeline."><rect x="16" y="176" width="90" height="48" rx="9" fill="var(--panel-2)" stroke="var(--eden)"></rect><text x="61" y="197" text-anchor="middle" fill="var(--eden)" font-size="12" font-weight="600">Clients</text><text x="61" y="212" text-anchor="middle" fill="var(--faint)" font-size="9">services</text></g>
+          <g data-node style="cursor:pointer" data-title="API Gateway" data-detail="<b>Role:</b> single entry point — authentication, per-user rate limiting, request validation, load balancing.<br><b>Tech:</b> API Gateway / ALB / Kong.<br>Returns <code>503</code> and lets clients retry if the backbone (Kafka) is unavailable."><rect x="126" y="176" width="100" height="48" rx="9" fill="var(--panel-2)" stroke="var(--border)"></rect><text x="176" y="197" text-anchor="middle" fill="var(--text)" font-size="12" font-weight="600">API Gateway</text><text x="176" y="212" text-anchor="middle" fill="var(--faint)" font-size="9">auth · rate limit</text></g>
+          <g data-node style="cursor:pointer" data-title="Notification Service (orchestrator)" data-detail="<b>Role:</b> the central, <b>stateless</b> orchestrator. Per request: dedup check → preference check → resolve template → assign priority → publish to Kafka.<br><b>Scale:</b> horizontal, 10–50 instances behind the load balancer.<br>Blocked-by-preference requests return 200 (silently dropped); duplicates return 409."><rect x="246" y="176" width="112" height="48" rx="9" fill="var(--panel-2)" stroke="var(--survivor)"></rect><text x="302" y="197" text-anchor="middle" fill="var(--survivor)" font-size="12" font-weight="600">Notification Svc</text><text x="302" y="212" text-anchor="middle" fill="var(--faint)" font-size="9">stateless orchestrator</text></g>
+          <g data-node style="cursor:pointer" data-title="Redis (cache · dedup · rate)" data-detail="<b>Dedup:</b> SET dedup:{key} NX EX 86400 — best-effort idempotency (24 h).<br><b>Rate limiting &amp; frequency caps:</b> INCR + EXPIRE sliding window per user/channel/day.<br><b>Caches:</b> preferences (~95% hit), templates (~99%), device tokens. Sorted sets hold scheduled notifications."><rect x="250" y="40" width="104" height="44" rx="9" fill="var(--panel-2)" stroke="var(--old)"></rect><text x="302" y="60" text-anchor="middle" fill="var(--old)" font-size="12" font-weight="600">Redis</text><text x="302" y="74" text-anchor="middle" fill="var(--faint)" font-size="9">cache · dedup · rate</text></g>
+          <g data-node style="cursor:pointer" data-title="Preference Service" data-detail="<b>Role:</b> for every send, checks channel enabled? quiet hours (defer non-critical to 8 AM)? frequency cap reached? rate-limited?<br><b>Read-heavy</b> — writes are rare (user edits settings). Cache-aside in Redis (1 h TTL), invalidated on PUT. Defaults apply if unset."><rect x="372" y="40" width="104" height="44" rx="9" fill="var(--panel-2)" stroke="var(--border)"></rect><text x="424" y="60" text-anchor="middle" fill="var(--text)" font-size="11" font-weight="600">Preference Svc</text><text x="424" y="74" text-anchor="middle" fill="var(--faint)" font-size="9">quiet hours · caps</text></g>
+          <g data-node style="cursor:pointer" data-title="Template Service" data-detail="<b>Role:</b> stores versioned, per-locale templates; does server-side Mustache-style <code>{{variable}}</code> substitution so every channel renders consistently.<br><b>Store:</b> PostgreSQL, cached in Redis (~99% hit). An <code>active</code> flag controls the live version."><rect x="494" y="40" width="104" height="44" rx="9" fill="var(--panel-2)" stroke="var(--border)"></rect><text x="546" y="60" text-anchor="middle" fill="var(--text)" font-size="11" font-weight="600">Template Svc</text><text x="546" y="74" text-anchor="middle" fill="var(--faint)" font-size="9">render server-side</text></g>
+          <g data-node style="cursor:pointer" data-title="PostgreSQL (preferences · templates)" data-detail="<b>Role:</b> relational store for user_preference and notification_template.<br><b>Why:</b> small (~50 GB prefs, ~10 MB templates), strong consistency needed so an opt-out takes effect immediately (ACID). Single primary + read replicas."><rect x="616" y="40" width="104" height="44" rx="9" fill="var(--panel-2)" stroke="var(--old)"></rect><text x="668" y="60" text-anchor="middle" fill="var(--old)" font-size="12" font-weight="600">PostgreSQL</text><text x="668" y="74" text-anchor="middle" fill="var(--faint)" font-size="9">prefs · templates</text></g>
+          <g data-node style="cursor:pointer" data-title="Scheduler Service" data-detail="<b>Role:</b> handles delayed / scheduled sends. Due messages sit in a time-indexed store (Redis sorted set / Cassandra); a poller (leader-elected, one active) runs every second and re-publishes anything where scheduledAt ≤ now to the right priority topic."><rect x="738" y="40" width="104" height="44" rx="9" fill="var(--panel-2)" stroke="var(--warn)"></rect><text x="790" y="60" text-anchor="middle" fill="var(--warn)" font-size="12" font-weight="600">Scheduler</text><text x="790" y="74" text-anchor="middle" fill="var(--faint)" font-size="9">polls due</text></g>
+          <g data-node style="cursor:pointer" data-title="Kafka — priority topics" data-detail="<b>Role:</b> durable backbone decoupling ingestion from delivery.<br><b>Separate topics per priority</b> (critical/high/medium/low/scheduled/dlq) so a 10M marketing batch never starves an OTP; each group scales independently.<br>Replication factor 3; handles 50K/s comfortably."><rect x="430" y="172" width="116" height="56" rx="9" fill="var(--panel-2)" stroke="var(--warn)"></rect><text x="488" y="196" text-anchor="middle" fill="var(--warn)" font-size="12" font-weight="600">Kafka</text><text x="488" y="211" text-anchor="middle" fill="var(--faint)" font-size="9">priority topics</text></g>
+          <g data-node style="cursor:pointer" data-title="Channel Workers" data-detail="<b>Role:</b> one Kafka consumer group per channel — Push, Email, SMS, In-App. Stateless, auto-scaled on consumer lag (HPA).<br>Look up device token / email / phone, call the provider, then commit the offset only on success. Push &amp; Email batch; SMS sends one-per-call (regulatory)."><rect x="596" y="176" width="104" height="48" rx="9" fill="var(--panel-2)" stroke="var(--border)"></rect><text x="648" y="197" text-anchor="middle" fill="var(--text)" font-size="12" font-weight="600">Channel Workers</text><text x="648" y="212" text-anchor="middle" fill="var(--faint)" font-size="9">consumer groups</text></g>
+          <g data-node style="cursor:pointer" data-title="Provider APIs" data-detail="<b>Push:</b> FCM (Android/Web) + APNs (iOS).<br><b>Email:</b> SES / SendGrid.<br><b>SMS:</b> Twilio / Nexmo.<br>In-App is a direct DB write — no external provider. Provider-level dedup (SES MessageDeduplicationId, FCM collapse_key) backs up idempotency."><rect x="738" y="176" width="104" height="48" rx="9" fill="var(--panel-2)" stroke="var(--border)"></rect><text x="790" y="197" text-anchor="middle" fill="var(--text)" font-size="12" font-weight="600">Providers</text><text x="790" y="212" text-anchor="middle" fill="var(--faint)" font-size="9">FCM · SES · Twilio</text></g>
+          <g data-node style="cursor:pointer" data-title="Cassandra (notification store)" data-detail="<b>Role:</b> notification records + delivery_log + in-app store.<br><b>Why:</b> write-heavy (1B+/day), time-series, built-in TTL for 30-day auto-expiry, linear horizontal scaling, tunable consistency.<br><b>Partition key:</b> (user_id, day_bucket) for efficient per-user reads."><rect x="246" y="308" width="112" height="48" rx="9" fill="var(--panel-2)" stroke="var(--old)"></rect><text x="302" y="329" text-anchor="middle" fill="var(--old)" font-size="12" font-weight="600">Cassandra</text><text x="302" y="344" text-anchor="middle" fill="var(--faint)" font-size="9">notif · logs · in-app</text></g>
+          <g data-node style="cursor:pointer" data-title="Dead Letter Queue (DLQ)" data-detail="<b>Role:</b> catches messages that exhaust retries or hit permanent failures — invalid device token, hard email bounce, unsubscribed, malformed data.<br>Alert if depth &gt; 10K (systemic issue). Supports manual/automated replay once the root cause is fixed."><rect x="430" y="308" width="116" height="48" rx="9" fill="var(--panel-2)" stroke="var(--warn)"></rect><text x="488" y="329" text-anchor="middle" fill="var(--warn)" font-size="12" font-weight="600">DLQ</text><text x="488" y="344" text-anchor="middle" fill="var(--faint)" font-size="9">poison / fail</text></g>
+          <g data-node style="cursor:pointer" data-title="Delivery Tracker" data-detail="<b>Role:</b> stateless webhook receiver for provider callbacks (SES→SNS bounce/complaint, Twilio status, FCM receipts).<br>Updates notification.status → DELIVERED / BOUNCED / FAILED and appends to delivery_log. Backs GET /notifications/{id}/status."><rect x="596" y="308" width="104" height="48" rx="9" fill="var(--panel-2)" stroke="var(--warn)"></rect><text x="648" y="329" text-anchor="middle" fill="var(--warn)" font-size="12" font-weight="600">Delivery Tracker</text><text x="648" y="344" text-anchor="middle" fill="var(--faint)" font-size="9">webhooks</text></g>
+        </svg>
+      </div>
+      <div class="node-detail"><span class="nd-title">Click any component</span><div class="nd-body">Its role, tech choice, and scaling note appear here. Then use the buttons below to step through a request flow.</div></div>
+
+      <div class="flowctl" data-flowctl>
+        <button class="btn" data-flow="write">Send path (write)</button>
+        <button class="btn" data-flow="read">In-app &amp; tracking (read)</button>
+        <span style="flex:1"></span>
+        <button class="btn" data-flowstep="prev">◀ Prev</button>
+        <button class="btn" data-flowstep="next">Next ▶</button>
+      </div>
+      <div class="flowlabel" data-flowlabel>Pick <b>Send</b> or <b>In-app &amp; tracking</b>, then press “Next ▶” to walk the numbered request flow one hop at a time.</div>
+
+      <div class="cloudmap">
+        <div class="kicker" style="margin-top:4px">Managed-service mapping — the same components on each cloud</div>
+        <table class="cloudtable">
+          <thead><tr>
+            <th>Component</th>
+            <th><span class="hdrlogo"><span class="logochip"><img src="../assets/logos/aws.svg" alt="AWS"></span>AWS</span></th>
+            <th><span class="hdrlogo"><span class="logochip"><img src="../assets/logos/gcp.svg" alt="GCP"></span>GCP</span></th>
+            <th><span class="hdrlogo"><span class="logochip"><img src="../assets/logos/azure.svg" alt="Azure"></span>Azure</span></th>
+          </tr></thead>
+          <tbody>
+            <tr><td>API Gateway</td><td><img class="svcicon" src="../assets/logos/services/aws-elb.svg" alt="">API Gateway / ALB</td><td><img class="svcicon" src="../assets/logos/services/gcp-elb.svg" alt="">API Gateway / Endpoints</td><td><img class="svcicon" src="../assets/logos/services/azure-appgw.svg" alt="">API Management</td></tr>
+            <tr><td>Services &amp; Workers</td><td><img class="svcicon" src="../assets/logos/services/aws-ecs.svg" alt="">ECS / EKS</td><td><img class="svcicon" src="../assets/logos/services/gcp-run.svg" alt="">Cloud Run / GKE</td><td><img class="svcicon" src="../assets/logos/services/azure-aks.svg" alt="">AKS / Container Apps</td></tr>
+            <tr><td>Priority queue (Kafka)</td><td><img class="svcicon" src="../assets/logos/services/aws-msk.svg" alt="">MSK (Kafka)</td><td><img class="svcicon" src="../assets/logos/services/gcp-pubsub.svg" alt="">Pub/Sub</td><td><img class="svcicon" src="../assets/logos/services/azure-eventhubs.svg" alt="">Event Hubs (Kafka)</td></tr>
+            <tr><td>Cache (Redis)</td><td><img class="svcicon" src="../assets/logos/services/aws-elasticache.svg" alt="">ElastiCache</td><td><img class="svcicon" src="../assets/logos/services/gcp-memorystore.svg" alt="">Memorystore</td><td><img class="svcicon" src="../assets/logos/services/azure-redis.svg" alt="">Cache for Redis</td></tr>
+            <tr><td>Notification store</td><td><img class="svcicon" src="../assets/logos/services/aws-dynamodb.svg" alt="">DynamoDB / Keyspaces</td><td><img class="svcicon" src="../assets/logos/services/gcp-bigtable.svg" alt="">Bigtable / Firestore</td><td><img class="svcicon" src="../assets/logos/services/azure-cosmos.svg" alt="">Cosmos DB (Cassandra API)</td></tr>
+            <tr><td>Preferences store</td><td>RDS PostgreSQL</td><td>Cloud SQL</td><td>Azure DB for PostgreSQL</td></tr>
+            <tr><td>Push</td><td>SNS + FCM/APNs</td><td>Firebase Cloud Messaging</td><td>Notification Hubs</td></tr>
+            <tr><td>Email</td><td>SES</td><td>SendGrid (3rd party)</td><td>Communication Services</td></tr>
+            <tr><td>SMS</td><td>SNS / Pinpoint</td><td>Twilio (3rd party)</td><td>Communication Services</td></tr>
+            <tr><td>Scheduler</td><td>EventBridge Scheduler</td><td>Cloud Scheduler</td><td>Logic Apps</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+
+  <!-- D · API -->
+  <section>
+    <div class="sec-h"><span class="n">D</span><h2>API design</h2><span class="tag">async accept-and-queue</span></div>
+    <table>
+      <thead><tr><th>Endpoint</th><th>Purpose</th><th>Response</th></tr></thead>
+      <tbody>
+        <tr><td><code>POST /api/notifications/send</code></td><td>send to one user (body: userId, templateId, channels[], priority, data, scheduledAt) · <code>X-Idempotency-Key</code></td><td>202 Accepted + notificationId, PENDING / 409 if duplicate</td></tr>
+        <tr><td><code>POST /api/notifications/batch</code></td><td>send to a segment (userIds[] or segmentId) — staged fan-out</td><td>202 Accepted + batchId, QUEUED</td></tr>
+        <tr><td><code>GET /api/notifications/{userId}?channel=IN_APP</code></td><td>in-app inbox (paged)</td><td>200 + notifications[], unreadCount</td></tr>
+        <tr><td><code>PUT /api/users/{userId}/preferences</code></td><td>update per-channel prefs (enabled, quiet hours, frequency cap)</td><td>200 OK + updated preferences</td></tr>
+        <tr><td><code>GET /api/notifications/{id}/status</code></td><td>per-channel delivery status</td><td>200 + status (PENDING→SENT→DELIVERED / FAILED / BOUNCED)</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <!-- E · DATA MODEL -->
+  <section>
+    <div class="sec-h"><span class="n">E</span><h2>Data model</h2><span class="tag">Cassandra + PostgreSQL</span></div>
+    <div class="grid g2">
+      <div class="card">
+        <div class="kicker">notification (Cassandra — write-heavy, TTL)</div>
+        <pre class="code">id              UUID  <span class="cm">// PK</span>
+user_id         VARCHAR(64)
+template_id     VARCHAR(128)
+channel         VARCHAR(16)  <span class="cm">// PUSH/EMAIL/SMS/IN_APP</span>
+priority        VARCHAR(16)  <span class="cm">// CRITICAL…LOW</span>
+status          VARCHAR(16)  <span class="cm">// PENDING→SENT→…</span>
+data_json       TEXT         <span class="cm">// template vars</span>
+idempotency_key VARCHAR(128)
+scheduled_at    TIMESTAMP
+retry_count     INT
+created_at      TIMESTAMP</pre>
+        <p class="muted">Partition key <code>(user_id, day_bucket)</code>; 30-day TTL auto-cleanup. <code>delivery_log</code> (notification_id, attempt, provider, status) is a sibling append-only table.</p>
+      </div>
+      <div class="card">
+        <div class="kicker">user_preference (PostgreSQL — strong consistency)</div>
+        <pre class="code">user_id           VARCHAR(64)  <span class="cm">// PK</span>
+channel           VARCHAR(16)  <span class="cm">// PK</span>
+enabled           BOOLEAN
+quiet_hours_start TIME         <span class="cm">// e.g. 22:00</span>
+quiet_hours_end   TIME         <span class="cm">// e.g. 08:00</span>
+frequency_cap     INT          <span class="cm">// max/day</span>
+updated_at        TIMESTAMP</pre>
+        <p class="muted">Relational so an opt-out is immediate (ACID). <code>notification_template</code> (subject/body templates, variables, locale, active) also lives here — both cached in Redis.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- F · KEY CHOICES -->
+  <section>
+    <div class="sec-h"><span class="n">F</span><h2>Key design choices (deep-dived on canvas 3)</h2><span class="tag">defend these</span></div>
+    <div class="grid g3">
+      <div class="card"><div class="kicker">queue</div><h3>Kafka · priority topics</h3><p class="muted">Separate topics per priority so a 10M-message marketing batch never starves an OTP; groups scale independently. Beats a single topic with headers, and RabbitMQ/SQS at this throughput. <span class="run">→ canvas 2 · LLD</span></p></div>
+      <div class="card"><div class="kicker">delivery guarantee</div><h3>At-least-once · AP</h3><p class="muted">A missed OTP is unacceptable; a duplicate is tolerable. Best-effort dedup via idempotency key + provider dedup IDs. Exactly-once is too expensive. <span class="run">→ canvas 3</span></p></div>
+      <div class="card"><div class="kicker">storage split</div><h3>Cassandra + PostgreSQL + Redis</h3><p class="muted">Cassandra for write-heavy time-series notifications/logs (TTL); PostgreSQL for small, strongly-consistent prefs/templates; Redis for dedup, rate limits &amp; caches.</p></div>
+    </div>
+  </section>
+
+  <!-- GLOSSARY -->
+  <section>
+    <div class="sec-h"><span class="n">§</span><h2>Glossary — one-liners</h2><span class="tag">terms used above</span></div>
+    <div class="grid g2">
+      <div class="card"><table><tbody>
+        <tr><td><b>At-least-once</b></td><td>every message is delivered ≥ 1 time; duplicates possible, drops not</td></tr>
+        <tr><td><b>Idempotency key</b></td><td>client-supplied ID; a repeat with the same key is deduped (Redis SET NX)</td></tr>
+        <tr><td><b>Priority topic</b></td><td>a Kafka topic per priority so critical traffic isn't stuck behind marketing</td></tr>
+        <tr><td><b>Consumer group</b></td><td>a set of workers that split a topic's partitions to consume in parallel</td></tr>
+        <tr><td><b>Fan-out (staged)</b></td><td>batch worker chunks a segment and throttles publishing to avoid flooding</td></tr>
+      </tbody></table></div>
+      <div class="card"><table><tbody>
+        <tr><td><b>DLQ</b></td><td>dead letter queue — parks messages after retries/permanent failures</td></tr>
+        <tr><td><b>Quiet hours</b></td><td>window (e.g. 10 PM–8 AM) where non-critical notifications are deferred</td></tr>
+        <tr><td><b>Frequency cap</b></td><td>max notifications per user/channel/day to prevent fatigue</td></tr>
+        <tr><td><b>Webhook</b></td><td>provider callback (SES/Twilio/FCM) that reports final delivery status</td></tr>
+        <tr><td><b>AP (CAP)</b></td><td>favour Availability + Partition-tolerance over strong Consistency</td></tr>
+      </tbody></table></div>
+    </div>
+  </section>
+
+  <footer>
+    <p>Use case 03 · Notification System — Canvas 1 of 3 (HLD). Grounded in <code>03-notification-system/docs/hld/</code>.</p>
+    <p class="run">This use case: HLD · <a href="lld.html">Canvas 2 · LLD</a> · <a href="deepdive.html">Canvas 3 · Deep-dive &amp; Trade-offs</a> &nbsp;|&nbsp; Next → <a href="lld.html">02 · LLD</a> &nbsp;|&nbsp; <a href="../index.html">Hub</a></p>
+  </footer>
+
+</div>
+<script src="../assets/canvas.js"></script>
+</body>
+</html>

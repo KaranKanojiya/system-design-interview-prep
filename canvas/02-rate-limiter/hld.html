@@ -1,0 +1,256 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>02 · Rate Limiter — HLD</title>
+<link rel="stylesheet" href="../assets/canvas.css">
+</head>
+<body>
+<div class="wrap">
+
+  <header class="hero">
+    <h1>Rate Limiter — High-Level Design</h1>
+    <div class="sub">Use case 02 · Canvas 1 of 3. The big picture: requirements, back-of-envelope numbers, and an <b>interactive architecture diagram</b> — click a component to see its role, then step through the request-check path and the rule-config path.</div>
+    <div class="badges">
+      <span class="badge lvl">Use case 02 · HLD</span>
+      <span class="badge">Canvas 1 of 3</span>
+      <span class="badge">interactive</span>
+      <span class="badge">AP · fail-open · &lt;5 ms</span>
+    </div>
+    <div class="legend">
+      <span><i class="dot" style="background:var(--eden)"></i> click a component</span>
+      <span><i class="dot" style="background:var(--survivor)"></i> request-check path</span>
+      <span><i class="dot" style="background:var(--eden)"></i> current step</span>
+      <span><i class="dot" style="background:var(--old)"></i> data stores</span>
+      <span><i class="dot" style="background:var(--warn)"></i> async / rule sync</span>
+    </div>
+  </header>
+
+  <!-- A · PROBLEM & REQUIREMENTS -->
+  <section>
+    <div class="sec-h"><span class="n">A</span><h2>Problem &amp; requirements</h2><span class="tag">clarify first</span></div>
+    <p class="muted">A rate limiter controls how many requests a client may send within a time window — the front-line defense against abuse, runaway scripts, noisy tenants, and cascading overload. It runs as <b>middleware</b> in front of every service, not as a standalone REST product.</p>
+    <div class="grid g2">
+      <div class="card">
+        <div class="kicker">functional</div>
+        <ul class="tight">
+          <li>Enforce <b>X requests per Y window per key</b> — key = user ID, IP, API endpoint, or composite (user+endpoint).</li>
+          <li>Return <code>HTTP 429 Too Many Requests</code> with <code>Retry-After</code> when a limit is exceeded.</li>
+          <li><b>Allow-list</b> (VIPs bypass) &amp; <b>deny-list</b> (always reject); configurable rules per endpoint &amp; per tenant.</li>
+          <li>Multiple algorithms selectable per rule; Admin CRUD for rules with hot-reload.</li>
+        </ul>
+      </div>
+      <div class="card">
+        <div class="kicker">non-functional</div>
+        <ul class="tight">
+          <li><b>Latency</b> &lt; 5 ms overhead per request — it sits on every hot path.</li>
+          <li><b>Availability</b> 99.99% — a broken limiter blocks (or floods) the whole platform.</li>
+          <li><b>Scale</b> 10M+ req/s; <b>consistency</b> eventual — brief over-count &lt; blocking legit users.</li>
+          <li><b>Fail-open</b> if Redis is down; hot-reload rules without redeploy.</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <!-- B · ESTIMATION -->
+  <section>
+    <div class="sec-h"><span class="n">B</span><h2>Back-of-envelope estimation</h2><span class="tag">10M req/s · 1 check each</span></div>
+    <div class="chips">
+      <div class="chip"><span class="k">Total QPS</span><span class="v">10M/s</span></div>
+      <div class="chip"><span class="k">RL checks/s</span><span class="v">10M/s</span></div>
+      <div class="chip"><span class="k">Redis / node</span><span class="v">~150K/s</span></div>
+      <div class="chip"><span class="k">Redis nodes</span><span class="v">~14 (hybrid)</span></div>
+      <div class="chip"><span class="k">Active keys</span><span class="v">~50M</span></div>
+      <div class="chip"><span class="k">Counter memory</span><span class="v">~5 GB</span></div>
+      <div class="chip"><span class="k">Rules DB</span><span class="v">~10 MB</span></div>
+      <div class="chip"><span class="k">Latency budget</span><span class="v">&lt;5 ms</span></div>
+    </div>
+    <div class="callout tip"><b>Derivation:</b> every request = 1 check → 10M ops/s. A Redis node does ~150K ops/s, so pure-Redis needs ~67 nodes. Serve the hot 80% from a local counter/cache → only 2M/s hit Redis → <b>~14 nodes</b>. ~50M active client-keys × ~100 B (key + counter + TTL) ≈ <b>5 GB</b> (~15 GB at 3× replication). Rules are tiny: 10K rules × 1 KB ≈ 10 MB — fits any DB. <span class="run">→ full math on canvas 3 · Estimation</span></div>
+  </section>
+
+  <!-- C · INTERACTIVE ARCHITECTURE -->
+  <section data-flowscope>
+    <div class="sec-h"><span class="n">C</span><h2>Architecture — click components, then step the flows</h2><span class="tag">the design, from the diagram</span></div>
+    <div>
+      <div class="arch">
+        <svg viewBox="0 0 840 400" width="100%" style="max-width:840px" role="img" aria-label="Rate limiter architecture">
+          <defs>
+            <marker id="ah" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" fill="var(--muted)"></path></marker>
+          </defs>
+
+          <!-- arrows (drawn first, under the boxes) -->
+          <line class="arrow" x1="104" y1="164" x2="130" y2="164" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"
+                data-flow="read" data-read="1"
+                data-desc-read="Client sends GET /api/v1/orders — the request enters through the API gateway / load balancer."></line>
+          <line class="arrow" x1="224" y1="164" x2="250" y2="164" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"
+                data-flow="read" data-read="2"
+                data-desc-read="Gateway forwards to any stateless app server; the rate-limit middleware intercepts BEFORE the controller."></line>
+          <line class="arrow" x1="314" y1="138" x2="314" y2="92" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"
+                data-flow="read" data-read="3"
+                data-desc-read="Middleware extracts the key (userId + endpoint) and resolves the matching rule from the local Caffeine rules cache (deny-list → allow-list → specific → default)."></line>
+          <line class="arrow" x1="376" y1="164" x2="450" y2="164" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"
+                data-flow="read" data-read="4"
+                data-desc-read="Middleware runs an atomic INCR + EXPIRE Lua script on the Redis counter for this key — one round trip, no read-then-write race."></line>
+          <path class="arrow" d="M370,140 L370,116 L754,116 L754,138" fill="none" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"
+                data-flow="read" data-read="5"
+                data-desc-read="count ≤ limit → ALLOW: forward to the upstream controller and attach X-RateLimit-* headers."></path>
+          <path class="arrow" d="M252,180 C 180,224 108,224 62,192" fill="none" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"
+                data-flow="read" data-read="6"
+                data-desc-read="Response returns with rate-limit headers. count > limit → REJECT with 429 + Retry-After (cached locally 1–2 s to spare Redis)."></path>
+
+          <line class="arrow" x1="128" y1="324" x2="250" y2="324" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"
+                data-flow="write" data-write="1"
+                data-desc-write="Admin creates/updates a rule via POST /admin/rate-limits — persisted in the Rules DB (Postgres)."></line>
+          <line class="arrow" x1="376" y1="324" x2="450" y2="324" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"
+                data-flow="write" data-write="2"
+                data-desc-write="The rule change publishes an invalidation event to Redis Pub/Sub."></line>
+          <path class="arrow" d="M584,318 L616,318 L616,66 L378,66" fill="none" stroke="var(--muted)" stroke-width="2" stroke-dasharray="4 3" marker-end="url(#ah)"
+                data-flow="write" data-write="3"
+                data-desc-write="Every node's Sync Service consumes the event and reloads affected rules into its local cache — also polled every 30–60 s as a safety net."></path>
+
+          <!-- static dashed: cold-load / poll -->
+          <path class="arrow" d="M300,92 L300,140" fill="none" stroke="var(--muted)" stroke-width="1.5" stroke-dasharray="3 3" opacity="0.5"></path>
+          <text x="196" y="248" fill="var(--faint)" font-size="9">allow → forward · reject → 429</text>
+          <text x="626" y="60" fill="var(--faint)" font-size="9">hot-reload</text>
+
+          <!-- nodes -->
+          <g data-node style="cursor:pointer" data-title="Client" data-detail="Any HTTP client — service, browser, mobile, or partner integration. Identified by user ID, API key, or IP. Every request it makes costs exactly one rate-limit check."><rect x="16" y="140" width="88" height="48" rx="9" fill="var(--panel-2)" stroke="var(--eden)"></rect><text x="60" y="169" text-anchor="middle" fill="var(--eden)" font-size="13" font-weight="600">Client</text></g>
+
+          <g data-node style="cursor:pointer" data-title="API Gateway / LB" data-detail="<b>Role:</b> single entry point — SSL termination, routing, health checks; often the first coarse throttle (per-API / per-IP).<br><b>Tech:</b> Nginx / Kong / cloud API gateway.<br><b>Note:</b> managed gateways cover ~80% of simple cases; we build custom middleware only for per-user/per-tenant/composite rules."><rect x="132" y="140" width="92" height="48" rx="9" fill="var(--panel-2)" stroke="var(--border)"></rect><text x="178" y="164" text-anchor="middle" fill="var(--text)" font-size="12" font-weight="600">API GW</text><text x="178" y="179" text-anchor="middle" fill="var(--faint)" font-size="10">/ Load Bal.</text></g>
+
+          <g data-node style="cursor:pointer" data-title="Rate-Limit Middleware (the core)" data-detail="<b>Role:</b> intercepts every request before the controller. Extracts the key, resolves the rule, runs the algorithm against the counter store, and returns allow/deny + headers.<br><b>Stateless:</b> any node handles any request — scale horizontally.<br><b>Pieces:</b> Rules Engine (priority match), Decision Engine (compare vs limit), Header Builder, Sync Service.<br><b>Algorithms:</b> Token Bucket · Leaky Bucket · Fixed Window · Sliding Window Log · Sliding Window Counter — selectable per rule."><rect x="252" y="140" width="124" height="48" rx="9" fill="var(--panel-2)" stroke="var(--survivor)"></rect><text x="314" y="164" text-anchor="middle" fill="var(--survivor)" font-size="12" font-weight="600">RL Middleware</text><text x="314" y="179" text-anchor="middle" fill="var(--faint)" font-size="10">stateless · the core</text></g>
+
+          <g data-node style="cursor:pointer" data-title="Rules Cache (local)" data-detail="<b>Role:</b> in-process cache of rate-limit rules (Caffeine / Guava) so rule lookup adds ~0 latency.<br><b>Why:</b> rules rarely change and are tiny — cache them with a 30–60 s TTL.<br><b>Freshness:</b> Redis Pub/Sub pushes invalidations on admin edits; a poll is the safety net. If sync fails, use stale rules (better than none)."><rect x="252" y="44" width="124" height="48" rx="9" fill="var(--panel-2)" stroke="var(--old)"></rect><text x="314" y="68" text-anchor="middle" fill="var(--old)" font-size="12" font-weight="600">Rules Cache</text><text x="314" y="83" text-anchor="middle" fill="var(--faint)" font-size="10">local · Caffeine</text></g>
+
+          <g data-node style="cursor:pointer" data-title="Redis Cluster (counter store)" data-detail="<b>Role:</b> the authoritative, shared counter store — one counter per key across all nodes.<br><b>Why Redis:</b> atomic INCR / INCRBY, native EXPIRE (counters self-clean at window end), Lua scripts for atomic check-and-increment, sorted sets for Sliding-Window-Log. ~0.1 ms/op.<br><b>Scale:</b> Redis Cluster shards keys across nodes via hash slots. Counters are NOT cached elsewhere — this is the source of truth."><rect x="452" y="140" width="132" height="48" rx="9" fill="var(--panel-2)" stroke="var(--old)"></rect><text x="518" y="164" text-anchor="middle" fill="var(--old)" font-size="12" font-weight="600">Redis Cluster</text><text x="518" y="179" text-anchor="middle" fill="var(--faint)" font-size="10">counters · Lua</text></g>
+
+          <g data-node style="cursor:pointer" data-title="Upstream App Server" data-detail="<b>Role:</b> the actual service/controller the request was headed for. It only ever sees requests the middleware ALLOWED.<br><b>Note:</b> the middleware typically runs in-process on the same server, sitting in the filter chain before business logic."><rect x="700" y="140" width="112" height="48" rx="9" fill="var(--panel-2)" stroke="var(--border)"></rect><text x="756" y="164" text-anchor="middle" fill="var(--text)" font-size="12" font-weight="600">App Server</text><text x="756" y="179" text-anchor="middle" fill="var(--faint)" font-size="10">upstream / controller</text></g>
+
+          <g data-node style="cursor:pointer" data-title="Admin Portal" data-detail="<b>Role:</b> operators define rules — max requests, window, algorithm, key type, allow/deny-lists, per-tenant limits — through the Admin CRUD API.<br><b>Endpoints:</b> POST / GET / PUT / DELETE /admin/rate-limits."><rect x="16" y="300" width="112" height="48" rx="9" fill="var(--panel-2)" stroke="var(--border)"></rect><text x="72" y="324" text-anchor="middle" fill="var(--text)" font-size="12" font-weight="600">Admin Portal</text><text x="72" y="339" text-anchor="middle" fill="var(--faint)" font-size="10">rule CRUD</text></g>
+
+          <g data-node style="cursor:pointer" data-title="Rules DB (Postgres)" data-detail="<b>Role:</b> durable source of truth for rule definitions.<br><b>Why Postgres:</b> dataset is tiny (~10 MB), read-heavy, rarely written — any relational DB or DynamoDB works. Bulk-loaded on startup, polled for changes.<br><b>Not on the hot path:</b> requests read rules from the local cache, never from here."><rect x="252" y="300" width="124" height="48" rx="9" fill="var(--panel-2)" stroke="var(--old)"></rect><text x="314" y="324" text-anchor="middle" fill="var(--old)" font-size="12" font-weight="600">Rules DB</text><text x="314" y="339" text-anchor="middle" fill="var(--faint)" font-size="10">Postgres</text></g>
+
+          <g data-node style="cursor:pointer" data-title="Redis Pub/Sub (rule sync)" data-detail="<b>Role:</b> broadcasts rule-change events so every node invalidates and reloads the affected rule instantly (push), instead of waiting for the next poll.<br><b>Why:</b> gives hot-reload without a redeploy; polling remains as a safety net."><rect x="452" y="300" width="132" height="48" rx="9" fill="var(--panel-2)" stroke="var(--warn)"></rect><text x="518" y="324" text-anchor="middle" fill="var(--warn)" font-size="12" font-weight="600">Redis Pub/Sub</text><text x="518" y="339" text-anchor="middle" fill="var(--faint)" font-size="10">rule sync</text></g>
+        </svg>
+      </div>
+      <div class="node-detail"><span class="nd-title">Click any component</span><div class="nd-body">Its role, tech choice, and scaling note appear here. Then use the buttons below to step through a request flow.</div></div>
+
+      <div class="flowctl" data-flowctl>
+        <button class="btn" data-flow="read">Request-check path</button>
+        <button class="btn" data-flow="write">Rule-config path</button>
+        <span style="flex:1"></span>
+        <button class="btn" data-flowstep="prev">◀ Prev</button>
+        <button class="btn" data-flowstep="next">Next ▶</button>
+      </div>
+      <div class="flowlabel" data-flowlabel>Pick <b>Request-check</b> (the hot path, on every request) or <b>Rule-config</b> (admin edits a rule), then press “Next ▶” to walk it one hop at a time.</div>
+
+      <div class="cloudmap">
+        <div class="kicker" style="margin-top:4px">Managed-service mapping — the same components on each cloud</div>
+        <table class="cloudtable">
+          <thead><tr>
+            <th>Component</th>
+            <th><span class="hdrlogo"><span class="logochip"><img src="../assets/logos/aws.svg" alt="AWS"></span>AWS</span></th>
+            <th><span class="hdrlogo"><span class="logochip"><img src="../assets/logos/gcp.svg" alt="GCP"></span>GCP</span></th>
+            <th><span class="hdrlogo"><span class="logochip"><img src="../assets/logos/azure.svg" alt="Azure"></span>Azure</span></th>
+          </tr></thead>
+          <tbody>
+            <tr><td>API Gateway / LB</td><td><img class="svcicon" src="../assets/logos/services/aws-elb.svg" alt="">API Gateway / ALB</td><td><img class="svcicon" src="../assets/logos/services/gcp-elb.svg" alt="">Cloud LB / Apigee</td><td><img class="svcicon" src="../assets/logos/services/azure-appgw.svg" alt="">App Gateway / APIM</td></tr>
+            <tr><td>Middleware compute</td><td><img class="svcicon" src="../assets/logos/services/aws-ecs.svg" alt="">ECS / EKS</td><td><img class="svcicon" src="../assets/logos/services/gcp-run.svg" alt="">Cloud Run / GKE</td><td><img class="svcicon" src="../assets/logos/services/azure-aks.svg" alt="">AKS / Container Apps</td></tr>
+            <tr><td>Counter store (Redis)</td><td><img class="svcicon" src="../assets/logos/services/aws-elasticache.svg" alt="">ElastiCache</td><td><img class="svcicon" src="../assets/logos/services/gcp-memorystore.svg" alt="">Memorystore</td><td><img class="svcicon" src="../assets/logos/services/azure-redis.svg" alt="">Cache for Redis</td></tr>
+            <tr><td>Rules DB</td><td><img class="svcicon" src="../assets/logos/services/aws-dynamodb.svg" alt="">DynamoDB / RDS</td><td><img class="svcicon" src="../assets/logos/services/gcp-bigtable.svg" alt="">Firestore / Cloud SQL</td><td><img class="svcicon" src="../assets/logos/services/azure-cosmos.svg" alt="">Cosmos DB / SQL DB</td></tr>
+            <tr><td>Rule-sync bus</td><td><img class="svcicon" src="../assets/logos/services/aws-msk.svg" alt="">SNS/SQS · MSK</td><td><img class="svcicon" src="../assets/logos/services/gcp-pubsub.svg" alt="">Pub/Sub</td><td><img class="svcicon" src="../assets/logos/services/azure-eventhubs.svg" alt="">Service Bus / Event Hubs</td></tr>
+            <tr><td>Edge / IP limiting</td><td>CloudFront + WAF</td><td>Cloud CDN + Armor</td><td>Front Door + WAF</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+
+  <!-- D · API -->
+  <section>
+    <div class="sec-h"><span class="n">D</span><h2>API design</h2><span class="tag">middleware, not a service</span></div>
+    <p class="muted">The limiter is invoked <b>internally</b> on every request; it also exposes an <b>Admin CRUD</b> for rules. Client-facing, it only adds response headers (and 429 on reject).</p>
+    <table>
+      <thead><tr><th>Endpoint / call</th><th>Purpose</th><th>Response</th></tr></thead>
+      <tbody>
+        <tr><td><code>isAllowed(clientId, endpoint, ts)</code></td><td>internal hot-path check (called per request)</td><td><code>RateLimitResult</code> { allowed, remaining, retryAfterMs, limit, resetAtMs }</td></tr>
+        <tr><td><code>POST /admin/rate-limits</code></td><td>create a rule</td><td>201 + rule id</td></tr>
+        <tr><td><code>GET /admin/rate-limits[/{id}]</code></td><td>list / fetch rules</td><td>200 + rule(s)</td></tr>
+        <tr><td><code>PUT /admin/rate-limits/{id}</code></td><td>update a rule (triggers hot-reload)</td><td>200</td></tr>
+        <tr><td><code>DELETE /admin/rate-limits/{id}</code></td><td>delete a rule</td><td>204 No Content</td></tr>
+      </tbody>
+    </table>
+    <div class="callout"><b>Response headers</b> (added to every proxied response): <code>X-RateLimit-Limit</code> · <code>X-RateLimit-Remaining</code> · <code>X-RateLimit-Reset</code> — plus <code>Retry-After</code> on a <b>429</b>.</div>
+  </section>
+
+  <!-- E · DATA MODEL -->
+  <section>
+    <div class="sec-h"><span class="n">E</span><h2>Data model</h2><span class="tag">tiny rules · ephemeral counters</span></div>
+    <div class="grid g2">
+      <div class="card">
+        <div class="kicker">RateLimitRule (Postgres → local cache)</div>
+        <pre class="code">id             VARCHAR     <span class="cm">// rule id (defaults to key)</span>
+key            VARCHAR     <span class="cm">// user_id | ip | endpoint | composite</span>
+max_requests   INT         <span class="cm">// e.g. 100</span>
+window_size_ms BIGINT      <span class="cm">// e.g. 60000</span>
+algorithm      ENUM        <span class="cm">// TOKEN_BUCKET, SLIDING_WINDOW_COUNTER…</span>
+burst_capacity INT         <span class="cm">// defaults to max_requests</span>
+enabled        BOOLEAN</pre>
+        <p class="muted">Matches <code>RateLimitRule</code> (Builder pattern) in <code>src</code>. ~10K rows, ~10 MB — bulk-loaded on startup, cached per node.</p>
+      </div>
+      <div class="card">
+        <div class="kicker">Redis counter (ephemeral, per key)</div>
+        <pre class="code"><span class="cm">// key = rl:{clientId}:{endpoint}:{window}</span>
+rl:user-123:/api/orders:202607281430
+   value = 47            <span class="cm">// INCR per request</span>
+   TTL   = window_size   <span class="cm">// EXPIRE — self-cleaning</span>
+
+<span class="cm">// Sliding Window Log variant → Sorted Set</span>
+ZADD  rl:user-123  &lt;ts&gt;  &lt;uuid&gt;
+ZREMRANGEBYSCORE  rl:user-123  0  &lt;win_start&gt;</pre>
+        <p class="muted">Counters never persist — EXPIRE reclaims them at window end. ~50M keys × ~100 B ≈ 5 GB.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- F · KEY CHOICES -->
+  <section>
+    <div class="sec-h"><span class="n">F</span><h2>Key design choices (deep-dived on canvas 3)</h2><span class="tag">defend these</span></div>
+    <div class="grid g3">
+      <div class="card"><div class="kicker">algorithm</div><h3>Sliding Window Counter</h3><p class="muted">Weighted average of two fixed windows — ~99.97% accurate, O(1) memory, no boundary spike. Token Bucket is the other default (natural bursts). All 5 in <span class="run">canvas 2 · LLD</span>.</p></div>
+      <div class="card"><div class="kicker">distributed counting</div><h3>Redis + Lua (atomic)</h3><p class="muted">One shared counter per key; a Lua script does check-and-increment atomically to kill the read-then-write race across nodes. <span class="run">→ canvas 3</span></p></div>
+      <div class="card"><div class="kicker">failure mode</div><h3>AP · fail-open</h3><p class="muted">Redis down → allow rather than block everyone; circuit-breaker + local fallback + alerting. Brief over-count beats a platform outage.</p></div>
+    </div>
+  </section>
+
+  <!-- GLOSSARY -->
+  <section>
+    <div class="sec-h"><span class="n">§</span><h2>Glossary — one-liners</h2><span class="tag">terms used above</span></div>
+    <div class="grid g2">
+      <div class="card"><table><tbody>
+        <tr><td><b>Token Bucket</b></td><td>bucket of tokens refilled at rate R; allows bursts up to capacity B</td></tr>
+        <tr><td><b>Sliding Window Counter</b></td><td>weighted blend of current + previous window counts; O(1), ~99.97% accurate</td></tr>
+        <tr><td><b>Fixed Window</b></td><td>counter per time bucket; simple but allows a 2× spike at the boundary</td></tr>
+        <tr><td><b>Lua script</b></td><td>Redis-side code that runs atomically — no interleaving between read and write</td></tr>
+        <tr><td><b>Composite key</b></td><td>rate-limit key combining fields, e.g. userId + endpoint</td></tr>
+      </tbody></table></div>
+      <div class="card"><table><tbody>
+        <tr><td><b>Fail-open</b></td><td>if the limiter can't check, allow the request (vs fail-closed = deny all)</td></tr>
+        <tr><td><b>429</b></td><td>HTTP "Too Many Requests" — returned with a <code>Retry-After</code> header</td></tr>
+        <tr><td><b>AP (CAP)</b></td><td>favour Availability + Partition-tolerance; counters are eventually consistent</td></tr>
+        <tr><td><b>Read-then-write race</b></td><td>two nodes both read 99, both allow → count hits 101 over the limit</td></tr>
+        <tr><td><b>Hot-reload</b></td><td>apply new rules live via Pub/Sub invalidation — no redeploy</td></tr>
+      </tbody></table></div>
+    </div>
+  </section>
+
+  <footer>
+    <p>Use case 02 · Rate Limiter — Canvas 1 of 3 (HLD). Grounded in <code>02-rate-limiter/docs/hld/</code>.</p>
+    <p class="run">This use case: HLD · <a href="lld.html">Canvas 2 · LLD</a> · <a href="deepdive.html">Canvas 3 · Deep-dive &amp; Trade-offs</a> &nbsp;|&nbsp; Next → <a href="lld.html">02 · LLD</a> &nbsp;|&nbsp; <a href="../index.html">Hub</a></p>
+  </footer>
+
+</div>
+<script src="../assets/canvas.js"></script>
+</body>
+</html>

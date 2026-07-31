@@ -1,0 +1,378 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>06 · Parking Lot — LLD</title>
+<link rel="stylesheet" href="../assets/canvas.css">
+</head>
+<body>
+<div class="wrap">
+
+  <header class="hero">
+    <h1>Parking Lot — Low-Level Design</h1>
+    <div class="sub">Use case 06 · Canvas 2 of 3. From boxes to classes: the actual Java object model of THE classic OOP interview. Start with the <b>interactive class map</b> — click a class to see its responsibility and how <code>AppConfig → Controller → ParkingService (Facade) → Strategy/Repository</code> is wired — then dig into the spot-assignment algorithm, the pluggable strategies, and the park/unpark sequences.</div>
+    <div class="badges">
+      <span class="badge lvl">Use case 06 · LLD</span>
+      <span class="badge">Canvas 2 of 3</span>
+      <span class="badge">interactive</span>
+      <span class="badge">OOP · Strategy · Facade · Singleton · Template Method</span>
+    </div>
+    <div class="legend">
+      <span><i class="dot" style="background:var(--eden)"></i> entry / composition root</span>
+      <span><i class="dot" style="background:var(--survivor)"></i> interface / contract</span>
+      <span><i class="dot" style="background:var(--old)"></i> concrete / singleton</span>
+      <span><i class="dot" style="background:var(--warn)"></i> domain model (abstract / builder)</span>
+      <span><i class="dot" style="background:var(--muted)"></i> click a class for its role</span>
+    </div>
+  </header>
+
+  <!-- A · CLASS DESIGN (interactive class map) -->
+  <section>
+    <div class="sec-h"><span class="n">A</span><h2>Class design — click a class in the map</h2><span class="tag">the object model, wired</span></div>
+    <div>
+      <div class="arch">
+        <svg viewBox="0 0 800 400" width="100%" style="max-width:800px" role="img" aria-label="Parking lot class map">
+          <defs>
+            <marker id="ah" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" fill="var(--muted)"></path></marker>
+          </defs>
+
+          <!-- wiring arrows (under boxes) -->
+          <line class="arrow" x1="90" y1="76" x2="90" y2="122" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"></line>
+          <line class="arrow" x1="160" y1="52" x2="213" y2="128" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"></line>
+          <line class="arrow" x1="160" y1="145" x2="213" y2="145" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"></line>
+          <line class="arrow" x1="285" y1="122" x2="285" y2="76" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"></line>
+          <line class="arrow" x1="355" y1="130" x2="408" y2="42" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"></line>
+          <line class="arrow" x1="355" y1="140" x2="408" y2="101" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"></line>
+          <line class="arrow" x1="355" y1="150" x2="408" y2="160" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"></line>
+          <line class="arrow" x1="355" y1="158" x2="408" y2="232" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"></line>
+          <line class="arrow" x1="285" y1="168" x2="285" y2="302" stroke="var(--muted)" stroke-width="2" stroke-dasharray="4 3" marker-end="url(#ah)"></line>
+          <path class="arrow" d="M550,44 C 600,60 610,90 618,120" fill="none" stroke="var(--muted)" stroke-width="2" stroke-dasharray="4 3" marker-end="url(#ah)"></path>
+          <line class="arrow" x1="690" y1="120" x2="690" y2="78" stroke="var(--muted)" stroke-width="2" stroke-dasharray="4 3" marker-end="url(#ah)"></line>
+          <text x="96" y="106" fill="var(--faint)" font-size="9">wires</text>
+          <text x="168" y="140" fill="var(--faint)" font-size="9">uses</text>
+          <text x="292" y="100" fill="var(--faint)" font-size="9">getInstance</text>
+
+          <!-- nodes -->
+          <g data-node style="cursor:pointer" data-title="AppConfig  (config)" data-detail="<b>Role:</b> composition root / poor-man's DI container (Factory pattern), no framework.<br><b>Wiring:</b> <code>setupParkingLot()</code> builds the Singleton lot with 3 floors (395 spots total) via inline spot-creation helpers; <code>createParkingService(lot)</code> news-up NearestFirstStrategy + HourlyPricingStrategy + an <code>EnumMap&lt;PaymentMethod,PaymentProcessor&gt;</code> (Cash + CreditCard) + InMemoryTicketRepository + DisplayBoard and injects them; <code>createController(service)</code> wraps it. The one place wiring changes."><rect x="20" y="30" width="140" height="46" rx="9" fill="var(--panel-2)" stroke="var(--eden)"></rect><text x="90" y="51" text-anchor="middle" fill="var(--eden)" font-size="12" font-weight="600">AppConfig</text><text x="90" y="66" text-anchor="middle" fill="var(--faint)" font-size="10">composition root</text></g>
+
+          <g data-node style="cursor:pointer" data-title="ParkingController  (controller)" data-detail="<b>Role:</b> framework-free stand-in for a Spring @RestController.<br><b>Methods:</b> <code>handleEntry(VehicleType, plate)</code> → issues a ticket, <code>handleExit(ticketId, method)</code> → returns a Payment, <code>handleAvailability()</code> → prints the board.<br><b>Factory Method:</b> a private <code>createVehicle(type, plate)</code> switch turns the enum into a <code>Car</code> / <code>Motorcycle</code> / <code>Bus</code>.<br>Catches <code>ParkingException</code> and reports friendly messages; all business logic delegates to ParkingService."><rect x="20" y="122" width="140" height="46" rx="9" fill="var(--panel-2)" stroke="var(--border)"></rect><text x="90" y="143" text-anchor="middle" fill="var(--text)" font-size="12" font-weight="600">ParkingController</text><text x="90" y="158" text-anchor="middle" fill="var(--faint)" font-size="10">entry · Factory Method</text></g>
+
+          <g data-node style="cursor:pointer" data-title="ParkingService  «Facade»" data-detail="<b>Role:</b> the Facade / orchestrator — the class an interview candidate is really being asked to design. Holds the lot, a <code>ParkingStrategy</code>, a <code>PricingStrategy</code>, a <code>Map&lt;PaymentMethod,PaymentProcessor&gt;</code>, a <code>TicketRepository</code> and a <code>DisplayBoard</code>, all constructor-injected.<br><b>parkVehicle(v):</b> lot.isFull? → strategy.findSpot(lot,v) → spot.park(v) → Ticket.Builder → repo.save.<br><b>unparkVehicle(id, method):</b> repo.findById → pricing.calculateFee → processor.processPayment → spot.vacate + ticket.markAsPaid.<br>Exposes <code>setParkingStrategy / setPricingStrategy</code> for runtime hot-swap. Depends only on interfaces."><rect x="215" y="122" width="140" height="46" rx="9" fill="var(--panel-2)" stroke="var(--eden)"></rect><text x="285" y="143" text-anchor="middle" fill="var(--eden)" font-size="12" font-weight="600">ParkingService</text><text x="285" y="158" text-anchor="middle" fill="var(--faint)" font-size="10">«Facade» orchestrator</text></g>
+
+          <g data-node style="cursor:pointer" data-title="ParkingLot  «Singleton»" data-detail="<b>Role:</b> the one physical lot — Singleton (double-checked locking, <code>volatile INSTANCE</code>). Private ctor + <code>createInstance(name,address)</code> / <code>getInstance()</code>; <code>resetInstance()</code> is package-private for clean demo runs.<br><b>Holds:</b> a <code>CopyOnWriteArrayList&lt;ParkingFloor&gt;</code> plus entry/exit gates.<br><b>Queries:</b> <code>getTotalCapacity()</code>, <code>getAvailableCount()</code>, <code>isFull()</code> — all stream over the floors. Two instances would mean two availability counts: a data-integrity bug."><rect x="215" y="30" width="140" height="46" rx="9" fill="var(--panel-2)" stroke="var(--old)"></rect><text x="285" y="51" text-anchor="middle" fill="var(--old)" font-size="12" font-weight="600">ParkingLot</text><text x="285" y="66" text-anchor="middle" fill="var(--faint)" font-size="10">«Singleton»</text></g>
+
+          <g data-node style="cursor:pointer" data-title="ParkingStrategy  «interface»" data-detail="<b>Role:</b> the spot-assignment contract — <code>Optional&lt;ParkingSpot&gt; findSpot(ParkingLot lot, Vehicle vehicle)</code> + <code>String name()</code>.<br><b>Why:</b> ParkingService holds this interface only, so the assignment policy swaps without touching service code (Open-Closed).<br><b>Impls:</b> <code>NearestFirstStrategy</code> (scan floors 1→N, first fit) and <code>CompactFloorStrategy</code> (pack the most-full floor first)."><rect x="410" y="18" width="140" height="46" rx="9" fill="var(--panel-2)" stroke="var(--survivor)"></rect><text x="480" y="39" text-anchor="middle" fill="var(--survivor)" font-size="12" font-weight="600">ParkingStrategy</text><text x="480" y="54" text-anchor="middle" fill="var(--faint)" font-size="10">«interface» find spot</text></g>
+
+          <g data-node style="cursor:pointer" data-title="PricingStrategy  «interface»" data-detail="<b>Role:</b> the fee-calculation contract — <code>double calculateFee(ParkingTicket)</code> + <code>name()</code>.<br><b>Impls:</b> <code>HourlyPricingStrategy</code> (ceil(hours) × per-type rate: M $1 / C $2 / B $5, min 1h) and <code>FlatRatePricingStrategy</code> (fixed per-day: M $10 / C $20 / B $50).<br>Both read the ticket's vehicle type + duration; new models (weekend, surge) drop in as new classes."><rect x="410" y="78" width="140" height="46" rx="9" fill="var(--panel-2)" stroke="var(--survivor)"></rect><text x="480" y="99" text-anchor="middle" fill="var(--survivor)" font-size="12" font-weight="600">PricingStrategy</text><text x="480" y="114" text-anchor="middle" fill="var(--faint)" font-size="10">«interface» calc fee</text></g>
+
+          <g data-node style="cursor:pointer" data-title="PaymentProcessor  «interface»" data-detail="<b>Role:</b> the payment contract — <code>Payment processPayment(String ticketId, double amount, PaymentMethod)</code> + <code>supportedMethod()</code>.<br><b>Impls:</b> <code>CashPaymentProcessor</code> (always succeeds) and <code>CreditCardPaymentProcessor</code> (~95% success rate).<br>ParkingService keeps an <code>EnumMap&lt;PaymentMethod,PaymentProcessor&gt;</code> and looks up the right one by method at exit."><rect x="410" y="138" width="140" height="46" rx="9" fill="var(--panel-2)" stroke="var(--survivor)"></rect><text x="480" y="159" text-anchor="middle" fill="var(--survivor)" font-size="12" font-weight="600">PaymentProcessor</text><text x="480" y="174" text-anchor="middle" fill="var(--faint)" font-size="10">«interface» charge</text></g>
+
+          <g data-node style="cursor:pointer" data-title="TicketRepository  «interface»" data-detail="<b>Role:</b> the data-access contract — <code>save</code>, <code>findById</code>, and active-ticket lookups.<br><b>Impl:</b> <code>InMemoryTicketRepository</code> backed by a <code>ConcurrentHashMap&lt;String,ParkingTicket&gt;</code> keyed by ticketId.<br><b>Why:</b> the service talks to the interface, so storage (in-memory today; JDBC/Postgres tomorrow) swaps with zero service changes. A sibling <code>SpotRepository</code> abstracts spot lookups."><rect x="410" y="210" width="140" height="46" rx="9" fill="var(--panel-2)" stroke="var(--survivor)"></rect><text x="480" y="231" text-anchor="middle" fill="var(--survivor)" font-size="12" font-weight="600">TicketRepository</text><text x="480" y="246" text-anchor="middle" fill="var(--faint)" font-size="10">«interface» storage</text></g>
+
+          <g data-node style="cursor:pointer" data-title="Vehicle  «abstract»" data-detail="<b>Role:</b> abstract base of the vehicle hierarchy — <code>licensePlate</code>, <code>vehicleType</code>, <code>entryTime</code>, <code>handicapped</code>; <code>protected</code> ctor so you can never <code>new Vehicle()</code>.<br><b>needsMultipleSpots()</b> is a concrete default <code>false</code>; only <code>Bus</code> overrides it to <code>true</code>.<br><b>Subclasses:</b> <code>Car</code>, <code>Motorcycle</code>, <code>Bus</code> — each fixes its VehicleType. equals/hashCode on the plate."><rect x="620" y="30" width="140" height="46" rx="9" fill="var(--panel-2)" stroke="var(--warn)"></rect><text x="690" y="51" text-anchor="middle" fill="var(--warn)" font-size="12" font-weight="600">Vehicle</text><text x="690" y="66" text-anchor="middle" fill="var(--faint)" font-size="10">«abstract» Car/Moto/Bus</text></g>
+
+          <g data-node style="cursor:pointer" data-title="ParkingSpot  «abstract»" data-detail="<b>Role:</b> abstract base of the spot hierarchy and THE polymorphic core. <code>abstract boolean canFitVehicle(Vehicle)</code> — each subclass declares its own fit rule (Template Method).<br><b>park()/vacate()</b> are <code>synchronized</code> and return <code>boolean</code> — a per-spot lock so two gates can't grab the same spot; <code>status</code> is <code>volatile</code>.<br><b>Subclasses:</b> Compact (car+moto), Large (any), Motorcycle (moto only), Handicapped (handicapped car only)."><rect x="620" y="120" width="140" height="46" rx="9" fill="var(--panel-2)" stroke="var(--warn)"></rect><text x="690" y="141" text-anchor="middle" fill="var(--warn)" font-size="12" font-weight="600">ParkingSpot</text><text x="690" y="156" text-anchor="middle" fill="var(--faint)" font-size="10">«abstract» canFitVehicle</text></g>
+
+          <g data-node style="cursor:pointer" data-title="ParkingTicket  «Builder»" data-detail="<b>Role:</b> the core domain entity, built via the inner <b>Builder</b> (<code>new ParkingTicket.Builder().vehicle(..).spot(..).entryTime(..).build()</code>, which requires vehicle + spot).<br><b>Fields:</b> ticketId, vehicle, spot, entryTime (final) + mutable exitTime, amount, isPaid.<br><b>Logic:</b> <code>calculateHours()</code> from entry→exit (min 1), <code>markAsPaid(amount)</code>. Referenced by pricing + payment at exit."><rect x="215" y="302" width="140" height="46" rx="9" fill="var(--panel-2)" stroke="var(--warn)"></rect><text x="285" y="323" text-anchor="middle" fill="var(--warn)" font-size="12" font-weight="600">ParkingTicket</text><text x="285" y="338" text-anchor="middle" fill="var(--faint)" font-size="10">«Builder» entity</text></g>
+        </svg>
+      </div>
+      <div class="node-detail"><span class="nd-title">Click any class</span><div class="nd-body">Its responsibility, key methods, and how it is wired appear here. Dashed arrows are <i>creates</i> / <i>returns</i> / <i>holds</i>; solid arrows are <i>uses</i> / <i>wires</i>. Notice ParkingService (the <b>Facade</b>) depends only on the four <b>«interface»</b> boxes — that is what makes assignment, pricing, payment, and storage swappable without editing the service.</div></div>
+    </div>
+  </section>
+
+  <!-- B · CORE ALGORITHM -->
+  <section>
+    <div class="sec-h"><span class="n">B</span><h2>Spot assignment + the polymorphic fit check — the core algorithm</h2><span class="tag">ParkingStrategy + canFitVehicle()</span></div>
+    <div class="grid g2">
+      <div class="card">
+        <div class="kicker">the code (verbatim)</div>
+        <pre class="code"><span class="cm">// NearestFirstStrategy — scan floors 1→N</span>
+<span class="kw">public</span> Optional&lt;ParkingSpot&gt; <span class="ty">findSpot</span>(
+        ParkingLot lot, Vehicle vehicle) {
+  <span class="kw">for</span> (ParkingFloor floor : lot.getFloors()) {
+    List&lt;ParkingSpot&gt; available =
+        floor.getAvailableSpots(vehicle);
+    <span class="kw">if</span> (!available.isEmpty())
+      <span class="kw">return</span> Optional.of(available.getFirst());
+  }
+  <span class="kw">return</span> Optional.empty();  <span class="cm">// lot full</span>
+}
+
+<span class="cm">// the polymorphic hook — one per subclass</span>
+<span class="cm">// HandicappedSpot:</span>
+<span class="kw">public boolean</span> <span class="ty">canFitVehicle</span>(Vehicle v) {
+  <span class="kw">return</span> v.getVehicleType() == CAR
+      &amp;&amp; v.isHandicapped();
+}</pre>
+        <p class="muted"><code>floor.getAvailableSpots(vehicle)</code> iterates <b>every</b> spot type and calls <code>spot.canFitVehicle(vehicle)</code> — a virtual dispatch that lands on the right subclass rule.</p>
+      </div>
+      <div class="card">
+        <div class="kicker">worked example — park a handicapped Car, then a Bus</div>
+        <pre class="code"><span class="cm">// canFitVehicle rules (Template Method)</span>
+CompactSpot     → CAR | MOTORCYCLE
+LargeSpot       → true   (any vehicle)
+MotorcycleSpot  → MOTORCYCLE only
+HandicappedSpot → CAR &amp;&amp; isHandicapped
+
+<span class="cm">// 1) handicapped Car, NearestFirst</span>
+floor 1 spots scanned →
+  MotorcycleSpot.canFit(car) = false
+  CompactSpot.canFit(car)    = <span class="st">true</span>  ■
+  HandicappedSpot.canFit(car)= <span class="st">true</span>
+→ first fit wins: <span class="st">F1-C001</span>
+
+<span class="cm">// 2) Bus (needsMultipleSpots = true)</span>
+  CompactSpot.canFit(bus)    = false
+  LargeSpot.canFit(bus)      = <span class="st">true</span>  ■
+→ <span class="st">F1-L001</span></pre>
+        <p class="muted">The service never branches on vehicle or spot type — it just asks each spot <code>canFitVehicle(v)</code> and lets polymorphism decide. Adding an <code>EVSpot</code> is one new subclass, zero edits.</p>
+      </div>
+    </div>
+    <div class="callout tip"><b>Why a Strategy for assignment?</b> <code>NearestFirst</code> optimises the driver's walk (fill floor 1 first); <code>CompactFloor</code> instead picks the <b>most-full</b> floor that still fits (<code>min</code> by <code>getAvailableCount()</code>) to keep whole floors empty for events or to power down unused levels. Same <code>findSpot(lot, vehicle)</code> signature, opposite goal — and <code>ParkingService.setParkingStrategy(...)</code> swaps them at runtime.</div>
+  </section>
+
+  <!-- C · STRATEGIES COMPARED (tabs) -->
+  <section>
+    <div class="sec-h"><span class="n">C</span><h2>The three Strategy families</h2><span class="tag">swap the algorithm, not the service</span></div>
+    <div data-tabscope>
+      <div class="tabs">
+        <button class="tab active" data-tab="park">Parking · findSpot</button>
+        <button class="tab" data-tab="price">Pricing · calculateFee</button>
+        <button class="tab" data-tab="pay">Payment · processPayment</button>
+        <button class="tab" data-tab="beyond">Beyond MVP</button>
+      </div>
+      <div class="tabpanel active" data-panel="park">
+        <p><b>ParkingStrategy</b> — <code>Optional&lt;ParkingSpot&gt; findSpot(lot, vehicle)</code>. <span class="run">default = NearestFirstStrategy</span></p>
+        <ul class="tight">
+          <li><b>NearestFirst:</b> scan floors 1→N, return the first compatible spot — shortest walk from the gate.</li>
+          <li><b>CompactFloor:</b> pick the most-full floor that still fits (<code>min</code> by available count) — concentrates cars, frees whole floors.</li>
+          <li><b>Cost:</b> O(F × S) worst case, short-circuits on first fit.</li>
+        </ul>
+      </div>
+      <div class="tabpanel" data-panel="price">
+        <p><b>PricingStrategy</b> — <code>double calculateFee(ticket)</code>. <span class="run">default = HourlyPricingStrategy</span></p>
+        <ul class="tight">
+          <li><b>Hourly:</b> <code>ceil(hours) × rate</code> per vehicle type — Motorcycle $1, Car $2, Bus $5; minimum 1 hour.</li>
+          <li><b>FlatRate:</b> fixed per-day regardless of duration — Motorcycle $10, Car $20, Bus $50.</li>
+          <li>Both read <code>ticket.getVehicle().getVehicleType()</code> from an <code>EnumMap</code> of rates.</li>
+        </ul>
+      </div>
+      <div class="tabpanel" data-panel="pay">
+        <p><b>PaymentProcessor</b> — <code>Payment processPayment(ticketId, amount, method)</code>. <span class="run">held in an EnumMap by method</span></p>
+        <ul class="tight">
+          <li><b>Cash:</b> always succeeds — the kiosk baseline.</li>
+          <li><b>CreditCard:</b> ~95% success rate to simulate declines; a failed <code>Payment</code> makes the service throw <code>PaymentFailedException</code> (spot stays occupied).</li>
+          <li>Each processor declares <code>supportedMethod()</code>; the service looks up the right one at exit.</li>
+        </ul>
+      </div>
+      <div class="tabpanel" data-panel="beyond">
+        <p>Not in the repo, but the interfaces make them drop-in — implement the interface, register in <code>AppConfig</code>:</p>
+        <ul class="tight">
+          <li><b>DynamicPricingStrategy:</b> surge on occupancy — higher rates as the lot fills.</li>
+          <li><b>ReservationStrategy:</b> honour pre-booked spots (uses the <code>RESERVED</code> SpotStatus already modelled).</li>
+          <li><b>MobilePaymentProcessor:</b> Apple/Google Pay — a new <code>PaymentMethod</code> enum value + one processor.</li>
+        </ul>
+      </div>
+    </div>
+    <table>
+      <thead><tr><th>Aspect</th><th>NearestFirst</th><th>CompactFloor</th><th>Hourly</th><th>FlatRate</th></tr></thead>
+      <tbody>
+        <tr><td>Optimises for</td><td>driver walk</td><td>empty floors / power</td><td>short stays</td><td>all-day / events</td></tr>
+        <tr><td>Selection</td><td>first fit, floor 1→N</td><td>most-full floor first</td><td>ceil(hours) × rate</td><td>fixed per-day</td></tr>
+        <tr><td>Bus example fee</td><td>—</td><td>—</td><td>3h → $15</td><td>$50 flat</td></tr>
+        <tr><td>Hot-swappable</td><td colspan="2">yes — <code>setParkingStrategy()</code></td><td colspan="2">yes — <code>setPricingStrategy()</code></td></tr>
+      </tbody>
+    </table>
+    <div class="callout"><b>The pattern:</b> <code>ParkingService</code> holds one field per strategy family and never branches on type — it calls <code>strategy.findSpot(...)</code>, <code>pricing.calculateFee(...)</code>, <code>processor.processPayment(...)</code>. Three <b>separate small interfaces</b> (not one fat one) is Interface Segregation; adding a new algorithm is a new class + one line in <code>AppConfig</code> with zero service edits (Open-Closed).</div>
+  </section>
+
+  <!-- D · DATA MODEL -->
+  <section>
+    <div class="sec-h"><span class="n">D</span><h2>Data model detail</h2><span class="tag">ParkingTicket · ParkingSpot · enums</span></div>
+    <div class="grid g2">
+      <div class="card">
+        <div class="kicker">ParkingTicket — the entry↔exit record</div>
+        <pre class="code">ticketId    String        <span class="cm">// KEY (repo map key)</span>
+vehicle     Vehicle       <span class="cm">// final</span>
+spot        ParkingSpot   <span class="cm">// final</span>
+entryTime   LocalDateTime <span class="cm">// final</span>
+exitTime    LocalDateTime <span class="cm">// set at exit</span>
+amount      double        <span class="cm">// set on payment</span>
+isPaid      boolean</pre>
+        <p class="muted">Built via the inner <code>Builder</code> (vehicle + spot required). <code>calculateHours()</code> = ceil(entry→exit), min 1; <code>markAsPaid(amount)</code> flips <code>isPaid</code>. Stored in a <code>ConcurrentHashMap&lt;String,ParkingTicket&gt;</code> keyed by ticketId.</p>
+      </div>
+      <div class="card">
+        <div class="kicker">ParkingSpot — state carried per spot</div>
+        <pre class="code">spotId        String   <span class="cm">// final, e.g. F1-C001</span>
+floorNumber   int      <span class="cm">// final</span>
+spotNumber    int      <span class="cm">// final</span>
+spotType      SpotType <span class="cm">// final</span>
+status        SpotStatus <span class="cm">// volatile</span>
+currentVehicle Vehicle <span class="cm">// null when free</span></pre>
+        <p class="muted">Abstract; concrete subtype fixes <code>spotType</code> + <code>canFitVehicle()</code>. <code>park()</code>/<code>vacate()</code> are <code>synchronized</code> (per-spot lock) and return <code>boolean</code> so a losing thread in a race simply gets <code>false</code>.</p>
+      </div>
+    </div>
+    <div class="grid g2">
+      <div class="card">
+        <div class="kicker">the enums that carry behaviour</div>
+        <pre class="code"><span class="kw">enum</span> VehicleType { MOTORCYCLE, CAR, BUS }
+      <span class="cm">// each maps to a default SpotType</span>
+<span class="kw">enum</span> SpotType { MOTORCYCLE_SPOT, COMPACT,
+                LARGE, HANDICAPPED }
+<span class="kw">enum</span> SpotStatus { AVAILABLE, OCCUPIED,
+                  RESERVED, OUT_OF_ORDER }
+      <span class="cm">// canTransitionTo() guards the State m/c</span>
+<span class="kw">enum</span> PaymentMethod { CASH, CREDIT_CARD, DEBIT_CARD }
+<span class="kw">enum</span> PaymentStatus { PENDING, COMPLETED,
+                     FAILED, REFUNDED }</pre>
+      </div>
+      <div class="card">
+        <div class="kicker">Payment — the transaction record</div>
+        <pre class="code">paymentId  String
+ticketId   String
+amount     double
+method     PaymentMethod
+status     PaymentStatus
+timestamp  LocalDateTime</pre>
+        <p class="muted">Produced by a <code>PaymentProcessor</code>. <code>isSuccessful()</code> gates the exit — only a COMPLETED payment lets the service <code>vacate()</code> the spot and mark the ticket paid; a FAILED one throws <code>PaymentFailedException</code>.</p>
+      </div>
+    </div>
+    <div class="callout tip"><b>Enums with behaviour, not flags:</b> <code>VehicleType</code> carries its default <code>SpotType</code>, and <code>SpotStatus.canTransitionTo()</code> encodes the legal state machine (AVAILABLE→OCCUPIED→AVAILABLE, ANY→OUT_OF_ORDER). Putting the rule <i>in</i> the enum kills the <code>if-else</code> chains interviewers hate and keeps the model Open-Closed.</div>
+  </section>
+
+  <!-- E · REQUEST SEQUENCES -->
+  <section>
+    <div class="sec-h"><span class="n">E</span><h2>Request handling sequence</h2><span class="tag">which class does what, in order</span></div>
+
+    <div class="collapsible open">
+      <div class="c-head"><h3>Entry &nbsp;→&nbsp; park a vehicle</h3></div>
+      <div class="c-body">
+        <pre class="code"><span class="cm">Controller.handleEntry(type, plate)</span>
+  1  createVehicle(type, plate)          <span class="cm">// Factory Method → Car/Moto/Bus</span>
+  └─ Service.parkVehicle(vehicle)
+       2  lot.isFull()? → ParkingFullException
+       3  parkingStrategy.findSpot(lot, vehicle)   <span class="cm">// Optional</span>
+            empty? → SpotNotAvailableException
+       4  spot.park(vehicle)              <span class="cm">// synchronized; false = lost race</span>
+            false? → SpotNotAvailableException
+       5  new ParkingTicket.Builder()
+              .vehicle(v).spot(spot)
+              .entryTime(v.getEntryTime()).build()
+       6  ticketRepo.save(ticket)         <span class="cm">// map.put(ticketId, ticket)</span>
+  └─ return ParkingTicket</pre>
+        <p class="muted">Step 3 delegates the whole assignment policy to the injected strategy; step 4's <code>synchronized</code> spot lock is what makes "two cars, one spot" safe — the loser simply retries via a different spot.</p>
+      </div>
+    </div>
+
+    <div class="collapsible open">
+      <div class="c-head"><h3>Exit &nbsp;→&nbsp; unpark, price &amp; pay</h3></div>
+      <div class="c-body">
+        <pre class="code"><span class="cm">Controller.handleExit(ticketId, method)</span>
+  └─ Service.unparkVehicle(ticketId, method)
+       1  ticketRepo.findById(ticketId)
+            empty? → InvalidTicketException
+       2  pricingStrategy.calculateFee(ticket)     <span class="cm">// hours × rate</span>
+       3  processor = paymentProcessors.get(method)
+            null? → PaymentFailedException
+       4  payment = processor.processPayment(id, fee, method)
+       5  payment.isSuccessful()?
+            yes → ticket.getSpot().vacate()   <span class="cm">// synchronized</span>
+                  ticket.markAsPaid(fee)
+            no  → PaymentFailedException       <span class="cm">// spot stays occupied</span>
+  └─ return Payment</pre>
+        <p class="muted">Pricing and payment are separate strategies looked up by <code>PaymentMethod</code> — the service coordinates the five subsystems but delegates every decision. The spot is only freed <i>after</i> a successful charge.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- F · DESIGN PATTERNS -->
+  <section>
+    <div class="sec-h"><span class="n">F</span><h2>Design patterns used</h2><span class="tag">GoF-categorized</span></div>
+    <div class="grid g3">
+      <div class="card">
+        <div class="kicker">Creational</div>
+        <ul class="tight">
+          <li><b>Singleton</b> — <code>ParkingLot</code> (double-checked locking). One physical lot; two instances = two availability counts.</li>
+          <li><b>Builder</b> — <code>ParkingTicket.Builder</code>. Readable construction; <code>build()</code> enforces vehicle + spot.</li>
+          <li><b>Factory Method</b> — <code>Controller.createVehicle()</code> + <code>AppConfig</code> spot helpers map an enum to the right subclass.</li>
+        </ul>
+      </div>
+      <div class="card">
+        <div class="kicker">Behavioral</div>
+        <ul class="tight">
+          <li><b>Strategy ×3</b> — <code>ParkingStrategy</code>, <code>PricingStrategy</code>, <code>PaymentProcessor</code>. Independently swappable algorithms.</li>
+          <li><b>Template Method</b> — <code>ParkingSpot.park()</code> fixes the skeleton; abstract <code>canFitVehicle()</code> is the varying hook.</li>
+          <li><b>State</b> — <code>SpotStatus.canTransitionTo()</code> guards AVAILABLE↔OCCUPIED / OUT_OF_ORDER.</li>
+          <li><b>Observer (style)</b> — <code>DisplayBoard</code> reflects availability off the lot after each park/unpark.</li>
+        </ul>
+      </div>
+      <div class="card">
+        <div class="kicker">Structural / Architectural</div>
+        <ul class="tight">
+          <li><b>Facade</b> — <code>ParkingService</code> hides 5+ subsystems behind <code>parkVehicle</code> / <code>unparkVehicle</code>.</li>
+          <li><b>Repository</b> — <code>TicketRepository</code> / <code>SpotRepository</code> → in-memory today, JDBC tomorrow, no service change.</li>
+          <li><b>Dependency Injection</b> — constructor injection everywhere, wired by hand in <code>AppConfig</code>.</li>
+        </ul>
+      </div>
+    </div>
+    <div class="callout"><b>Why Parking Lot is THE classic:</b> it exercises inheritance (Vehicle / ParkingSpot), polymorphism (canFitVehicle), and every SOLID letter at once — Strategy + Repository + DI deliver Open-Closed and Dependency Inversion, Template Method + LSP make subtypes substitutable, and three small interfaces give Interface Segregation. <span class="run">→ concurrency &amp; scale trade-offs on canvas 3</span></div>
+  </section>
+
+  <!-- RUN IT -->
+  <section>
+    <div class="sec-h"><span class="n">▶</span><h2>Run it — repo file map</h2><span class="tag">concept → actual Java class</span></div>
+    <table>
+      <thead><tr><th>Concept above</th><th>File in <code>06-parking-lot/src/main/java/…/parking/</code></th></tr></thead>
+      <tbody>
+        <tr><td>Composition root / wiring</td><td><code>config/AppConfig.java</code></td></tr>
+        <tr><td>REST entry + Factory Method</td><td><code>controller/ParkingController.java</code></td></tr>
+        <tr><td>Facade orchestrator</td><td><code>service/ParkingService.java</code> · <code>AvailabilityService.java</code></td></tr>
+        <tr><td>Singleton lot + floors + gates</td><td><code>model/ParkingLot.java</code> · <code>ParkingFloor.java</code> · <code>EntryGate.java</code> · <code>ExitGate.java</code></td></tr>
+        <tr><td>Vehicle hierarchy (§B)</td><td><code>model/vehicle/Vehicle.java</code> · <code>Car.java</code> · <code>Motorcycle.java</code> · <code>Bus.java</code></td></tr>
+        <tr><td>Spot hierarchy + Template Method (§B)</td><td><code>model/spot/ParkingSpot.java</code> · <code>CompactSpot.java</code> · <code>LargeSpot.java</code> · <code>MotorcycleSpot.java</code> · <code>HandicappedSpot.java</code></td></tr>
+        <tr><td>Domain models (§D)</td><td><code>model/ticket/ParkingTicket.java</code> · <code>model/Payment.java</code> · enums <code>VehicleType/SpotType/SpotStatus/PaymentMethod/PaymentStatus</code></td></tr>
+        <tr><td>Parking strategies (§C)</td><td><code>strategy/parking/ParkingStrategy.java</code> · <code>NearestFirstStrategy.java</code> · <code>CompactFloorStrategy.java</code></td></tr>
+        <tr><td>Pricing strategies (§C)</td><td><code>strategy/pricing/PricingStrategy.java</code> · <code>HourlyPricingStrategy.java</code> · <code>FlatRatePricingStrategy.java</code></td></tr>
+        <tr><td>Payment processors (§C)</td><td><code>payment/PaymentProcessor.java</code> · <code>CashPaymentProcessor.java</code> · <code>CreditCardPaymentProcessor.java</code></td></tr>
+        <tr><td>Storage contract + impl</td><td><code>repository/TicketRepository.java</code> · <code>InMemoryTicketRepository.java</code> · <code>SpotRepository.java</code></td></tr>
+        <tr><td>Display board (Observer)</td><td><code>display/DisplayBoard.java</code></td></tr>
+        <tr><td>Exceptions</td><td><code>exception/ParkingException.java</code> · <code>ParkingFullException.java</code> · <code>SpotNotAvailableException.java</code> · <code>InvalidTicketException.java</code> · <code>PaymentFailedException.java</code></td></tr>
+        <tr><td>Runnable demo (main)</td><td><code>ParkingLotApp.java</code></td></tr>
+      </tbody>
+    </table>
+    <div class="callout tip"><b>Run the demo</b> (Gradle <code>application</code> plugin, mainClass <code>ParkingLotApp</code>, no framework):<br><pre class="code">./gradlew :06-parking-lot:run</pre>It builds a 3-floor / 395-spot lot, parks cars, a motorcycle, a handicapped car and a bus, prints the availability board, then processes exits with hourly pricing and Cash / CreditCard payments — including a declined card.</div>
+  </section>
+
+  <!-- GLOSSARY -->
+  <section>
+    <div class="sec-h"><span class="n">§</span><h2>Glossary — one-liners</h2><span class="tag">terms used above</span></div>
+    <div class="grid g2">
+      <div class="card"><table><tbody>
+        <tr><td><b>Strategy pattern</b></td><td>family of interchangeable algorithms behind one interface, chosen/swapped at runtime</td></tr>
+        <tr><td><b>Template Method</b></td><td>base class fixes the algorithm skeleton; subclasses override one hook (canFitVehicle)</td></tr>
+        <tr><td><b>Facade</b></td><td>one entry class (ParkingService) hiding a multi-subsystem workflow</td></tr>
+        <tr><td><b>Singleton</b></td><td>exactly one instance via private ctor + getInstance (ParkingLot)</td></tr>
+        <tr><td><b>Builder</b></td><td>fluent step-by-step construction of an object with required + optional fields</td></tr>
+        <tr><td><b>Repository</b></td><td>interface over data access so storage swaps without touching logic</td></tr>
+      </tbody></table></div>
+      <div class="card"><table><tbody>
+        <tr><td><b>Polymorphism</b></td><td>same call, subclass-specific behaviour — spot.canFitVehicle() dispatches per type</td></tr>
+        <tr><td><b>LSP</b></td><td>any ParkingSpot subtype works wherever ParkingSpot is expected</td></tr>
+        <tr><td><b>Open-Closed</b></td><td>new vehicle/spot/strategy = new class, existing code untouched</td></tr>
+        <tr><td><b>Double-checked locking</b></td><td>volatile + two null checks → lock only on first Singleton creation</td></tr>
+        <tr><td><b>synchronized spot lock</b></td><td>per-spot park()/vacate() so two gates can't claim the same spot</td></tr>
+        <tr><td><b>EnumMap</b></td><td>compact array-backed map keyed by enum — used for rates and payment processors</td></tr>
+      </tbody></table></div>
+    </div>
+  </section>
+
+  <footer>
+    <p>Use case 06 · Parking Lot — Canvas 2 of 3 (LLD). Grounded in <code>06-parking-lot/docs/lld/</code>, <code>docs/patterns/</code>, and the Java under <code>src/main/java/com/systemdesign/parking</code>.</p>
+    <p class="run">This use case: <a href="hld.html">Canvas 1 · HLD</a> · LLD · <a href="deepdive.html">Canvas 3 · Deep-dive &amp; Trade-offs</a> &nbsp;|&nbsp; Next → <a href="deepdive.html">Canvas 3 · Deep-dive &amp; Trade-offs</a> &nbsp;|&nbsp; <a href="../index.html">Hub</a></p>
+  </footer>
+
+</div>
+<script src="../assets/canvas.js"></script>
+</body>
+</html>

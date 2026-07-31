@@ -1,0 +1,277 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>09 · Search Autocomplete — HLD</title>
+<link rel="stylesheet" href="../assets/canvas.css">
+</head>
+<body>
+<div class="wrap">
+
+  <header class="hero">
+    <h1>Search Autocomplete (Typeahead) — High-Level Design</h1>
+    <div class="sub">Use case 09 · Canvas 1 of 3. The big picture: requirements, back-of-envelope numbers, and an <b>interactive architecture diagram</b> — click a component to see its role, then step through the suggestion (read) and ingestion (write) flows.</div>
+    <div class="badges">
+      <span class="badge lvl">Use case 09 · HLD</span>
+      <span class="badge">Canvas 1 of 3</span>
+      <span class="badge">interactive</span>
+      <span class="badge">AP · read-heavy · p99 &lt; 100 ms</span>
+    </div>
+    <div class="legend">
+      <span><i class="dot" style="background:var(--eden)"></i> click a component</span>
+      <span><i class="dot" style="background:var(--eden)"></i> read path (get suggestions)</span>
+      <span><i class="dot" style="background:var(--survivor)"></i> write path (ingest &amp; rebuild)</span>
+      <span><i class="dot" style="background:var(--old)"></i> data stores</span>
+      <span><i class="dot" style="background:var(--warn)"></i> async pipeline</span>
+    </div>
+  </header>
+
+  <!-- A · PROBLEM & REQUIREMENTS -->
+  <section>
+    <div class="sec-h"><span class="n">A</span><h2>Problem &amp; requirements</h2><span class="tag">clarify first</span></div>
+    <div class="grid g2">
+      <div class="card">
+        <div class="kicker">functional</div>
+        <ul class="tight">
+          <li>Given a typed <b>prefix</b>, return the ranked top-K (default 10) matching query suggestions, case-insensitive.</li>
+          <li>Rank by a composite of <b>frequency + recency + trending + personalization</b>.</li>
+          <li>Ingest every completed search; surface trending queries within minutes.</li>
+          <li>Filter a <b>blocklist</b> (offensive/illegal); GDPR deletion of a user's history.</li>
+        </ul>
+      </div>
+      <div class="card">
+        <div class="kicker">non-functional</div>
+        <ul class="tight">
+          <li><b>Latency</b> p99 &lt; 100 ms end-to-end; Trie lookup p99 &lt; 5 ms — every keystroke is a request.</li>
+          <li><b>Availability</b> 99.99% — never block the user typing; degrade to stale cache / empty list.</li>
+          <li><b>Cache hit ratio</b> &gt; 90% — popular prefixes (Zipf) absorb the load.</li>
+          <li><b>Scale</b> 1.4M QPS peak; <b>AP</b> — stale-by-minutes suggestions are acceptable.</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <!-- B · ESTIMATION -->
+  <section>
+    <div class="sec-h"><span class="n">B</span><h2>Back-of-envelope estimation</h2><span class="tag">5B searches/day · ~8 keystrokes each</span></div>
+    <div class="chips">
+      <div class="chip"><span class="k">Searches / day</span><span class="v">5 B</span></div>
+      <div class="chip"><span class="k">Autocomplete req / day</span><span class="v">~40 B</span></div>
+      <div class="chip"><span class="k">Peak QPS</span><span class="v">~1.4 M</span></div>
+      <div class="chip"><span class="k">Unique queries</span><span class="v">200 M</span></div>
+      <div class="chip"><span class="k">Trie + top-K</span><span class="v">~8–10 GB</span></div>
+      <div class="chip"><span class="k">Cache hit</span><span class="v">&gt; 90%</span></div>
+      <div class="chip"><span class="k">Query logs</span><span class="v">~250 GB/day</span></div>
+      <div class="chip"><span class="k">Trie servers</span><span class="v">~9–12</span></div>
+    </div>
+    <div class="callout tip"><b>Derivation:</b> 5B searches × ~8 keystrokes = ~40B autocomplete req/day ÷ 86,400 × 3 peak ≈ <b>1.4M QPS</b>. 200M unique queries → radix-compressed Trie ≈ 5 GB, plus pre-computed top-K (~200 B/node) ≈ 8–10 GB — fits in one JVM heap. Multi-tier cache absorbs ~90%, so only ~140K QPS reach the Trie → ~3 servers × replication = <b>9–12</b>. <span class="run">→ full math on canvas 3 &amp; F · Estimation</span></div>
+  </section>
+
+  <!-- C · INTERACTIVE ARCHITECTURE -->
+  <section data-flowscope>
+    <div class="sec-h"><span class="n">C</span><h2>Architecture — click components, then step the flows</h2><span class="tag">the design, from the diagram</span></div>
+    <div>
+      <div class="arch">
+        <svg viewBox="0 0 780 420" width="100%" style="max-width:900px" role="img" aria-label="Search autocomplete architecture">
+          <defs>
+            <marker id="ah" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" fill="var(--muted)"></path></marker>
+          </defs>
+
+          <!-- arrows (drawn first, under the boxes) -->
+          <!-- READ -->
+          <line class="arrow" x1="104" y1="192" x2="148" y2="120" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"
+                data-flow="read" data-read="1"
+                data-desc-read="Client debounces ~50 ms after the last keystroke, then GET /suggestions?prefix=…&amp;limit=10 hits the nearest CDN edge."></line>
+          <line class="arrow" x1="202" y1="138" x2="202" y2="176" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"
+                data-flow="read" data-read="2"
+                data-desc-read="CDN edge MISS for this prefix → forward to origin. Short 1–2 char prefixes (~70% of traffic, Zipf) are served straight from the edge (TTL 5–15 min)."></line>
+          <line class="arrow" x1="256" y1="204" x2="298" y2="204" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"
+                data-flow="read write" data-read="3" data-write="2"
+                data-desc-read="API Gateway authenticates, rate-limits (20/s per user), validates the prefix, then routes to a stateless Autocomplete Service instance."
+                data-desc-write="On search submit, the gateway forwards the completed-search event to the Autocomplete / Search Service."></line>
+          <line class="arrow" x1="430" y1="192" x2="472" y2="122" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"
+                data-flow="read" data-read="4"
+                data-desc-read="Check caches first: L1 in-process Caffeine (TTL 60 s) then Redis Cluster (TTL 5 min). A HIT returns in &lt;2 ms — the ~90% common case."></line>
+          <line class="arrow" x1="430" y1="204" x2="472" y2="204" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"
+                data-flow="read" data-read="5"
+                data-desc-read="Cache MISS → Trie Service traverses the prefix O(L), reads the pre-computed top-K at that node, and filters the blocklist."></line>
+          <line class="arrow" x1="538" y1="230" x2="538" y2="270" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"
+                data-flow="read" data-read="6"
+                data-desc-read="Raw top-K candidates go to the Ranking Service, which re-scores by frequency, recency decay, trending boost, and personalization."></line>
+          <path class="arrow" d="M474,290 C 432,290 400,250 372,230" fill="none" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"
+                data-flow="read" data-read="7"
+                data-desc-read="Final ranked top-K returns to the Autocomplete Service, which writes it back to L1 + Redis for the next request."></path>
+          <path class="arrow" d="M300,190 C 200,120 138,138 92,178" fill="none" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"
+                data-flow="read" data-read="8"
+                data-desc-read="Suggestions returned to the client (200 OK, ~12–45 ms) and rendered in the dropdown."></path>
+
+          <!-- WRITE / ingestion pipeline -->
+          <line class="arrow" x1="104" y1="216" x2="148" y2="214" stroke="var(--muted)" stroke-width="2" stroke-dasharray="4 3" marker-end="url(#ah)"
+                data-flow="write" data-write="1"
+                data-desc-write="User selects a suggestion and submits the search → POST hits the API Gateway."></line>
+          <path class="arrow" d="M356,230 L356,354" fill="none" stroke="var(--muted)" stroke-width="2" stroke-dasharray="4 3" marker-end="url(#ah)"
+                data-flow="write" data-write="3"
+                data-desc-write="The service publishes a normalized {query, userId, ts, location} event to Kafka — async, off the read hot path."></path>
+          <line class="arrow" x1="430" y1="378" x2="472" y2="378" stroke="var(--muted)" stroke-width="2" stroke-dasharray="4 3" marker-end="url(#ah)"
+                data-flow="write" data-write="4"
+                data-desc-write="Data Collection consumes the topic and appends raw events to object storage (S3/HDFS), ~250 GB/day."></line>
+          <line class="arrow" x1="604" y1="378" x2="626" y2="378" stroke="var(--muted)" stroke-width="2" stroke-dasharray="4 3" marker-end="url(#ah)"
+                data-flow="write" data-write="5"
+                data-desc-write="An hourly Spark job aggregates frequencies, recency and trending scores into the query_frequencies table."></line>
+          <line class="arrow" x1="692" y1="354" x2="692" y2="318" stroke="var(--muted)" stroke-width="2" stroke-dasharray="4 3" marker-end="url(#ah)"
+                data-flow="write" data-write="6"
+                data-desc-write="The Trie Builder reads aggregated data, inserts queries, compresses to a radix tree, and pre-computes top-K bottom-up at every node."></line>
+          <line class="arrow" x1="692" y1="270" x2="692" y2="230" stroke="var(--muted)" stroke-width="2" stroke-dasharray="4 3" marker-end="url(#ah)"
+                data-flow="write" data-write="7"
+                data-desc-write="The built Trie is serialized to a versioned S3 snapshot (rollback-safe)."></line>
+          <line class="arrow" x1="626" y1="204" x2="604" y2="204" stroke="var(--muted)" stroke-width="2" stroke-dasharray="4 3" marker-end="url(#ah)"
+                data-flow="write" data-write="8"
+                data-desc-write="Trie Service instances download the snapshot and atomically hot-swap it in via a volatile reference — zero downtime, no read blocking."></line>
+
+          <text x="470" y="350" fill="var(--faint)" font-size="9">async ingestion &amp; rebuild pipeline</text>
+
+          <!-- nodes -->
+          <g data-node style="cursor:pointer" data-title="Client (browser / app)" data-detail="<b>Role:</b> sends GET /suggestions on each keystroke and renders the dropdown.<br><b>Debounce:</b> waits ~50–200 ms after the last keystroke before firing — cuts requests 50–70%.<br><b>Degrade:</b> on error, keep the last suggestions or show none — never block typing."><rect x="12" y="180" width="92" height="48" rx="9" fill="var(--panel-2)" stroke="var(--eden)"></rect><text x="58" y="204" text-anchor="middle" fill="var(--eden)" font-size="12" font-weight="600">Client</text><text x="58" y="219" text-anchor="middle" fill="var(--faint)" font-size="10">debounce</text></g>
+
+          <g data-node style="cursor:pointer" data-title="CDN / Edge cache" data-detail="<b>Role:</b> caches global (non-personalized) suggestions for short prefixes at the edge.<br><b>Why:</b> autocomplete traffic is Zipf — 1–2 char prefixes are ~70% of requests and highly cacheable. TTL 5–15 min.<br><b>Tech:</b> CloudFront / Cloud CDN / Azure CDN."><rect x="150" y="92" width="104" height="44" rx="9" fill="var(--panel-2)" stroke="var(--border)"></rect><text x="202" y="112" text-anchor="middle" fill="var(--text)" font-size="12" font-weight="600">CDN / Edge</text><text x="202" y="127" text-anchor="middle" fill="var(--faint)" font-size="10">short prefixes</text></g>
+
+          <g data-node style="cursor:pointer" data-title="API Gateway" data-detail="<b>Role:</b> single entry point behind the load balancer — auth (Bearer token), rate limiting (20/s per user, 50/s per IP), prefix validation (1–200 chars), gzip.<br><b>Tech:</b> API Gateway + LB (round-robin / least-connections)."><rect x="150" y="180" width="104" height="48" rx="9" fill="var(--panel-2)" stroke="var(--border)"></rect><text x="202" y="200" text-anchor="middle" fill="var(--text)" font-size="12" font-weight="600">API Gateway</text><text x="202" y="215" text-anchor="middle" fill="var(--faint)" font-size="10">auth · rate-limit</text></g>
+
+          <g data-node style="cursor:pointer" data-title="Autocomplete Service (stateless)" data-detail="<b>Role:</b> orchestrates the lookup — checks L1 Caffeine cache (TTL 60 s, 100K entries) → Redis → Trie → Ranking, then caches the result.<br><b>Stateless:</b> any instance serves any request; auto-scales to 10–20 instances.<br><b>Tech:</b> Java 21 / Spring Boot in containers (ECS/GKE/AKS)."><rect x="300" y="180" width="128" height="48" rx="9" fill="var(--panel-2)" stroke="var(--eden)"></rect><text x="364" y="200" text-anchor="middle" fill="var(--eden)" font-size="12" font-weight="600">Autocomplete Svc</text><text x="364" y="215" text-anchor="middle" fill="var(--faint)" font-size="10">L1 Caffeine · stateless</text></g>
+
+          <g data-node style="cursor:pointer" data-title="Distributed Cache — Redis" data-detail="<b>Pattern:</b> key ac:{prefix}:{userId} → JSON top-K, TTL 5 min, LRU.<br><b>Why:</b> read-heavy + Zipf → cache-first gives &lt;2 ms responses; absorbs ~90% before the Trie.<br><b>Split:</b> global keys (no userId) share high hit-ratio; personalized keys have shorter TTL."><rect x="474" y="92" width="128" height="48" rx="9" fill="var(--panel-2)" stroke="var(--old)"></rect><text x="538" y="112" text-anchor="middle" fill="var(--old)" font-size="12" font-weight="600">Cache · Redis</text><text x="538" y="127" text-anchor="middle" fill="var(--faint)" font-size="10">prefix → top-K · LRU</text></g>
+
+          <g data-node style="cursor:pointer" data-title="Trie Service (in-memory)" data-detail="<b>Heart of the system.</b> Holds a compressed (radix) Trie in JVM heap with pre-computed top-K at every node.<br><b>Lookup:</b> O(L) prefix traversal + O(1) top-K read — no subtree DFS at query time. p99 &lt; 5 ms.<br><b>Update:</b> accepts hot-swapped Trie snapshots via a volatile reference (immutable reads, no locks)."><rect x="474" y="180" width="128" height="48" rx="9" fill="var(--panel-2)" stroke="var(--survivor)"></rect><text x="538" y="200" text-anchor="middle" fill="var(--survivor)" font-size="12" font-weight="600">Trie Service</text><text x="538" y="215" text-anchor="middle" fill="var(--faint)" font-size="10">compressed · top-K</text></g>
+
+          <g data-node style="cursor:pointer" data-title="Ranking Service" data-detail="<b>Role:</b> re-scores Trie candidates.<br>final = 0.50·frequency + 0.15·recency-decay + 0.20·trending + 0.15·personalization.<br><b>Personalization:</b> boosts queries in the user's Redis history hash. Sort desc, return top-K."><rect x="474" y="272" width="128" height="44" rx="9" fill="var(--panel-2)" stroke="var(--border)"></rect><text x="538" y="292" text-anchor="middle" fill="var(--text)" font-size="12" font-weight="600">Ranking Svc</text><text x="538" y="307" text-anchor="middle" fill="var(--faint)" font-size="10">composite score</text></g>
+
+          <g data-node style="cursor:pointer" data-title="Kafka (event stream)" data-detail="<b>Role:</b> decouples ingestion from the read path. Topic search-events, 64 partitions, RF 3, retention 30 days, ~60K events/s.<br><b>Consumers:</b> Data Collection (raw log), Trending Detection (Flink sliding window), User-History updater."><rect x="300" y="356" width="128" height="44" rx="9" fill="var(--panel-2)" stroke="var(--warn)"></rect><text x="364" y="376" text-anchor="middle" fill="var(--warn)" font-size="12" font-weight="600">Kafka</text><text x="364" y="391" text-anchor="middle" fill="var(--faint)" font-size="10">search-events</text></g>
+
+          <g data-node style="cursor:pointer" data-title="Data Collection Service" data-detail="<b>Role:</b> normalizes queries (lowercase, trim, strip specials), drops noise/abuse/bots, and appends raw events to object storage (S3/HDFS), partitioned by date/hour.<br><b>Optional:</b> INCR Redis counters for near-real-time trending."><rect x="474" y="356" width="128" height="44" rx="9" fill="var(--panel-2)" stroke="var(--warn)"></rect><text x="538" y="376" text-anchor="middle" fill="var(--warn)" font-size="12" font-weight="600">Data Collection</text><text x="538" y="391" text-anchor="middle" fill="var(--faint)" font-size="10">raw log → S3</text></g>
+
+          <g data-node style="cursor:pointer" data-title="Aggregation Job (Spark)" data-detail="<b>Role:</b> hourly batch — counts frequency per query, maintains a rolling 7-day recent_frequency, and computes a daily trending_score (today ÷ 30-day avg − 1).<br><b>Output:</b> the query_frequencies table (source of truth for the Trie).<br><b>Tech:</b> Spark on EMR / Dataproc / HDInsight."><rect x="628" y="356" width="128" height="44" rx="9" fill="var(--panel-2)" stroke="var(--border)"></rect><text x="692" y="376" text-anchor="middle" fill="var(--text)" font-size="12" font-weight="600">Aggregation</text><text x="692" y="391" text-anchor="middle" fill="var(--faint)" font-size="10">Spark · hourly</text></g>
+
+          <g data-node style="cursor:pointer" data-title="Trie Builder" data-detail="<b>Role:</b> offline batch (every 1–4 h, 10–30 min). Reads query_frequencies (freq &gt; threshold), inserts into a Trie, compresses single-child chains into a radix tree (~60% fewer nodes), then computes top-K bottom-up (post-order) at every node.<br><b>Output:</b> a serialized binary snapshot."><rect x="628" y="272" width="128" height="44" rx="9" fill="var(--panel-2)" stroke="var(--border)"></rect><text x="692" y="292" text-anchor="middle" fill="var(--text)" font-size="12" font-weight="600">Trie Builder</text><text x="692" y="307" text-anchor="middle" fill="var(--faint)" font-size="10">build + top-K</text></g>
+
+          <g data-node style="cursor:pointer" data-title="Object storage — Trie snapshots" data-detail="<b>Role:</b> holds versioned serialized Trie snapshots and raw query logs.<br><b>Why versioned:</b> if a build is bad (aggregation bug), roll back to the previous snapshot in seconds.<br><b>Tech:</b> S3 / Cloud Storage / Blob (cross-region replicated)."><rect x="628" y="180" width="128" height="48" rx="9" fill="var(--panel-2)" stroke="var(--old)"></rect><text x="692" y="200" text-anchor="middle" fill="var(--old)" font-size="12" font-weight="600">Object Store</text><text x="692" y="215" text-anchor="middle" fill="var(--faint)" font-size="10">Trie snapshots</text></g>
+        </svg>
+      </div>
+      <div class="node-detail"><span class="nd-title">Click any component</span><div class="nd-body">Its role, tech choice, and scaling note appear here. Then use the buttons below to step through the read (suggestion) or write (ingestion) flow.</div></div>
+
+      <div class="flowctl" data-flowctl>
+        <button class="btn" data-flow="read">Read path (get suggestions)</button>
+        <button class="btn" data-flow="write">Write path (ingest &amp; rebuild)</button>
+        <span style="flex:1"></span>
+        <button class="btn" data-flowstep="prev">◀ Prev</button>
+        <button class="btn" data-flowstep="next">Next ▶</button>
+      </div>
+      <div class="flowlabel" data-flowlabel>Pick <b>Read</b> or <b>Write</b>, then press “Next ▶” to walk the numbered request flow one hop at a time.</div>
+
+      <div class="cloudmap">
+        <div class="kicker" style="margin-top:4px">Managed-service mapping — the same components on each cloud</div>
+        <table class="cloudtable">
+          <thead><tr>
+            <th>Component</th>
+            <th><span class="hdrlogo"><span class="logochip"><img src="../assets/logos/aws.svg" alt="AWS"></span>AWS</span></th>
+            <th><span class="hdrlogo"><span class="logochip"><img src="../assets/logos/gcp.svg" alt="GCP"></span>GCP</span></th>
+            <th><span class="hdrlogo"><span class="logochip"><img src="../assets/logos/azure.svg" alt="Azure"></span>Azure</span></th>
+          </tr></thead>
+          <tbody>
+            <tr><td>CDN / Edge</td><td><img class="svcicon" src="../assets/logos/services/aws-cloudfront.svg" alt="">CloudFront</td><td><img class="svcicon" src="../assets/logos/services/gcp-cloudcdn.svg" alt="">Cloud CDN</td><td><img class="svcicon" src="../assets/logos/services/azure-cdn.svg" alt="">Azure CDN / Front Door</td></tr>
+            <tr><td>API Gateway</td><td><img class="svcicon" src="../assets/logos/services/aws-apigw.svg" alt="">API Gateway</td><td><img class="svcicon" src="../assets/logos/services/gcp-apigw.svg" alt="">Cloud Endpoints</td><td><img class="svcicon" src="../assets/logos/services/azure-apim.svg" alt="">API Management</td></tr>
+            <tr><td>Autocomplete Service</td><td><img class="svcicon" src="../assets/logos/services/aws-ecs.svg" alt="">ECS Fargate / EKS</td><td><img class="svcicon" src="../assets/logos/services/gcp-run.svg" alt="">Cloud Run / GKE</td><td><img class="svcicon" src="../assets/logos/services/azure-aks.svg" alt="">AKS / App Service</td></tr>
+            <tr><td>Search index (Trie)</td><td><img class="svcicon" src="../assets/logos/services/aws-opensearch.svg" alt="">OpenSearch (Completion)</td><td>Vertex AI Search</td><td><img class="svcicon" src="../assets/logos/services/azure-search.svg" alt="">Cognitive Search</td></tr>
+            <tr><td>Prefix cache (Redis)</td><td><img class="svcicon" src="../assets/logos/services/aws-elasticache.svg" alt="">ElastiCache</td><td><img class="svcicon" src="../assets/logos/services/gcp-memorystore.svg" alt="">Memorystore</td><td><img class="svcicon" src="../assets/logos/services/azure-redis.svg" alt="">Cache for Redis</td></tr>
+            <tr><td>Event stream</td><td><img class="svcicon" src="../assets/logos/services/aws-msk.svg" alt="">MSK / Kinesis</td><td><img class="svcicon" src="../assets/logos/services/gcp-pubsub.svg" alt="">Pub/Sub</td><td><img class="svcicon" src="../assets/logos/services/azure-eventhubs.svg" alt="">Event Hubs</td></tr>
+            <tr><td>Aggregation (Spark)</td><td>EMR / Glue</td><td>Dataproc / Dataflow</td><td>HDInsight / Synapse</td></tr>
+            <tr><td>Trie snapshots / logs</td><td><img class="svcicon" src="../assets/logos/services/aws-s3.svg" alt="">S3</td><td><img class="svcicon" src="../assets/logos/services/gcp-cloudstorage.svg" alt="">Cloud Storage</td><td><img class="svcicon" src="../assets/logos/services/azure-blob.svg" alt="">Blob Storage</td></tr>
+            <tr><td>User history DB</td><td><img class="svcicon" src="../assets/logos/services/aws-dynamodb.svg" alt="">DynamoDB</td><td><img class="svcicon" src="../assets/logos/services/gcp-bigtable.svg" alt="">Bigtable / Firestore</td><td><img class="svcicon" src="../assets/logos/services/azure-cosmos.svg" alt="">Cosmos DB</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+
+  <!-- D · API -->
+  <section>
+    <div class="sec-h"><span class="n">D</span><h2>API design</h2><span class="tag">GET so it's cacheable</span></div>
+    <table>
+      <thead><tr><th>Endpoint</th><th>Purpose</th><th>Response</th></tr></thead>
+      <tbody>
+        <tr><td><code>GET /api/v1/suggestions?prefix=&amp;limit=&amp;userId=</code></td><td>the hot path — ranked top-K (limit ≤ 25, default 10)</td><td>200 + suggestions[] (query, score, type) / 400 empty prefix</td></tr>
+        <tr><td><code>POST /api/v1/internal/search-events</code></td><td>record a completed search (internal, feeds Kafka)</td><td>202 Accepted + event_id</td></tr>
+        <tr><td><code>DELETE /api/v1/users/{userId}/search-history</code></td><td>GDPR — remove a user's history from suggestions</td><td>200 + deleted_count</td></tr>
+        <tr><td><code>POST /api/v1/admin/blocklist</code></td><td>block a query from ever appearing</td><td>201 Created (effective_immediately)</td></tr>
+      </tbody>
+    </table>
+    <div class="callout tip"><b>Why GET, not POST?</b> GET is idempotent and cacheable — CDN/proxy/browser can cache popular prefixes natively. <code>userId</code> is a query param (not header) so it becomes part of the cache key: anonymous users share the high-hit global cache; personalized entries get a shorter TTL.</div>
+  </section>
+
+  <!-- E · DATA MODEL -->
+  <section>
+    <div class="sec-h"><span class="n">E</span><h2>Data model</h2><span class="tag">frequencies feed the Trie</span></div>
+    <div class="grid g2">
+      <div class="card">
+        <div class="kicker">query_frequencies (source of truth for the Trie)</div>
+        <pre class="code">query             STRING   <span class="cm">// normalized (PK)</span>
+frequency         LONG     <span class="cm">// all-time count</span>
+recent_frequency  LONG     <span class="cm">// rolling last 7 days</span>
+trending_score    DOUBLE   <span class="cm">// spike 0.0–1.0</span>
+last_searched_at  LONG     <span class="cm">// epoch millis</span>
+language          STRING   <span class="cm">// "en","es","fr"</span>
+is_blocked        BOOL     <span class="cm">// blocklist flag</span></pre>
+        <p class="muted">Rebuilt hourly by Spark from the raw event log; the Trie Builder reads rows with <code>frequency &gt; threshold</code>.</p>
+      </div>
+      <div class="card">
+        <div class="kicker">TrieNode (in-memory, JVM heap)</div>
+        <pre class="code">children       Map&lt;Char,Node&gt;    <span class="cm">// or radix label</span>
+isEndOfWord    boolean           <span class="cm">// completes a query</span>
+frequency      long              <span class="cm">// if end-of-word</span>
+topSuggestions List&lt;Suggestion&gt;  <span class="cm">// pre-computed top-K</span>
+<span class="cm">// Suggestion = { query, score, frequency }</span></pre>
+        <p class="muted">Pre-computing top-K (~200 B/node) turns a prefix lookup from O(subtree DFS) into O(L)+O(1). Raw events (<code>search_events</code>) stream via Kafka → S3; per-user history lives in a Redis hash.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- F · KEY CHOICES -->
+  <section>
+    <div class="sec-h"><span class="n">F</span><h2>Key design choices (deep-dived on canvas 3)</h2><span class="tag">defend these</span></div>
+    <div class="grid g3">
+      <div class="card"><div class="kicker">data structure</div><h3>Compressed Trie + pre-computed top-K</h3><p class="muted">O(L) traversal, O(1) top-K read — no query-time DFS. Beats scanning or on-the-fly ranking. <span class="run">→ canvas 2 · LLD</span></p></div>
+      <div class="card"><div class="kicker">caching</div><h3>CDN + L1 Caffeine + Redis</h3><p class="muted">Zipf traffic + multi-tier cache absorbs &gt;90%, so only ~140K QPS reach the Trie. <span class="run">→ canvas 3</span></p></div>
+      <div class="card"><div class="kicker">updates &amp; consistency</div><h3>AP · offline build + hot-swap</h3><p class="muted">No live writes to the Trie (locks kill read latency). Rebuild offline, atomic volatile swap; stale-by-minutes is fine. <span class="run">→ canvas 3</span></p></div>
+    </div>
+  </section>
+
+  <!-- GLOSSARY -->
+  <section>
+    <div class="sec-h"><span class="n">§</span><h2>Glossary — one-liners</h2><span class="tag">terms used above</span></div>
+    <div class="grid g2">
+      <div class="card"><table><tbody>
+        <tr><td><b>Trie</b></td><td>prefix tree — each node is a character; a path spells a prefix</td></tr>
+        <tr><td><b>Radix / compressed Trie</b></td><td>merges single-child chains into one labelled node (~60% fewer nodes)</td></tr>
+        <tr><td><b>Top-K pre-computation</b></td><td>store each node's best K suggestions so lookup is O(1) after traversal</td></tr>
+        <tr><td><b>Debounce</b></td><td>wait ~50–200 ms after the last keystroke before sending a request</td></tr>
+        <tr><td><b>Zipf distribution</b></td><td>a few short prefixes account for most traffic → highly cacheable</td></tr>
+      </tbody></table></div>
+      <div class="card"><table><tbody>
+        <tr><td><b>Hot-swap</b></td><td>atomically replace the live Trie via a volatile reference — zero downtime</td></tr>
+        <tr><td><b>L1 cache (Caffeine)</b></td><td>in-process cache on each app node, TTL 60 s, W-TinyLFU eviction</td></tr>
+        <tr><td><b>Trending score</b></td><td>today's frequency ÷ 30-day average − 1 → boosts sudden spikes</td></tr>
+        <tr><td><b>AP (CAP)</b></td><td>favour Availability + Partition-tolerance; stale suggestions are acceptable</td></tr>
+        <tr><td><b>Completion Suggester</b></td><td>OpenSearch/Elasticsearch FST — an on-disk Trie for &gt;100M-term vocab</td></tr>
+      </tbody></table></div>
+    </div>
+  </section>
+
+  <footer>
+    <p>Use case 09 · Search Autocomplete — Canvas 1 of 3 (HLD). Grounded in <code>09-search-autocomplete/docs/hld/</code> &amp; <code>docs/cloud/</code>.</p>
+    <p class="run">This use case: HLD · <a href="lld.html">Canvas 2 · LLD</a> · <a href="deepdive.html">Canvas 3 · Deep-dive &amp; Trade-offs</a> &nbsp;|&nbsp; Next → <a href="lld.html">Canvas 2 · LLD</a> &nbsp;|&nbsp; <a href="../index.html">Hub</a></p>
+  </footer>
+
+</div>
+<script src="../assets/canvas.js"></script>
+</body>
+</html>
