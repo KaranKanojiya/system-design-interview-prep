@@ -1,0 +1,298 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>13 · Video Streaming — HLD</title>
+<link rel="stylesheet" href="../assets/canvas.css">
+</head>
+<body>
+<div class="wrap">
+
+  <header class="hero">
+    <h1>Video Streaming Platform — High-Level Design</h1>
+    <div class="sub">Use case 13 · Canvas 1 of 3. The big picture: requirements, back-of-envelope numbers, and an <b>interactive architecture diagram</b> — click a component to see its role, then step through the upload (write) and streaming (read) request flows. Grounded in YouTube/Netflix/Hotstar-scale VOD.</div>
+    <div class="badges">
+      <span class="badge lvl">Use case 13 · HLD</span>
+      <span class="badge">Canvas 1 of 3</span>
+      <span class="badge">interactive</span>
+      <span class="badge">AP stream · CP upload · read-heavy</span>
+    </div>
+    <div class="legend">
+      <span><i class="dot" style="background:var(--eden)"></i> click a component</span>
+      <span><i class="dot" style="background:var(--survivor)"></i> upload / transcode (write) path</span>
+      <span><i class="dot" style="background:var(--eden)"></i> streaming (read) path</span>
+      <span><i class="dot" style="background:var(--old)"></i> data stores</span>
+      <span><i class="dot" style="background:var(--warn)"></i> async / off hot-path</span>
+    </div>
+  </header>
+
+  <!-- A · PROBLEM & REQUIREMENTS -->
+  <section>
+    <div class="sec-h"><span class="n">A</span><h2>Problem &amp; requirements</h2><span class="tag">clarify first</span></div>
+    <div class="grid g2">
+      <div class="card">
+        <div class="kicker">functional</div>
+        <ul class="tight">
+          <li><b>Upload</b> — chunked, resumable upload (5 MB chunks, presigned URLs, direct-to-S3) of files up to 256 GB.</li>
+          <li><b>Transcode</b> to a resolution ladder (240p–1080p) × codecs (H.264, VP9) → HLS/DASH segments.</li>
+          <li><b>Stream on demand</b> with adaptive bitrate — quality follows bandwidth, zero rebuffer on drops.</li>
+          <li>Search, recommendations, like/comment, watch history &amp; resume; live streaming (conceptual).</li>
+        </ul>
+      </div>
+      <div class="card">
+        <div class="kicker">non-functional</div>
+        <ul class="tight">
+          <li><b>Playback startup</b> &lt; 2 s p99; <b>rebuffering</b> &lt; 1% of playtime — the #1 churn driver.</li>
+          <li><b>Availability</b> 99.99%; <b>durability</b> zero data loss on uploaded source + variants.</li>
+          <li><b>CDN cache-hit</b> &gt; 95% — miss ratio directly drives origin bandwidth cost.</li>
+          <li><b>Scale</b> 500M DAU, 1B watch-hours/day; <b>AP</b> for views/likes, <b>CP</b> for upload chunk state.</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <!-- B · ESTIMATION -->
+  <section>
+    <div class="sec-h"><span class="n">B</span><h2>Back-of-envelope estimation</h2><span class="tag">500M DAU · 500 hrs uploaded/min</span></div>
+    <div class="chips">
+      <div class="chip"><span class="k">DAU</span><span class="v">500 M</span></div>
+      <div class="chip"><span class="k">Uploads / day</span><span class="v">~720 K</span></div>
+      <div class="chip"><span class="k">Peak concurrent</span><span class="v">~50 M</span></div>
+      <div class="chip"><span class="k">Peak egress</span><span class="v">~250 Tbps</span></div>
+      <div class="chip"><span class="k">CDN hit ratio</span><span class="v">&gt; 95%</span></div>
+      <div class="chip"><span class="k">Total storage</span><span class="v">~3 EB</span></div>
+      <div class="chip"><span class="k">Variants / video</span><span class="v">5 × 2 = 10</span></div>
+      <div class="chip"><span class="k">Startup p99</span><span class="v">&lt; 2 s</span></div>
+    </div>
+    <div class="callout tip"><b>Derivation:</b> 500 hrs/min uploaded ÷ 10 min avg × 60 × 24 ≈ <b>720K videos/day</b> ≈ 720 TB raw/day. Each video → 10 variants ≈ ~3 GB, so ~2.2 PB transcoded/day → across 1B videos ≈ <b>~3 EB</b> total. Streaming: ~50M concurrent viewers × 5 Mbps ≈ <b>250 Tbps</b> peak egress; a &gt;95% CDN cache-hit leaves only ~12.5 Tbps hitting origin (S3). <span class="run">→ full cost math on canvas 3 &amp; F3 · Estimation</span></div>
+  </section>
+
+  <!-- C · INTERACTIVE ARCHITECTURE -->
+  <section data-flowscope>
+    <div class="sec-h"><span class="n">C</span><h2>Architecture — click components, then step the flows</h2><span class="tag">two pipelines: ingest &amp; deliver</span></div>
+    <div>
+      <div class="arch">
+        <svg viewBox="0 0 940 480" width="100%" style="max-width:940px" role="img" aria-label="Video streaming architecture">
+          <defs>
+            <marker id="ah" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" fill="var(--muted)"></path></marker>
+          </defs>
+
+          <!-- arrows (drawn first, under the boxes) -->
+          <line class="arrow" x1="116" y1="236" x2="152" y2="236" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"
+                data-flow="write read" data-write="1" data-read="1"
+                data-desc-write="Creator POSTs /videos/upload (title, size, chunk size) to the API gateway." data-desc-read="Viewer requests GET /videos/{id}/manifest through the API gateway."></line>
+
+          <path class="arrow" d="M210,210 C 238,130 280,92 300,84" fill="none" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"
+                data-flow="write" data-write="2"
+                data-desc-write="Gateway authenticates (JWT), rate-limits, and routes to the Upload Service."></path>
+
+          <line class="arrow" x1="256" y1="236" x2="300" y2="236" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"
+                data-flow="read" data-read="2"
+                data-desc-read="Gateway routes the manifest request to the stateless Streaming Service."></line>
+
+          <path class="arrow" d="M322,90 C 272,160 272,300 316,330" fill="none" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"
+                data-flow="write" data-write="3"
+                data-desc-write="Upload Service creates the Video record (status UPLOADING) in the metadata DB and returns a batch of presigned S3 URLs, one per 5 MB chunk."></path>
+
+          <path class="arrow" d="M84,210 C 150,116 380,120 470,162" fill="none" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"
+                data-flow="write" data-write="4"
+                data-desc-write="Client PUTs chunks DIRECTLY to object storage using the presigned URLs — parallel (~20 at a time) and resumable, bypassing the API server. S3 events track completion; on all-received, chunks are assembled into the source file."></path>
+
+          <line class="arrow" x1="426" y1="65" x2="470" y2="65" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"
+                data-flow="write" data-write="5"
+                data-desc-write="After assembly, Upload Service publishes a &quot;video_uploaded&quot; event to Kafka — decoupling ingest from the heavy transcode."></line>
+
+          <line class="arrow" x1="574" y1="65" x2="618" y2="65" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"
+                data-flow="write" data-write="6"
+                data-desc-write="Transcoding Orchestrator consumes the event and builds a DAG: extract audio → split into 10-s segments → fan out to 5 resolutions × 2 codecs."></line>
+
+          <line class="arrow" x1="768" y1="65" x2="808" y2="65" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"
+                data-flow="write" data-write="7"
+                data-desc-write="Orchestrator schedules transcode tasks onto a priority-tiered worker pool (GPU / CPU / spot). ~50 workers run FFmpeg in parallel."></line>
+
+          <path class="arrow" d="M862,90 C 862,150 680,182 620,182" fill="none" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"
+                data-flow="write" data-write="8"
+                data-desc-write="Workers write HLS/DASH segments to S3 (/videoId/resolution/codec/seg_N). Orchestrator generates manifests, flips status to READY, and indexes the video for search."></path>
+
+          <path class="arrow" d="M292,258 C 210,214 130,214 116,250" fill="none" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"
+                data-flow="read" data-read="4"
+                data-desc-read="Streaming Service returns the master manifest (.m3u8 / .mpd) listing every quality variant and its segment URLs."></path>
+
+          <path class="arrow" d="M420,262 C 452,300 470,318 490,326" fill="none" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"
+                data-flow="read" data-read="3"
+                data-desc-read="Streaming Service reads video metadata / manifest URL from Redis (cache-aside over the metadata DB) — sub-ms lookup."></path>
+
+          <path class="arrow" d="M116,256 C 260,308 560,308 682,258" fill="none" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"
+                data-flow="read" data-read="5"
+                data-desc-read="Client's ABR picks a variant for its bandwidth and fetches 10-s segments from the nearest CDN edge. A cache HIT serves in &lt;50 ms; the player prefetches 2–3 ahead."></path>
+
+          <path class="arrow" d="M700,210 C 668,192 645,186 622,186" fill="none" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"
+                data-flow="read" data-read="6"
+                data-desc-read="Cache MISS → CDN walks regional → origin-shield → origin (S3), backfilling each tier so the next viewer hits the edge."></path>
+
+          <path class="arrow" d="M70,262 L70,455 L755,455 L755,378" fill="none" stroke="var(--muted)" stroke-width="2" stroke-dasharray="4 3" marker-end="url(#ah)"
+                data-flow="read" data-read="7"
+                data-desc-read="Every ~30 s the player POSTs playback analytics (watch time, quality switches, rebuffers) asynchronously — off the streaming hot path — into the analytics pipeline."></path>
+
+          <!-- static / decorative arrows -->
+          <line x1="470" y1="290" x2="426" y2="342" stroke="var(--muted)" stroke-width="2" stroke-dasharray="4 3" marker-end="url(#ah)"></line>
+          <text x="392" y="316" fill="var(--faint)" font-size="9">cache-aside</text>
+          <text x="612" y="472" fill="var(--faint)" font-size="9">async analytics heartbeats</text>
+
+          <!-- nodes -->
+          <g data-node style="cursor:pointer" data-title="Client (player)" data-detail="Browser / mobile / TV app with an <b>ABR player</b>. On upload it chunks the file and PUTs directly to S3; on playback it fetches the manifest, then pulls segments from the CDN and switches quality as bandwidth changes."><rect x="24" y="210" width="92" height="52" rx="9" fill="var(--panel-2)" stroke="var(--eden)"></rect><text x="70" y="232" text-anchor="middle" fill="var(--eden)" font-size="13" font-weight="600">Client</text><text x="70" y="248" text-anchor="middle" fill="var(--faint)" font-size="10">ABR player</text></g>
+
+          <g data-node style="cursor:pointer" data-title="API Gateway / LB" data-detail="<b>Role:</b> single control-plane entry — TLS termination, JWT auth, rate limiting, and routing to Upload / Streaming / metadata services.<br><b>Note:</b> it is NOT in the video bytes path — chunks go straight to S3 and segments come from the CDN.<br><b>Tech:</b> API Gateway + WAF, or Nginx/Kong."><rect x="152" y="210" width="104" height="52" rx="9" fill="var(--panel-2)" stroke="var(--border)"></rect><text x="204" y="232" text-anchor="middle" fill="var(--text)" font-size="12" font-weight="600">API Gateway</text><text x="204" y="248" text-anchor="middle" fill="var(--faint)" font-size="10">TLS · auth · LB</text></g>
+
+          <g data-node style="cursor:pointer" data-title="Upload Service" data-detail="<b>Role:</b> orchestrates chunked, resumable upload without ever touching video bytes.<br>Creates the Video record (UPLOADING), hands out <b>presigned S3 URLs</b>, tracks chunk completion via S3 events (a bitmap in Redis → resume from the last chunk), triggers assembly, then publishes to Kafka.<br><b>Code:</b> <code>UploadService</code>."><rect x="300" y="40" width="126" height="50" rx="9" fill="var(--panel-2)" stroke="var(--border)"></rect><text x="363" y="61" text-anchor="middle" fill="var(--text)" font-size="12" font-weight="600">Upload Service</text><text x="363" y="77" text-anchor="middle" fill="var(--faint)" font-size="10">presigned URLs</text></g>
+
+          <g data-node style="cursor:pointer" data-title="Message Queue — Kafka" data-detail="<b>Role:</b> decouples ingest from the compute-heavy transcode. The &quot;video_uploaded&quot; event survives worker crashes and enables retry.<br><b>Also:</b> carries transcode-complete and analytics events.<br><b>Tech:</b> Kafka / Kinesis / Pub/Sub."><rect x="470" y="40" width="104" height="50" rx="9" fill="var(--panel-2)" stroke="var(--survivor)"></rect><text x="522" y="61" text-anchor="middle" fill="var(--survivor)" font-size="12" font-weight="600">Kafka</text><text x="522" y="77" text-anchor="middle" fill="var(--faint)" font-size="10">event bus</text></g>
+
+          <g data-node style="cursor:pointer" data-title="Transcoding Orchestrator" data-detail="<b>Role:</b> the star of this design. Builds a <b>DAG</b> of transcode tasks per video, schedules them onto worker pools by priority, retries failures (≤3), then generates HLS/DASH manifests and flips status to READY.<br><b>Tech:</b> Step Functions / Workflows over MediaConvert. <br><b>Code:</b> <code>TranscodingService</code>, <code>ParallelTranscodingStrategy</code>."><rect x="618" y="40" width="150" height="50" rx="9" fill="var(--panel-2)" stroke="var(--survivor)"></rect><text x="693" y="61" text-anchor="middle" fill="var(--survivor)" font-size="12" font-weight="600">Transcode Orchestrator</text><text x="693" y="77" text-anchor="middle" fill="var(--faint)" font-size="10">DAG scheduler</text></g>
+
+          <g data-node style="cursor:pointer" data-title="Transcoding Workers" data-detail="<b>Role:</b> run FFmpeg to produce each resolution×codec variant, segment it (10 s), and upload to S3.<br><b>Pools:</b> GPU (premium/live) · CPU (regular) · <b>spot instances</b> (backfills — 60–70% cheaper, retry-safe).<br>~50 workers process a video's variants in parallel."><rect x="808" y="40" width="108" height="50" rx="9" fill="var(--panel-2)" stroke="var(--survivor)"></rect><text x="862" y="61" text-anchor="middle" fill="var(--survivor)" font-size="12" font-weight="600">Workers</text><text x="862" y="77" text-anchor="middle" fill="var(--faint)" font-size="10">FFmpeg ×N</text></g>
+
+          <g data-node style="cursor:pointer" data-title="Object Storage — S3 / GCS" data-detail="<b>Role:</b> durable source of truth for raw chunks, assembled sources, and all transcoded segments + manifests + thumbnails.<br><b>Key layout:</b> /videoId/resolution/codec/seg_N.ts.<br><b>Tiering:</b> Standard (hot ≤30d) → IA (warm) → Glacier (cold, 180d+) — 80% of views hit the first 7 days.<br>Doubles as the CDN <b>origin</b>."><rect x="470" y="150" width="150" height="60" rx="9" fill="var(--panel-2)" stroke="var(--old)"></rect><text x="545" y="176" text-anchor="middle" fill="var(--old)" font-size="12" font-weight="600">Object Storage</text><text x="545" y="192" text-anchor="middle" fill="var(--faint)" font-size="10">S3 · tiered · origin</text></g>
+
+          <g data-node style="cursor:pointer" data-title="Streaming Service" data-detail="<b>Role:</b> serves the master/variant <b>manifest</b> and manages playback sessions. Stateless, horizontally scaled. It is NOT in the segment byte path — the client streams segments from the CDN.<br><b>Code:</b> <code>StreamingService</code>, ABR strategies (<code>ThroughputBasedABR</code>, <code>BufferBasedABR</code>) run client-side."><rect x="300" y="210" width="126" height="52" rx="9" fill="var(--panel-2)" stroke="var(--border)"></rect><text x="363" y="232" text-anchor="middle" fill="var(--text)" font-size="12" font-weight="600">Streaming Svc</text><text x="363" y="248" text-anchor="middle" fill="var(--faint)" font-size="10">manifest server</text></g>
+
+          <g data-node style="cursor:pointer" data-title="Cache — Redis" data-detail="<b>Pattern:</b> cache-aside over the metadata DB — hot video metadata, manifest URLs, session state, and the upload chunk bitmap.<br><b>Also:</b> atomic counters for view/like counts (eventually consistent).<br><b>Tech:</b> ElastiCache / Memorystore."><rect x="470" y="270" width="150" height="48" rx="9" fill="var(--panel-2)" stroke="var(--old)"></rect><text x="545" y="291" text-anchor="middle" fill="var(--old)" font-size="12" font-weight="600">Cache · Redis</text><text x="545" y="307" text-anchor="middle" fill="var(--faint)" font-size="10">cache-aside · counters</text></g>
+
+          <g data-node style="cursor:pointer" data-title="Metadata DB — DynamoDB" data-detail="<b>Access pattern:</b> key-value lookup by videoId — Video, VideoMetadata, Resolution, TranscodeJob, WatchHistory.<br><b>Why NoSQL:</b> high throughput, auto-scale, Global Tables for multi-region (&lt;1 s replication).<br><b>Note:</b> binary segments live in S3, not here.<br><b>Code:</b> <code>Video</code>, <code>VideoMetadata</code>."><rect x="300" y="330" width="126" height="48" rx="9" fill="var(--panel-2)" stroke="var(--old)"></rect><text x="363" y="351" text-anchor="middle" fill="var(--old)" font-size="12" font-weight="600">Metadata DB</text><text x="363" y="367" text-anchor="middle" fill="var(--faint)" font-size="10">DynamoDB</text></g>
+
+          <g data-node style="cursor:pointer" data-title="CDN (multi-tier)" data-detail="<b>Role:</b> delivers 95%+ of segment bytes from cache, near the viewer.<br><b>Tiers:</b> edge (200+ PoPs) → regional → origin-shield → S3 origin. Shield is the single origin contact — kills the <b>thundering herd</b> on viral videos.<br><b>Pre-warm:</b> push popular creators' first segments before release.<br><b>At scale:</b> custom CDN (Netflix Open Connect / Google GGC)."><rect x="680" y="210" width="150" height="52" rx="9" fill="var(--panel-2)" stroke="var(--eden)"></rect><text x="755" y="232" text-anchor="middle" fill="var(--eden)" font-size="12" font-weight="600">CDN</text><text x="755" y="248" text-anchor="middle" fill="var(--faint)" font-size="10">edge → shield → origin</text></g>
+
+          <g data-node style="cursor:pointer" data-title="Analytics pipeline" data-detail="<b>Role:</b> ingests playback heartbeats (watch time, quality switches, rebuffer rate) via Kafka/Kinesis, aggregates in a columnar warehouse for recommendations, creator dashboards, and rebuffer alarms.<br><b>Tech:</b> Kinesis + Redshift / BigQuery / Synapse.<br><b>Code:</b> <code>AnalyticsService</code>."><rect x="680" y="330" width="150" height="48" rx="9" fill="var(--panel-2)" stroke="var(--warn)"></rect><text x="755" y="351" text-anchor="middle" fill="var(--warn)" font-size="12" font-weight="600">Analytics</text><text x="755" y="367" text-anchor="middle" fill="var(--faint)" font-size="10">heartbeats · OLAP</text></g>
+        </svg>
+      </div>
+      <div class="node-detail"><span class="nd-title">Click any component</span><div class="nd-body">Its role, tech choice, and scaling note appear here. Then use the buttons below to step through the upload or streaming flow.</div></div>
+
+      <div class="flowctl" data-flowctl>
+        <button class="btn" data-flow="write">Upload path (write)</button>
+        <button class="btn" data-flow="read">Streaming path (read)</button>
+        <span style="flex:1"></span>
+        <button class="btn" data-flowstep="prev">◀ Prev</button>
+        <button class="btn" data-flowstep="next">Next ▶</button>
+      </div>
+      <div class="flowlabel" data-flowlabel>Pick <b>Upload</b> or <b>Streaming</b>, then press “Next ▶” to walk the numbered request flow one hop at a time.</div>
+
+      <div class="cloudmap">
+        <div class="kicker" style="margin-top:4px">Managed-service mapping — the same components on each cloud</div>
+        <table class="cloudtable">
+          <thead><tr>
+            <th>Component</th>
+            <th><span class="hdrlogo"><span class="logochip"><img src="../assets/logos/aws.svg" alt="AWS"></span>AWS</span></th>
+            <th><span class="hdrlogo"><span class="logochip"><img src="../assets/logos/gcp.svg" alt="GCP"></span>GCP</span></th>
+            <th><span class="hdrlogo"><span class="logochip"><img src="../assets/logos/azure.svg" alt="Azure"></span>Azure</span></th>
+          </tr></thead>
+          <tbody>
+            <tr><td>API Gateway</td><td><img class="svcicon" src="../assets/logos/services/aws-apigw.svg" alt="">API Gateway + WAF</td><td><img class="svcicon" src="../assets/logos/services/gcp-apigw.svg" alt="">Cloud Endpoints</td><td><img class="svcicon" src="../assets/logos/services/azure-apim.svg" alt="">API Management</td></tr>
+            <tr><td>Upload / Streaming svc</td><td><img class="svcicon" src="../assets/logos/services/aws-ecs.svg" alt="">ECS Fargate / EKS</td><td><img class="svcicon" src="../assets/logos/services/gcp-run.svg" alt="">Cloud Run / GKE</td><td><img class="svcicon" src="../assets/logos/services/azure-aks.svg" alt="">AKS / App Service</td></tr>
+            <tr><td>Object Storage</td><td><img class="svcicon" src="../assets/logos/services/aws-s3.svg" alt="">S3 (+ IA / Glacier)</td><td><img class="svcicon" src="../assets/logos/services/gcp-cloudstorage.svg" alt="">Cloud Storage</td><td><img class="svcicon" src="../assets/logos/services/azure-blob.svg" alt="">Blob (Hot/Cool/Archive)</td></tr>
+            <tr><td>Transcoding</td><td><img class="svcicon" src="../assets/logos/services/aws-media.svg" alt="">MediaConvert / Elemental</td><td><img class="svcicon" src="../assets/logos/services/gcp-media.svg" alt="">Transcoder API</td><td><img class="svcicon" src="../assets/logos/services/azure-media.svg" alt="">Media Services</td></tr>
+            <tr><td>CDN</td><td><img class="svcicon" src="../assets/logos/services/aws-cloudfront.svg" alt="">CloudFront</td><td><img class="svcicon" src="../assets/logos/services/gcp-cloudcdn.svg" alt="">Cloud CDN</td><td><img class="svcicon" src="../assets/logos/services/azure-cdn.svg" alt="">Azure CDN / Front Door</td></tr>
+            <tr><td>Metadata DB (NoSQL)</td><td><img class="svcicon" src="../assets/logos/services/aws-dynamodb.svg" alt="">DynamoDB</td><td><img class="svcicon" src="../assets/logos/services/gcp-bigtable.svg" alt="">Firestore / Bigtable</td><td><img class="svcicon" src="../assets/logos/services/azure-cosmos.svg" alt="">Cosmos DB</td></tr>
+            <tr><td>Cache</td><td><img class="svcicon" src="../assets/logos/services/aws-elasticache.svg" alt="">ElastiCache</td><td><img class="svcicon" src="../assets/logos/services/gcp-memorystore.svg" alt="">Memorystore</td><td><img class="svcicon" src="../assets/logos/services/azure-redis.svg" alt="">Cache for Redis</td></tr>
+            <tr><td>Message queue / stream</td><td><img class="svcicon" src="../assets/logos/services/aws-msk.svg" alt="">MSK / Kinesis</td><td><img class="svcicon" src="../assets/logos/services/gcp-pubsub.svg" alt="">Pub/Sub</td><td><img class="svcicon" src="../assets/logos/services/azure-eventhubs.svg" alt="">Event Hubs</td></tr>
+            <tr><td>User DB (RDBMS)</td><td><img class="svcicon" src="../assets/logos/services/aws-rds.svg" alt="">RDS Aurora</td><td><img class="svcicon" src="../assets/logos/services/gcp-cloudsql.svg" alt="">Cloud SQL / AlloyDB</td><td><img class="svcicon" src="../assets/logos/services/azure-sql.svg" alt="">Azure SQL</td></tr>
+            <tr><td>Search</td><td><img class="svcicon" src="../assets/logos/services/aws-opensearch.svg" alt="">OpenSearch</td><td>Vertex AI Search</td><td><img class="svcicon" src="../assets/logos/services/azure-search.svg" alt="">AI Search</td></tr>
+            <tr><td>Analytics</td><td><img class="svcicon" src="../assets/logos/services/aws-redshift.svg" alt="">Kinesis + Redshift</td><td><img class="svcicon" src="../assets/logos/services/gcp-bigquery.svg" alt="">Dataflow + BigQuery</td><td><img class="svcicon" src="../assets/logos/services/azure-synapse.svg" alt="">Event Hubs + Synapse</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+
+  <!-- D · API -->
+  <section>
+    <div class="sec-h"><span class="n">D</span><h2>API design</h2><span class="tag">control plane; bytes bypass it</span></div>
+    <table>
+      <thead><tr><th>Endpoint</th><th>Purpose</th><th>Response</th></tr></thead>
+      <tbody>
+        <tr><td><code>POST /api/v1/videos/upload</code></td><td>initiate upload (title, file_size, chunk_size)</td><td>201 + video_id, upload_id, <b>presigned_urls[]</b></td></tr>
+        <tr><td><code>POST /api/v1/videos/{id}/upload/complete</code></td><td>signal all chunks sent (+ checksums) → assemble &amp; transcode</td><td>200 + status PROCESSING, ETA</td></tr>
+        <tr><td><code>GET /api/v1/videos/{id}/manifest?protocol=HLS</code></td><td>fetch master manifest (the read hot path)</td><td>200 + <code>.m3u8</code> / <code>.mpd</code></td></tr>
+        <tr><td><code>GET .../{id}/stream?resolution=1080p&amp;segment=5</code></td><td>segment (in practice fetched straight from CDN URLs)</td><td>200 + <code>video/mp2t</code> bytes</td></tr>
+        <tr><td><code>GET /api/v1/videos/{id}</code></td><td>metadata + resume point (watch_progress)</td><td>200 + video JSON</td></tr>
+        <tr><td><code>POST /api/v1/videos/{id}/like</code></td><td>like / dislike / none (idempotent)</td><td>200 + counts</td></tr>
+        <tr><td><code>GET /api/v1/search?q=&amp;sort=RELEVANCE</code></td><td>full-text search</td><td>200 + ranked results</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <!-- E · DATA MODEL -->
+  <section>
+    <div class="sec-h"><span class="n">E</span><h2>Data model</h2><span class="tag">metadata in DB · bytes in S3</span></div>
+    <div class="grid g2">
+      <div class="card">
+        <div class="kicker">Video + VideoMetadata (DynamoDB)</div>
+        <pre class="code">video_id     STRING  <span class="cm">// PK (Snowflake)</span>
+user_id      STRING  <span class="cm">// creator FK</span>
+status       ENUM    <span class="cm">// UPLOADING→…→READY</span>
+source_url   STRING  <span class="cm">// S3 assembled source</span>
+duration_sec INT
+visibility   ENUM    <span class="cm">// PUBLIC/UNLISTED/PRIVATE</span>
+title,tags,category,thumbnail_url
+view_count,like_count  <span class="cm">// approx (Redis)</span></pre>
+        <p class="muted">Key-value lookup by <code>video_id</code>. Co-locate metadata for single-read hydration. Counters are eventually consistent. <code>Video</code>, <code>VideoMetadata</code>.</p>
+      </div>
+      <div class="card">
+        <div class="kicker">Resolution / VideoChunk · TranscodeJob</div>
+        <pre class="code">resolution_name  <span class="cm">// 240p…1080p</span>
+codec            <span class="cm">// h264 / vp9</span>
+bitrate_kbps, width, height
+storage_url_prefix  <span class="cm">// s3://…/1080p/h264/</span>
+segment_index    <span class="cm">// 0-based, ~10s each</span>
+--- TranscodeJob ---
+job_id, video_id, status, priority
+worker_id, retry_count, progress_pct</pre>
+        <p class="muted">Segments are S3 objects (not DB rows). One <code>TranscodeJob</code> per variant tracks the DAG. <code>Resolution</code>, <code>VideoChunk</code>, <code>TranscodeJob</code>.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- F · KEY CHOICES -->
+  <section>
+    <div class="sec-h"><span class="n">F</span><h2>Key design choices (deep-dived on canvas 3)</h2><span class="tag">defend these</span></div>
+    <div class="grid g3">
+      <div class="card"><div class="kicker">ingest</div><h3>Chunked, resumable, direct-to-S3</h3><p class="muted">5 MB chunks + presigned URLs upload straight to storage — the API server never touches bytes. A Redis chunk bitmap enables resume. <span class="run">→ canvas 2 · LLD</span></p></div>
+      <div class="card"><div class="kicker">transcode &amp; deliver</div><h3>DAG pipeline + ABR over CDN</h3><p class="muted">Parallel resolution×codec ladder → HLS/DASH segments; client ABR switches quality per segment. Multi-tier CDN + shield serves 95%+.</p></div>
+      <div class="card"><div class="kicker">consistency &amp; cost</div><h3>AP stream · CP upload · tiered storage</h3><p class="muted">Buffer a few segments (AP); chunk state must be exact (CP). Hot→IA→Glacier tiering + custom CDN dominate the cost story. <span class="run">→ canvas 3</span></p></div>
+    </div>
+  </section>
+
+  <!-- GLOSSARY -->
+  <section>
+    <div class="sec-h"><span class="n">§</span><h2>Glossary — one-liners</h2><span class="tag">terms used above</span></div>
+    <div class="grid g2">
+      <div class="card"><table><tbody>
+        <tr><td><b>HLS / DASH</b></td><td>HTTP adaptive-streaming protocols; a manifest lists quality variants + segment URLs</td></tr>
+        <tr><td><b>ABR</b></td><td>Adaptive Bitrate — player picks a variant per segment from measured bandwidth + buffer</td></tr>
+        <tr><td><b>Manifest</b></td><td><code>.m3u8</code>/<code>.mpd</code> playlist mapping resolutions/codecs to segment URLs</td></tr>
+        <tr><td><b>Segment</b></td><td>a ~10 s independently-decodable chunk of one variant</td></tr>
+        <tr><td><b>Transcoding</b></td><td>re-encoding the source into a resolution×codec ladder (via FFmpeg)</td></tr>
+        <tr><td><b>DAG orchestration</b></td><td>tasks as a dependency graph: split → transcode (fan-out) → package → finalize</td></tr>
+        <tr><td><b>Presigned URL</b></td><td>time-limited signed link letting the client PUT a chunk directly to S3</td></tr>
+      </tbody></table></div>
+      <div class="card"><table><tbody>
+        <tr><td><b>Resumable upload</b></td><td>a chunk bitmap lets a dropped upload restart from the last completed chunk</td></tr>
+        <tr><td><b>Origin shield</b></td><td>single CDN tier that talks to origin — collapses the thundering herd</td></tr>
+        <tr><td><b>Cache-hit ratio</b></td><td>% of bytes served from CDN cache; &gt;95% keeps origin bandwidth cheap</td></tr>
+        <tr><td><b>Pre-warming</b></td><td>pushing hot content to edges before release so launch doesn't hit origin</td></tr>
+        <tr><td><b>Storage tiering</b></td><td>Standard→IA→Glacier as videos cool; 80% of views hit the first 7 days</td></tr>
+        <tr><td><b>Open Connect</b></td><td>Netflix's custom ISP-embedded CDN — 90%+ traffic, near-free bandwidth at scale</td></tr>
+        <tr><td><b>AP / CP</b></td><td>streaming favours availability (AP); upload chunk state must be consistent (CP)</td></tr>
+      </tbody></table></div>
+    </div>
+  </section>
+
+  <footer>
+    <p>Use case 13 · Video Streaming — Canvas 1 of 3 (HLD). Grounded in <code>13-video-streaming/docs/hld/</code> &amp; <code>docs/cloud/</code>.</p>
+    <p class="run">This use case: HLD · <a href="lld.html">Canvas 2 · LLD</a> · <a href="deepdive.html">Canvas 3 · Deep-dive &amp; Trade-offs</a> &nbsp;|&nbsp; Next → <a href="lld.html">Canvas 2 · LLD</a> &nbsp;|&nbsp; <a href="../index.html">Hub</a></p>
+  </footer>
+
+</div>
+<script src="../assets/canvas.js"></script>
+</body>
+</html>

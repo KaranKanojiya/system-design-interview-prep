@@ -1,0 +1,270 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>11 · Payment System — HLD</title>
+<link rel="stylesheet" href="../assets/canvas.css">
+</head>
+<body>
+<div class="wrap">
+
+  <header class="hero">
+    <h1>Payment System — High-Level Design</h1>
+    <div class="sub">Use case 11 · Canvas 1 of 3. The big picture: requirements, back-of-envelope numbers, and an <b>interactive architecture diagram</b> — click a component to see its role, then step through the payment-create and status-query flows. Every dollar must be accounted for.</div>
+    <div class="badges">
+      <span class="badge lvl">Use case 11 · HLD</span>
+      <span class="badge">Canvas 1 of 3</span>
+      <span class="badge">interactive</span>
+      <span class="badge">CP · strong consistency · exactly-once</span>
+    </div>
+    <div class="legend">
+      <span><i class="dot" style="background:var(--eden)"></i> click a component</span>
+      <span><i class="dot" style="background:var(--survivor)"></i> write / create path</span>
+      <span><i class="dot" style="background:var(--eden)"></i> current step</span>
+      <span><i class="dot" style="background:var(--old)"></i> data stores</span>
+      <span><i class="dot" style="background:var(--warn)"></i> async / off hot-path</span>
+    </div>
+  </header>
+
+  <!-- A · PROBLEM & REQUIREMENTS -->
+  <section>
+    <div class="sec-h"><span class="n">A</span><h2>Problem &amp; requirements</h2><span class="tag">clarify first</span></div>
+    <div class="grid g2">
+      <div class="card">
+        <div class="kicker">functional</div>
+        <ul class="tight">
+          <li>Process payments (cards / UPI / bank transfer) with a client <b>idempotency key</b> → <b>exactly-once</b> execution, never a double-charge.</li>
+          <li>Two-phase <b>auth + capture</b>; full &amp; partial <b>refunds</b> that post ledger <i>reversal</i> entries (never mutate the original).</li>
+          <li>Immutable <b>double-entry ledger</b> — every movement = 1 DEBIT + 1 CREDIT of equal amount.</li>
+          <li>Signed <b>HMAC webhooks</b> with retry; status &amp; balance queries; daily <b>reconciliation</b> vs bank files; 135+ currencies; fraud scoring.</li>
+        </ul>
+      </div>
+      <div class="card">
+        <div class="kicker">non-functional</div>
+        <ul class="tight">
+          <li><b>Payment latency</b> p99 &lt; 500 ms (card network is the bottleneck); <b>status query</b> p99 &lt; 50 ms.</li>
+          <li><b>Availability</b> 99.999% (≈5.26 min/yr) — downtime is direct revenue loss for every merchant.</li>
+          <li><b>Strong consistency</b> for ledger &amp; payments — a <b>CP</b> system; money cannot be eventually consistent.</li>
+          <li><b>Zero</b> financial data loss; SUM(debits) = SUM(credits) <i>always</i>. Immutable, append-only audit trail (PCI-DSS / SOX).</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <!-- B · ESTIMATION -->
+  <section>
+    <div class="sec-h"><span class="n">B</span><h2>Back-of-envelope estimation</h2><span class="tag">1B txns/day · $10T/yr</span></div>
+    <div class="chips">
+      <div class="chip"><span class="k">Txns / day</span><span class="v">1 B</span></div>
+      <div class="chip"><span class="k">Peak TPS</span><span class="v">~35 K/s</span></div>
+      <div class="chip"><span class="k">Flash-sale peak</span><span class="v">~175 K/s</span></div>
+      <div class="chip"><span class="k">Payment p99</span><span class="v">&lt; 500 ms</span></div>
+      <div class="chip"><span class="k">Status p99</span><span class="v">&lt; 50 ms</span></div>
+      <div class="chip"><span class="k">Availability</span><span class="v">99.999%</span></div>
+      <div class="chip"><span class="k">Storage / yr</span><span class="v">~500 TB</span></div>
+      <div class="chip"><span class="k">Idempotency TTL</span><span class="v">48 h</span></div>
+    </div>
+    <div class="callout tip"><b>Derivation:</b> 1B/day ÷ 86,400 × 3 (peak) ≈ <b>35K TPS</b>; holiday flash sale ×5 ≈ <b>175K TPS</b>. Payment ~1 KB × 1B ≈ 1 TB/day of records; ledger = 2 entries × ~200 B × 1B ≈ 400 GB/day; idempotency keys ~1 KB × 1B with a 48 h TTL ≈ ~2 TB active. The <b>card-network auth (100–300 ms) dominates</b> the p99 budget — everything else is single-digit ms. <span class="run">→ full math on canvas 3 &amp; F · Estimation</span></div>
+  </section>
+
+  <!-- C · INTERACTIVE ARCHITECTURE -->
+  <section data-flowscope>
+    <div class="sec-h"><span class="n">C</span><h2>Architecture — click components, then step the flows</h2><span class="tag">the design, from the diagram</span></div>
+    <div>
+      <div class="arch">
+        <svg viewBox="0 0 900 470" width="100%" style="max-width:900px" role="img" aria-label="Payment system architecture">
+          <defs>
+            <marker id="ah" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" fill="var(--muted)"></path></marker>
+          </defs>
+
+          <!-- arrows (drawn first, under the boxes) -->
+          <line class="arrow" x1="102" y1="212" x2="116" y2="212" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"
+                data-flow="write read" data-write="1" data-read="1"
+                data-desc-write="Merchant backend POSTs /api/v1/payments with amount, card token, and an Idempotency-Key header." data-desc-read="Merchant GETs /api/v1/payments/{id} to poll the current payment status."></line>
+          <line class="arrow" x1="210" y1="212" x2="224" y2="212" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"
+                data-flow="write read" data-write="2" data-read="2"
+                data-desc-write="L7 load balancer terminates TLS 1.3, health-checks, and routes to a gateway node." data-desc-read="LB terminates TLS and routes the read to any gateway node."></line>
+          <line class="arrow" x1="270" y1="236" x2="396" y2="299" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"
+                data-flow="write" data-write="3"
+                data-desc-write="Gateway does the idempotency check in Redis: SET key=PROCESSING with NX. COMPLETED → return the cached response; PROCESSING → 409 (concurrent in-flight)."></line>
+          <line class="arrow" x1="330" y1="212" x2="358" y2="212" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"
+                data-flow="write read" data-write="4" data-read="3"
+                data-desc-write="Gateway authenticates the merchant API key, rate-limits, validates the body, then forwards to the Payment Service." data-desc-read="Gateway authenticates and forwards the status lookup to the Payment Service."></line>
+          <line class="arrow" x1="440" y1="236" x2="548" y2="299" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"
+                data-flow="write read" data-write="5" data-read="5"
+                data-desc-write="Payment Service INSERTs the payment record (status INITIATED), then UPDATEs it to AUTHORIZED → CAPTURED as the flow proceeds." data-desc-read="Cache MISS → read the payment row from PostgreSQL (the source of truth) and backfill Redis."></line>
+          <line class="arrow" x1="418" y1="188" x2="418" y2="130" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"
+                data-flow="write" data-write="6"
+                data-desc-write="Payment Service calls Fraud Detection to score risk (velocity + blocklist + geo rules, then an ML model). risk>0.8 → decline; 0.5–0.8 → 3-D Secure step-up."></line>
+          <line class="arrow" x1="476" y1="200" x2="512" y2="150" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"
+                data-flow="write" data-write="7"
+                data-desc-write="If approved, Payment Service asks the Payment Processor to authorize then capture the funds."></line>
+          <line class="arrow" x1="622" y1="144" x2="660" y2="144" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"
+                data-flow="write" data-write="8"
+                data-desc-write="Processor adapter (Visa / MC / UPI) sends auth + capture to the card network. Timeout ≠ failure — it queries status before any retry to avoid a double-auth."></line>
+          <line class="arrow" x1="476" y1="212" x2="510" y2="212" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"
+                data-flow="write" data-write="9"
+                data-desc-write="On capture, Payment Service tells the Ledger Service to record the double-entry (DEBIT customer funding source, CREDIT merchant pending balance)."></line>
+          <line class="arrow" x1="567" y1="236" x2="567" y2="298" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"
+                data-flow="write" data-write="10"
+                data-desc-write="Ledger Service INSERTs the two balanced entries in a SINGLE PostgreSQL transaction. Append-only — a DB trigger rejects any UPDATE/DELETE."></line>
+          <path class="arrow" d="M372,236 C 320,290 320,345 375,392" fill="none" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"
+                data-flow="write" data-write="11"
+                data-desc-write="Payment Service publishes payment.succeeded to Kafka (fire-and-forget) and writes the idempotency key = COMPLETED + cached response in Redis."></path>
+          <line class="arrow" x1="410" y1="236" x2="410" y2="300" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"
+                data-flow="read" data-read="4"
+                data-desc-read="Status query hits Redis first — a cache HIT returns the payment in 1–2 ms."></line>
+          <path class="arrow" d="M362,196 C 240,150 130,150 62,184" fill="none" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"
+                data-flow="write read" data-write="12" data-read="6"
+                data-desc-write="Payment Service returns 201 Created (payment object) back through the gateway to the merchant." data-desc-read="Payment Service returns 200 OK with the payment status + timeline."></path>
+          <line class="arrow" x1="476" y1="416" x2="510" y2="416" stroke="var(--muted)" stroke-width="2" stroke-dasharray="4 3" marker-end="url(#ah)"
+                data-flow="write" data-write="13"
+                data-desc-write="Webhook Service consumes payment.succeeded from Kafka — off the payment hot path."></line>
+          <path class="arrow" d="M512,432 L512,452 L58,452 L58,238" fill="none" stroke="var(--muted)" stroke-width="2" stroke-dasharray="4 3" marker-end="url(#ah)"
+                data-flow="write" data-write="14"
+                data-desc-write="Webhook Service POSTs the event to the merchant URL, signed with HMAC-SHA256, retried with exponential backoff (up to 24 h)."></path>
+          <text x="600" y="446" fill="var(--faint)" font-size="9">async webhook delivery</text>
+
+          <!-- nodes -->
+          <g data-node style="cursor:pointer" data-title="Merchant Backend" data-detail="The API client. POSTs /payments to charge a customer (with an Idempotency-Key), and GETs /payments/{id} for status. Receives signed webhooks and fulfils orders."><rect x="14" y="188" width="88" height="48" rx="9" fill="var(--panel-2)" stroke="var(--eden)"></rect><text x="58" y="211" text-anchor="middle" fill="var(--eden)" font-size="12" font-weight="600">Merchant</text><text x="58" y="226" text-anchor="middle" fill="var(--faint)" font-size="10">backend</text></g>
+          <g data-node style="cursor:pointer" data-title="Load Balancer (L7)" data-detail="<b>Role:</b> single entry point — TLS 1.3 termination, health checks, WAF/DDoS shielding, routing.<br><b>HA:</b> active-passive with Route 53 / DNS failover across regions (avoid the SPOF).<br><b>Tech:</b> ALB / App Gateway / Cloud LB."><rect x="118" y="188" width="92" height="48" rx="9" fill="var(--panel-2)" stroke="var(--border)"></rect><text x="164" y="212" text-anchor="middle" fill="var(--text)" font-size="12" font-weight="600">Load</text><text x="164" y="227" text-anchor="middle" fill="var(--text)" font-size="12" font-weight="600">Balancer</text></g>
+          <g data-node style="cursor:pointer" data-title="Payment API Gateway" data-detail="<b>Role:</b> the three concerns that MUST resolve before any business logic — <b>authentication</b> (SHA-256 API-key lookup), <b>rate limiting</b> (token bucket, 1K req/s per merchant), and the <b>idempotency check</b> (Redis SET NX).<br><b>Also:</b> JSON-schema validation, circuit breakers, 30 s timeout."><rect x="226" y="188" width="104" height="48" rx="9" fill="var(--panel-2)" stroke="var(--border)"></rect><text x="278" y="208" text-anchor="middle" fill="var(--text)" font-size="12" font-weight="600">API Gateway</text><text x="278" y="223" text-anchor="middle" fill="var(--faint)" font-size="10">auth · rate-limit · idem</text></g>
+          <g data-node style="cursor:pointer" data-title="Payment Service" data-detail="<b>Role:</b> central orchestrator of the payment state machine (INITIATED → AUTHORIZED → CAPTURED → SETTLED). Coordinates fraud, processor, ledger, Kafka.<br><b>Crash-safe:</b> a recovery job scans stale AUTHORIZED rows every 5 min and queries the processor — a card-network timeout is NOT a failure.<br><b>Tech:</b> stateless containers, horizontal auto-scale."><rect x="360" y="188" width="116" height="48" rx="9" fill="var(--panel-2)" stroke="var(--survivor)"></rect><text x="418" y="208" text-anchor="middle" fill="var(--survivor)" font-size="12" font-weight="600">Payment Service</text><text x="418" y="223" text-anchor="middle" fill="var(--faint)" font-size="10">state-machine orchestrator</text></g>
+          <g data-node style="cursor:pointer" data-title="Fraud Detection Service" data-detail="<b>Role:</b> scores each transaction BEFORE authorization. Chain of rules (velocity limits, blocklists, geo/IP-vs-issuer anomalies) then an ML model.<br><b>Outcome:</b> risk&gt;0.8 → decline · 0.5–0.8 → 3-D Secure step-up · &lt;0.5 → approve. Rules are configurable per merchant."><rect x="360" y="80" width="116" height="48" rx="9" fill="var(--panel-2)" stroke="var(--border)"></rect><text x="418" y="100" text-anchor="middle" fill="var(--text)" font-size="12" font-weight="600">Fraud Detection</text><text x="418" y="115" text-anchor="middle" fill="var(--faint)" font-size="10">rules + ML score</text></g>
+          <g data-node style="cursor:pointer" data-title="Payment Processor" data-detail="<b>Role:</b> abstracts each external network behind a Strategy-pattern adapter (Visa / MC / Amex / UPI / bank). Routes by card BIN + method.<br><b>Timeout handling:</b> query status before retry (avoid double-auth).<br><b>Circuit breaker per network:</b> a Visa outage never blocks Mastercard payments."><rect x="512" y="120" width="110" height="48" rx="9" fill="var(--panel-2)" stroke="var(--border)"></rect><text x="567" y="140" text-anchor="middle" fill="var(--text)" font-size="12" font-weight="600">Payment</text><text x="567" y="155" text-anchor="middle" fill="var(--text)" font-size="12" font-weight="600">Processor</text></g>
+          <g data-node style="cursor:pointer" data-title="Card Network (external)" data-detail="<b>Role:</b> Visa / Mastercard / Amex / NPCI-UPI — the external rails that actually authorize and capture funds. Returns an auth_code and settlement reference.<br><b>Reality:</b> 100–300 ms latency dominates the p99 budget, and it can time out or double-confirm — the whole design defends against this."><rect x="662" y="120" width="110" height="48" rx="9" fill="var(--panel-2)" stroke="var(--survivor)"></rect><text x="717" y="140" text-anchor="middle" fill="var(--survivor)" font-size="12" font-weight="600">Card Network</text><text x="717" y="155" text-anchor="middle" fill="var(--faint)" font-size="10">Visa · MC · UPI</text></g>
+          <g data-node style="cursor:pointer" data-title="Ledger Service" data-detail="<b>Role:</b> the financial heart — immutable double-entry bookkeeping. Every movement = 1 DEBIT + 1 CREDIT of equal amount, inserted atomically.<br><b>Invariant:</b> SUM(debits) = SUM(credits) ALWAYS.<br><b>Immutable:</b> DB role has no UPDATE/DELETE; corrections are new reversal entries."><rect x="512" y="188" width="110" height="48" rx="9" fill="var(--panel-2)" stroke="var(--border)"></rect><text x="567" y="208" text-anchor="middle" fill="var(--text)" font-size="12" font-weight="600">Ledger Service</text><text x="567" y="223" text-anchor="middle" fill="var(--faint)" font-size="10">double-entry</text></g>
+          <g data-node style="cursor:pointer" data-title="Redis (idempotency + cache)" data-detail="<b>Role:</b> sub-ms idempotency-key lookup (PROCESSING / COMPLETED + cached response, 48 h TTL), rate-limit counters, and the payment-status read cache.<br><b>Note:</b> PostgreSQL is the durable source of truth; after a failover Redis re-warms in minutes."><rect x="360" y="300" width="116" height="48" rx="9" fill="var(--panel-2)" stroke="var(--old)"></rect><text x="418" y="320" text-anchor="middle" fill="var(--old)" font-size="12" font-weight="600">Redis</text><text x="418" y="335" text-anchor="middle" fill="var(--faint)" font-size="10">idempotency · cache</text></g>
+          <g data-node style="cursor:pointer" data-title="PostgreSQL (Aurora)" data-detail="<b>Role:</b> the ACID source of truth — payments, payment_transitions, ledger_entries, merchants.<br><b>Why RDBMS:</b> the double-entry ledger needs transactions + constraints; strong consistency is non-negotiable.<br><b>Scale:</b> range-partition by created_at, read replicas, Aurora Global (single writer) for multi-region."><rect x="512" y="300" width="110" height="48" rx="9" fill="var(--panel-2)" stroke="var(--old)"></rect><text x="567" y="320" text-anchor="middle" fill="var(--old)" font-size="12" font-weight="600">PostgreSQL</text><text x="567" y="335" text-anchor="middle" fill="var(--faint)" font-size="10">Aurora · ACID</text></g>
+          <g data-node style="cursor:pointer" data-title="Kafka (event bus)" data-detail="<b>Role:</b> decouples async work from the payment hot path. Carries payment.* and refund.* events.<br><b>Consumers:</b> Webhook Service, reconciliation, analytics. Partition by payment_id for per-payment ordering."><rect x="360" y="392" width="116" height="44" rx="9" fill="var(--panel-2)" stroke="var(--warn)"></rect><text x="418" y="419" text-anchor="middle" fill="var(--warn)" font-size="12" font-weight="600">Kafka</text></g>
+          <g data-node style="cursor:pointer" data-title="Webhook Service" data-detail="<b>Role:</b> consumes events and POSTs signed notifications to the merchant's URL.<br><b>Reliability:</b> HMAC-SHA256 signature, exponential-backoff retry (up to 24 h / 15 attempts), a unique event_id for merchant-side dedup, and a DLQ for exhausted deliveries."><rect x="512" y="392" width="110" height="44" rx="9" fill="var(--panel-2)" stroke="var(--warn)"></rect><text x="567" y="413" text-anchor="middle" fill="var(--warn)" font-size="12" font-weight="600">Webhook Svc</text><text x="567" y="428" text-anchor="middle" fill="var(--faint)" font-size="10">HMAC · retry</text></g>
+        </svg>
+      </div>
+      <div class="node-detail"><span class="nd-title">Click any component</span><div class="nd-body">Its role, tech choice, and scaling note appear here. Then use the buttons below to step through a request flow.</div></div>
+
+      <div class="flowctl" data-flowctl>
+        <button class="btn" data-flow="write">Create path (charge)</button>
+        <button class="btn" data-flow="read">Read path (status query)</button>
+        <span style="flex:1"></span>
+        <button class="btn" data-flowstep="prev">◀ Prev</button>
+        <button class="btn" data-flowstep="next">Next ▶</button>
+      </div>
+      <div class="flowlabel" data-flowlabel>Pick <b>Create</b> or <b>Read</b>, then press “Next ▶” to walk the numbered request flow one hop at a time.</div>
+
+      <div class="cloudmap">
+        <div class="kicker" style="margin-top:4px">Managed-service mapping — the same components on each cloud</div>
+        <table class="cloudtable">
+          <thead><tr>
+            <th>Component</th>
+            <th><span class="hdrlogo"><span class="logochip"><img src="../assets/logos/aws.svg" alt="AWS"></span>AWS</span></th>
+            <th><span class="hdrlogo"><span class="logochip"><img src="../assets/logos/gcp.svg" alt="GCP"></span>GCP</span></th>
+            <th><span class="hdrlogo"><span class="logochip"><img src="../assets/logos/azure.svg" alt="Azure"></span>Azure</span></th>
+          </tr></thead>
+          <tbody>
+            <tr><td>Load Balancer</td><td><img class="svcicon" src="../assets/logos/services/aws-elb.svg" alt="">ALB / NLB</td><td><img class="svcicon" src="../assets/logos/services/gcp-elb.svg" alt="">Cloud Load Balancing</td><td><img class="svcicon" src="../assets/logos/services/azure-appgw.svg" alt="">App Gateway</td></tr>
+            <tr><td>API Gateway</td><td><img class="svcicon" src="../assets/logos/services/aws-apigw.svg" alt="">API Gateway + WAF</td><td><img class="svcicon" src="../assets/logos/services/gcp-apigw.svg" alt="">Apigee / Endpoints</td><td><img class="svcicon" src="../assets/logos/services/azure-apim.svg" alt="">API Management</td></tr>
+            <tr><td>Services (Payment / Ledger / Webhook / Fraud)</td><td><img class="svcicon" src="../assets/logos/services/aws-ecs.svg" alt="">ECS / EKS Fargate</td><td><img class="svcicon" src="../assets/logos/services/gcp-run.svg" alt="">GKE / Cloud Run</td><td><img class="svcicon" src="../assets/logos/services/azure-aks.svg" alt="">AKS</td></tr>
+            <tr><td>Idempotency + cache (Redis)</td><td><img class="svcicon" src="../assets/logos/services/aws-elasticache.svg" alt="">ElastiCache</td><td><img class="svcicon" src="../assets/logos/services/gcp-memorystore.svg" alt="">Memorystore</td><td><img class="svcicon" src="../assets/logos/services/azure-redis.svg" alt="">Cache for Redis</td></tr>
+            <tr><td>Payments + ledger DB (RDBMS)</td><td><img class="svcicon" src="../assets/logos/services/aws-rds.svg" alt="">RDS Aurora PostgreSQL</td><td><img class="svcicon" src="../assets/logos/services/gcp-cloudsql.svg" alt="">Cloud SQL / AlloyDB</td><td><img class="svcicon" src="../assets/logos/services/azure-sql.svg" alt="">Azure SQL</td></tr>
+            <tr><td>Event streaming</td><td><img class="svcicon" src="../assets/logos/services/aws-msk.svg" alt="">MSK / Kinesis</td><td><img class="svcicon" src="../assets/logos/services/gcp-pubsub.svg" alt="">Pub/Sub</td><td><img class="svcicon" src="../assets/logos/services/azure-eventhubs.svg" alt="">Event Hubs</td></tr>
+            <tr><td>Webhook / task queue</td><td><img class="svcicon" src="../assets/logos/services/aws-sqs.svg" alt="">SQS + SNS</td><td><img class="svcicon" src="../assets/logos/services/gcp-pubsub.svg" alt="">Pub/Sub + Cloud Tasks</td><td><img class="svcicon" src="../assets/logos/services/azure-servicebus.svg" alt="">Service Bus</td></tr>
+            <tr><td>Audit logs &amp; recon reports</td><td><img class="svcicon" src="../assets/logos/services/aws-s3.svg" alt="">S3 (Object Lock)</td><td><img class="svcicon" src="../assets/logos/services/gcp-cloudstorage.svg" alt="">Cloud Storage</td><td><img class="svcicon" src="../assets/logos/services/azure-blob.svg" alt="">Blob (immutable)</td></tr>
+            <tr><td>Analytics / recon warehouse</td><td><img class="svcicon" src="../assets/logos/services/aws-redshift.svg" alt="">Redshift / Athena</td><td><img class="svcicon" src="../assets/logos/services/gcp-bigquery.svg" alt="">BigQuery</td><td><img class="svcicon" src="../assets/logos/services/azure-synapse.svg" alt="">Synapse</td></tr>
+            <tr><td>Card tokenization / KMS <span class="muted">(no cached icon)</span></td><td>CloudHSM + KMS</td><td>Cloud HSM + Cloud KMS</td><td>Managed HSM + Key Vault</td></tr>
+            <tr><td>Card networks <span class="muted">(3rd-party rails)</span></td><td colspan="3">Visa · Mastercard · Amex · NPCI-UPI · acquiring banks — external, no managed icon</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+
+  <!-- D · API -->
+  <section>
+    <div class="sec-h"><span class="n">D</span><h2>API design</h2><span class="tag">RESTful · idempotent writes</span></div>
+    <table>
+      <thead><tr><th>Endpoint</th><th>Purpose</th><th>Response</th></tr></thead>
+      <tbody>
+        <tr><td><code>POST /api/v1/payments</code></td><td>create a charge (body: amount, currency, payment_method; header: <code>Idempotency-Key</code>)</td><td>201 + payment object / <b>409</b> idempotency-key reuse / <b>402</b> card declined</td></tr>
+        <tr><td><code>GET /api/v1/payments/{id}</code></td><td>status query — source of truth when webhooks are delayed</td><td>200 + status &amp; state-transition timeline / 404</td></tr>
+        <tr><td><code>POST /api/v1/refunds</code></td><td>full or partial refund (posts ledger reversal entries)</td><td>201 + refund (PENDING) / <b>400</b> if it exceeds the original</td></tr>
+        <tr><td><code>POST /api/v1/webhooks</code></td><td>register the merchant endpoint + subscribed events</td><td>201 + endpoint id &amp; signing secret</td></tr>
+        <tr><td><code>GET /api/v1/balance</code></td><td>merchant balance, computed from the ledger</td><td>200 + available / pending / reserved per currency</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <!-- E · DATA MODEL -->
+  <section>
+    <div class="sec-h"><span class="n">E</span><h2>Data model</h2><span class="tag">ACID · append-only ledger</span></div>
+    <div class="grid g2">
+      <div class="card">
+        <div class="kicker">payments (state machine)</div>
+        <pre class="code">id               VARCHAR(36) PK  <span class="cm">// pay_xxx</span>
+merchant_id      VARCHAR(36)
+idempotency_key  VARCHAR(255) UQ <span class="cm">// exactly-once</span>
+amount           BIGINT          <span class="cm">// cents — no floats</span>
+currency         VARCHAR(3)
+status           VARCHAR(20)     <span class="cm">// INITIATED→…→SETTLED</span>
+authorization_code VARCHAR(50)
+settlement_id    VARCHAR(50)     <span class="cm">// recon lookup</span>
+refunded_amount  BIGINT
+created_at       TIMESTAMP</pre>
+        <p class="muted">UNIQUE index on <code>idempotency_key</code> is the DB-level exactly-once guard. Range-partitioned by <code>created_at</code>.</p>
+      </div>
+      <div class="card">
+        <div class="kicker">ledger_entries (append-only)</div>
+        <pre class="code">id             BIGSERIAL PK
+transaction_id VARCHAR(36) <span class="cm">// pairs debit+credit</span>
+payment_id     VARCHAR(36)
+account_id     VARCHAR(36)
+entry_type     VARCHAR(10) <span class="cm">// DEBIT | CREDIT</span>
+amount         BIGINT      <span class="cm">// always &gt; 0</span>
+currency       VARCHAR(3)
+created_at     TIMESTAMP   <span class="cm">// immutable</span></pre>
+        <p class="muted">Every <code>transaction_id</code> = exactly 2 entries; a trigger enforces DEBIT total = CREDIT total. <b>No UPDATE/DELETE</b> — corrections are new reversal rows.</p>
+      </div>
+    </div>
+    <div class="callout"><b>Supporting tables:</b> <code>payment_transitions</code> (state-change timeline) · <code>merchants</code> (api_key_hash, webhook_secret, settlement_currency) · <code>webhook_deliveries</code> (status, attempt_count, next_retry_at) · <code>idempotency_keys</code> (request_hash, cached response_body, 48 h TTL — Redis primary, PostgreSQL durable backup). <span class="run">→ full schema on canvas 2 · LLD</span></div>
+  </section>
+
+  <!-- F · KEY CHOICES -->
+  <section>
+    <div class="sec-h"><span class="n">F</span><h2>Key design choices (deep-dived on canvas 3)</h2><span class="tag">defend these</span></div>
+    <div class="grid g3">
+      <div class="card"><div class="kicker">exactly-once</div><h3>Idempotency key</h3><p class="muted">Client key → Redis <code>SET NX</code> (PROCESSING/COMPLETED + cached response) with a PostgreSQL <b>unique constraint</b> as the durable guard. A retried charge returns the same result in ~2 ms — never double-charges. <span class="run">→ canvas 2 · LLD</span></p></div>
+      <div class="card"><div class="kicker">accounting</div><h3>Double-entry ledger</h3><p class="muted">Append-only, immutable; every movement is a balanced DEBIT/CREDIT pair inserted atomically. SUM(debits)=SUM(credits) is the invariant. The single source of truth for all money.</p></div>
+      <div class="card"><div class="kicker">consistency</div><h3>CP · strong (not AP)</h3><p class="muted">Unlike a URL shortener, money can't be eventually consistent. PostgreSQL/Aurora, single-writer, synchronous replication. Availability comes from active-passive failover + reconciliation, not from relaxing consistency. <span class="run">→ canvas 3</span></p></div>
+    </div>
+  </section>
+
+  <!-- GLOSSARY -->
+  <section>
+    <div class="sec-h"><span class="n">§</span><h2>Glossary — one-liners</h2><span class="tag">terms used above</span></div>
+    <div class="grid g2">
+      <div class="card"><table><tbody>
+        <tr><td><b>Idempotency key</b></td><td>client-supplied token so a retried request returns the same result, never re-executes</td></tr>
+        <tr><td><b>Double-entry ledger</b></td><td>every movement = one DEBIT + one matching CREDIT; funds never appear or vanish</td></tr>
+        <tr><td><b>Auth vs Capture</b></td><td>authorize = hold funds; capture = actually collect them (two-phase)</td></tr>
+        <tr><td><b>Exactly-once</b></td><td>a charge executes precisely once despite network retries or crashes</td></tr>
+        <tr><td><b>Reconciliation</b></td><td>daily batch matching internal ledger against external bank settlement files</td></tr>
+      </tbody></table></div>
+      <div class="card"><table><tbody>
+        <tr><td><b>CP (CAP)</b></td><td>favour Consistency + Partition-tolerance — money can't be eventually consistent</td></tr>
+        <tr><td><b>HMAC-SHA256</b></td><td>keyed signature on the webhook payload so the merchant can verify authenticity</td></tr>
+        <tr><td><b>Settlement (T+2)</b></td><td>funds move from pending → available balance after the bank confirms, ~2 days later</td></tr>
+        <tr><td><b>Circuit breaker</b></td><td>trips a network adapter open after repeated failures so one card network can't sink the rest</td></tr>
+        <tr><td><b>3-D Secure</b></td><td>step-up customer authentication for medium-risk transactions</td></tr>
+      </tbody></table></div>
+    </div>
+  </section>
+
+  <footer>
+    <p>Use case 11 · Payment System — Canvas 1 of 3 (HLD). Grounded in <code>11-payment-system/docs/hld/</code> &amp; <code>docs/cloud/</code>.</p>
+    <p class="run">This use case: HLD · <a href="lld.html">Canvas 2 · LLD</a> · <a href="deepdive.html">Canvas 3 · Deep-dive &amp; Trade-offs</a> &nbsp;|&nbsp; Next → <a href="lld.html">LLD</a> &nbsp;|&nbsp; <a href="../index.html">Hub</a></p>
+  </footer>
+
+</div>
+<script src="../assets/canvas.js"></script>
+</body>
+</html>

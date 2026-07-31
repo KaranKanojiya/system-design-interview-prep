@@ -1,0 +1,370 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>13 · Video Streaming — LLD</title>
+<link rel="stylesheet" href="../assets/canvas.css">
+</head>
+<body>
+<div class="wrap">
+
+  <header class="hero">
+    <h1>Video Streaming — Low-Level Design</h1>
+    <div class="sub">Use case 13 · Canvas 2 of 3. From boxes to classes: the actual Java object model for upload → transcode → stream. Start with the <b>interactive class map</b> — click a class to see its responsibility and how <code>AppConfig → VideoController → VideoService (Facade) → sub-services → Strategy/Repository</code> is wired — then dig into the ABR selection algorithm, the three pluggable strategy axes, and the request sequences.</div>
+    <div class="badges">
+      <span class="badge lvl">Use case 13 · LLD</span>
+      <span class="badge">Canvas 2 of 3</span>
+      <span class="badge">interactive</span>
+      <span class="badge">Strategy ×3 · Facade · Builder · State</span>
+    </div>
+    <div class="legend">
+      <span><i class="dot" style="background:var(--eden)"></i> entry / composition root</span>
+      <span><i class="dot" style="background:var(--survivor)"></i> interface / contract</span>
+      <span><i class="dot" style="background:var(--old)"></i> concrete implementation</span>
+      <span><i class="dot" style="background:var(--warn)"></i> domain model</span>
+      <span><i class="dot" style="background:var(--muted)"></i> click a class for its role</span>
+    </div>
+  </header>
+
+  <!-- A · CLASS DESIGN (interactive class map) -->
+  <section>
+    <div class="sec-h"><span class="n">A</span><h2>Class design — click a class in the map</h2><span class="tag">the object model, wired</span></div>
+    <div>
+      <div class="arch">
+        <svg viewBox="0 0 760 340" width="100%" style="max-width:760px" role="img" aria-label="Video streaming class map">
+          <defs>
+            <marker id="ah" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" fill="var(--muted)"></path></marker>
+          </defs>
+
+          <!-- wiring arrows -->
+          <line class="arrow" x1="88" y1="62" x2="88" y2="90" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"></line>
+          <line class="arrow" x1="88" y1="134" x2="88" y2="170" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"></line>
+          <line class="arrow" x1="158" y1="186" x2="190" y2="40"  stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"></line>
+          <line class="arrow" x1="158" y1="188" x2="190" y2="108" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"></line>
+          <line class="arrow" x1="158" y1="192" x2="190" y2="176" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"></line>
+          <line class="arrow" x1="158" y1="196" x2="190" y2="244" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"></line>
+          <line class="arrow" x1="158" y1="200" x2="190" y2="312" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"></line>
+          <line class="arrow" x1="340" y1="108" x2="388" y2="92"  stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"></line>
+          <line class="arrow" x1="340" y1="176" x2="388" y2="180" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"></line>
+          <line class="arrow" x1="538" y1="92"  x2="596" y2="92"  stroke="var(--muted)" stroke-width="2" stroke-dasharray="4 3" marker-end="url(#ah)"></line>
+          <line class="arrow" x1="538" y1="180" x2="596" y2="180" stroke="var(--muted)" stroke-width="2" stroke-dasharray="4 3" marker-end="url(#ah)"></line>
+          <line class="arrow" x1="538" y1="268" x2="596" y2="268" stroke="var(--muted)" stroke-width="2" stroke-dasharray="4 3" marker-end="url(#ah)"></line>
+          <text x="96" y="84" fill="var(--faint)" font-size="9">wires</text>
+          <text x="96" y="162" fill="var(--faint)" font-size="9">uses</text>
+
+          <!-- c1 -->
+          <g data-node style="cursor:pointer" data-title="AppConfig  (config)" data-detail="<b>Role:</b> composition root / poor-man's DI container (Factory pattern) — the ONLY place that says <code>new ConcreteClass()</code>.<br><b>Wiring order:</b> Layer 1 repositories (Video/User/WatchHistory) → Layer 2 <code>InMemoryVideoStore</code> → Layer 3 strategies (Parallel/Sequential transcoding, Throughput/Buffer ABR, Trending/Personalized) → Layer 4 services → VideoController + StreamingStatsDisplay.<br>Holds a shared <code>Map&lt;String,VideoMetadata&gt; metadataMap</code> that simulates a shared table. In production: Spring <code>@Configuration</code> + <code>@Bean</code>."><rect x="18" y="18" width="140" height="44" rx="9" fill="var(--panel-2)" stroke="var(--eden)"></rect><text x="88" y="38" text-anchor="middle" fill="var(--eden)" font-size="12" font-weight="600">AppConfig</text><text x="88" y="53" text-anchor="middle" fill="var(--faint)" font-size="10">composition root</text></g>
+
+          <g data-node style="cursor:pointer" data-title="VideoController  (controller)" data-detail="<b>Role:</b> framework-free stand-in for a Spring @RestController.<br><b>Methods:</b> handleUpload → uploadVideo, handleStream → streamVideo, handleSearch, handleRecommendations, handleGetStats.<br><b>Wiring:</b> holds a <code>VideoService</code> (the Facade) and a <code>RecommendationService</code>; every endpoint is a thin one-line delegate returning a formatted string."><rect x="18" y="90" width="140" height="44" rx="9" fill="var(--panel-2)" stroke="var(--border)"></rect><text x="88" y="110" text-anchor="middle" fill="var(--text)" font-size="12" font-weight="600">VideoController</text><text x="88" y="125" text-anchor="middle" fill="var(--faint)" font-size="10">REST endpoints</text></g>
+
+          <g data-node style="cursor:pointer" data-title="VideoService  «Facade»" data-detail="<b>Role:</b> the Facade that orchestrates the whole lifecycle. Callers never touch sub-services directly.<br><b>uploadVideo():</b> Video.Builder → repo.save → uploadService.initiateUpload + uploadChunk×N → video.markUploaded() → transcodingService.transcodeVideo().<br><b>streamVideo():</b> getVideo → streamingService.simulateStreaming(bandwidth, 60s) → analyticsService.recordView.<br>Depends on VideoRepository + Upload/Transcoding/Streaming/Analytics/Search services."><rect x="18" y="170" width="140" height="44" rx="9" fill="var(--panel-2)" stroke="var(--border)"></rect><text x="88" y="190" text-anchor="middle" fill="var(--text)" font-size="12" font-weight="600">VideoService</text><text x="88" y="205" text-anchor="middle" fill="var(--faint)" font-size="10">«Facade» orchestrator</text></g>
+
+          <g data-node style="cursor:pointer" data-title="Video  (model)" data-detail="<b>Role:</b> the core domain entity, built via the <b>Builder pattern</b> — <code>new Video.Builder(videoId, title, uploaderId)</code> then optional <code>.description().fileSizeBytes().originalResolution().codec()...build()</code>.<br><b>Immutable identity</b> (videoId/title/uploaderId/codec) + a mutable <code>volatile VideoStatus status</code>.<br><b>State methods:</b> markUploaded, startTranscoding, markReady, markFailed, delete — each guards the legal transition and throws IllegalStateException otherwise (State pattern)."><rect x="18" y="256" width="140" height="44" rx="9" fill="var(--panel-2)" stroke="var(--warn)"></rect><text x="88" y="276" text-anchor="middle" fill="var(--warn)" font-size="12" font-weight="600">Video</text><text x="88" y="291" text-anchor="middle" fill="var(--faint)" font-size="10">«Builder» entity</text></g>
+
+          <!-- c2 services -->
+          <g data-node style="cursor:pointer" data-title="UploadService" data-detail="<b>Role:</b> chunked, resumable upload. <code>CHUNK_SIZE_BYTES = 5&nbsp;MB</code>.<br><b>initiateUpload(video):</b> computes <code>ceil(fileSize / 5MB)</code> expected chunks, records in <code>expectedChunkCounts</code>.<br><b>uploadChunk(videoId, index, data):</b> stores via VideoStore, tracks arrivals in a <code>ConcurrentHashMap&lt;String,Set&lt;Integer&gt;&gt;</code>. <code>getMissingChunks()</code> drives resume; <code>getUploadProgress()</code> reports %."><rect x="190" y="18" width="150" height="44" rx="9" fill="var(--panel-2)" stroke="var(--old)"></rect><text x="265" y="38" text-anchor="middle" fill="var(--old)" font-size="12" font-weight="600">UploadService</text><text x="265" y="53" text-anchor="middle" fill="var(--faint)" font-size="10">chunked / resumable</text></g>
+
+          <g data-node style="cursor:pointer" data-title="TranscodingService" data-detail="<b>Role:</b> manages transcode jobs; delegates HOW to a <code>TranscodingStrategy</code>.<br><b>transcodeVideo(video):</b> video.startTranscoding() → buildResolutionLadder(source) → strategy.transcode(video, targets, codec) → video.markReady() and register jobs in <code>jobsByVideo</code>.<br>AppConfig wires two instances — one Parallel, one Sequential — for side-by-side comparison."><rect x="190" y="86" width="150" height="44" rx="9" fill="var(--panel-2)" stroke="var(--old)"></rect><text x="265" y="106" text-anchor="middle" fill="var(--old)" font-size="12" font-weight="600">TranscodingService</text><text x="265" y="121" text-anchor="middle" fill="var(--faint)" font-size="10">job manager</text></g>
+
+          <g data-node style="cursor:pointer" data-title="StreamingService" data-detail="<b>Role:</b> generates the manifest and runs the ABR playback loop; delegates HOW-to-pick-quality to an <code>ABRStrategy</code>.<br><b>generateManifest(video, protocol):</b> builds a <code>StreamManifest</code> (HLS/DASH) of one <code>StreamVariant</code> per available resolution.<br><b>simulateStreaming(video, user, bandwidth, seconds):</b> each tick calls <code>abrStrategy.selectResolution(bw, buffer, available)</code> and logs the chosen rung."><rect x="190" y="154" width="150" height="44" rx="9" fill="var(--panel-2)" stroke="var(--old)"></rect><text x="265" y="174" text-anchor="middle" fill="var(--old)" font-size="12" font-weight="600">StreamingService</text><text x="265" y="189" text-anchor="middle" fill="var(--faint)" font-size="10">manifest + ABR loop</text></g>
+
+          <g data-node style="cursor:pointer" data-title="CDNService" data-detail="<b>Role:</b> simulated CDN edge in front of the origin <code>VideoStore</code> (S3).<br><b>getChunk(videoId, res, index):</b> check edge cache → HIT returns fast; MISS fetches from origin, caches at edge, returns.<br>Edge cache is an access-ordered <code>LinkedHashMap</code> with <code>removeEldestEntry</code> → <b>LRU eviction</b> at <code>maxCacheSize</code>. Tracks <code>cacheHits</code>/<code>cacheMisses</code> (AtomicLong) → <code>getHitRate()</code>."><rect x="190" y="222" width="150" height="44" rx="9" fill="var(--panel-2)" stroke="var(--old)"></rect><text x="265" y="242" text-anchor="middle" fill="var(--old)" font-size="12" font-weight="600">CDNService</text><text x="265" y="257" text-anchor="middle" fill="var(--faint)" font-size="10">LRU edge cache</text></g>
+
+          <g data-node style="cursor:pointer" data-title="AnalyticsService" data-detail="<b>Role:</b> view counts, watch time, engagement (Observer-flavoured).<br><b>recordView(videoId, userId, seconds):</b> increments the video's <code>viewCount</code> in the shared <code>VideoMetadata</code> (AtomicLong) and appends a <code>WatchHistory</code> record via WatchHistoryRepository.<br>Feeds TrendingRecommendation (view velocity) and PersonalizedRecommendation (category affinity)."><rect x="190" y="290" width="150" height="44" rx="9" fill="var(--panel-2)" stroke="var(--old)"></rect><text x="265" y="310" text-anchor="middle" fill="var(--old)" font-size="12" font-weight="600">AnalyticsService</text><text x="265" y="325" text-anchor="middle" fill="var(--faint)" font-size="10">views / watch time</text></g>
+
+          <!-- c3 interfaces -->
+          <g data-node style="cursor:pointer" data-title="TranscodingStrategy  «interface»" data-detail="<b>Contract:</b> <code>List&lt;TranscodeJob&gt; transcode(Video video, List&lt;Resolution&gt; targets, Codec codec)</code> + <code>getStrategyName()</code>.<br><b>Why:</b> TranscodingService never branches on parallel-vs-sequential — it just calls <code>transcode(...)</code>. Adding a DistributedTranscodingStrategy is a new class + one AppConfig line (Open-Closed)."><rect x="388" y="70" width="150" height="44" rx="9" fill="var(--panel-2)" stroke="var(--survivor)"></rect><text x="463" y="90" text-anchor="middle" fill="var(--survivor)" font-size="11" font-weight="600">TranscodingStrategy</text><text x="463" y="105" text-anchor="middle" fill="var(--faint)" font-size="10">«interface»</text></g>
+
+          <g data-node style="cursor:pointer" data-title="ABRStrategy  «interface»" data-detail="<b>Contract:</b> <code>Resolution selectResolution(long bandwidthKbps, double bufferSeconds, List&lt;Resolution&gt; available)</code> + <code>getStrategyName()</code>.<br><b>Why:</b> the playback loop asks the strategy which rung to fetch next without knowing the algorithm — swap Throughput↔Buffer per user cohort for A/B testing, zero player changes."><rect x="388" y="158" width="150" height="44" rx="9" fill="var(--panel-2)" stroke="var(--survivor)"></rect><text x="463" y="178" text-anchor="middle" fill="var(--survivor)" font-size="12" font-weight="600">ABRStrategy</text><text x="463" y="193" text-anchor="middle" fill="var(--faint)" font-size="10">«interface»</text></g>
+
+          <g data-node style="cursor:pointer" data-title="RecommendationStrategy  «interface»" data-detail="<b>Contract:</b> <code>List&lt;Video&gt; recommend(String userId, int limit)</code> + <code>getStrategyName()</code>.<br><b>Why:</b> RecommendationService (used by VideoController) holds one strategy field. Trending handles cold-start; Personalized uses watch history. Swap or A/B test without touching the service."><rect x="388" y="246" width="150" height="44" rx="9" fill="var(--panel-2)" stroke="var(--survivor)"></rect><text x="463" y="264" text-anchor="middle" fill="var(--survivor)" font-size="11" font-weight="600">RecommendationStrategy</text><text x="463" y="279" text-anchor="middle" fill="var(--faint)" font-size="10">«interface»</text></g>
+
+          <!-- c4 concrete -->
+          <g data-node style="cursor:pointer" data-title="Parallel / Sequential TranscodingStrategy" data-detail="<b>ParallelTranscodingStrategy</b> (default) — submits every resolution job to a fixed <code>ExecutorService</code> (AppConfig wires 6 threads), collects via <code>Future.get()</code>. Wall-clock = <b>max</b> of the individual times.<br><b>SequentialTranscodingStrategy</b> — one resolution at a time; wall-clock = <b>sum</b>. Baseline for the interview comparison (2.5× speedup)."><rect x="596" y="70" width="150" height="44" rx="9" fill="var(--panel-2)" stroke="var(--old)"></rect><text x="671" y="88" text-anchor="middle" fill="var(--old)" font-size="10" font-weight="600">Parallel / Sequential</text><text x="671" y="103" text-anchor="middle" fill="var(--faint)" font-size="10">ExecutorService vs loop</text></g>
+
+          <g data-node style="cursor:pointer" data-title="Throughput / Buffer ABR" data-detail="<b>ThroughputBasedABR</b> — usable = 0.8 × measured bandwidth; pick the highest rung whose bitrate ≤ usable. Aggressive, YouTube-style.<br><b>BufferBasedABR</b> — buffer &lt; 5s → lowest rung; &gt; 30s → highest; between → interpolate index linearly (Netflix BBA). Conservative, avoids rebuffering."><rect x="596" y="158" width="150" height="44" rx="9" fill="var(--panel-2)" stroke="var(--old)"></rect><text x="671" y="176" text-anchor="middle" fill="var(--old)" font-size="10" font-weight="600">Throughput / Buffer</text><text x="671" y="191" text-anchor="middle" fill="var(--faint)" font-size="10">ABR impls</text></g>
+
+          <g data-node style="cursor:pointer" data-title="Trending / Personalized Recommendation" data-detail="<b>TrendingRecommendation</b> — videos uploaded in the last window sorted by viewCount desc; great for cold-start.<br><b>PersonalizedRecommendation</b> — builds category affinity from the user's WatchHistory, scores unwatched videos (affinity × recency × popularity), sorts desc."><rect x="596" y="246" width="150" height="44" rx="9" fill="var(--panel-2)" stroke="var(--old)"></rect><text x="671" y="264" text-anchor="middle" fill="var(--old)" font-size="10" font-weight="600">Trending / Personalized</text><text x="671" y="279" text-anchor="middle" fill="var(--faint)" font-size="10">recommendation impls</text></g>
+        </svg>
+      </div>
+      <div class="node-detail"><span class="nd-title">Click any class</span><div class="nd-body">Its responsibility, key methods, and how it is wired appear here. Solid arrows are <i>uses</i> / <i>wires</i>; dashed arrows are <i>implements</i>. Notice each sub-service depends only on a strategy <b>«interface»</b> — that is what makes transcoding, ABR, and recommendation independently swappable and A/B-testable.</div></div>
+    </div>
+  </section>
+
+  <!-- B · CORE ALGORITHMS -->
+  <section>
+    <div class="sec-h"><span class="n">B</span><h2>Adaptive bitrate — the core algorithm</h2><span class="tag">ThroughputBasedABR.selectResolution()</span></div>
+    <div class="grid g2">
+      <div class="card">
+        <div class="kicker">the code (grounded in source)</div>
+        <pre class="code"><span class="kw">public</span> Resolution <span class="ty">selectResolution</span>(
+        <span class="kw">long</span> bandwidthKbps, <span class="kw">double</span> bufferSeconds,
+        List&lt;Resolution&gt; available) {
+  <span class="kw">if</span> (available == <span class="kw">null</span> || available.isEmpty())
+      <span class="kw">return</span> Resolution.P240;         <span class="cm">// floor</span>
+  <span class="cm">// only trust 80% of the measured pipe</span>
+  <span class="kw">long</span> usable = (<span class="kw">long</span>)(bandwidthKbps * <span class="num">0.8</span>);
+  Resolution selected = available.get(<span class="num">0</span>); <span class="cm">// lowest fallback</span>
+  <span class="kw">for</span> (Resolution res : available) {   <span class="cm">// ascending bitrate</span>
+    <span class="kw">if</span> (res.getBitrateKbps() &lt;= usable)
+        selected = res;                 <span class="cm">// keep climbing</span>
+  }
+  <span class="kw">return</span> selected;
+}</pre>
+        <p class="muted">Rungs (Kbps): P240=400 · P360=750 · P480=1000 · P720=2500 · P1080=4500 · P4K=12000.</p>
+      </div>
+      <div class="card">
+        <div class="kicker">worked example — 6 Mbps link, full buffer</div>
+        <pre class="code"><span class="cm">// player measured 6000 Kbps this tick</span>
+usable = 6000 * 0.8 = <span class="num">4800</span> Kbps
+
+P240   400 &lt;= 4800 ? <span class="st">yes</span> → selected=P240
+P360   750 &lt;= 4800 ? <span class="st">yes</span> → selected=P360
+P480  1000 &lt;= 4800 ? <span class="st">yes</span> → selected=P480
+P720  2500 &lt;= 4800 ? <span class="st">yes</span> → selected=P720
+P1080 4500 &lt;= 4800 ? <span class="st">yes</span> → selected=P1080
+P4K  12000 &lt;= 4800 ? <span class="st">no</span>  <span class="cm">■ keep P1080</span>
+
+chosen rung → <span class="st">P1080</span>  (4.5 Mbps)</pre>
+        <p class="muted">The 4.5 Mbps rung fits inside the 4.8 Mbps safety budget; 4K's 12 Mbps blows past it. The 20% headroom is the buffer against a bandwidth dip before the next tick.</p>
+      </div>
+    </div>
+    <div class="callout tip"><b>The other core algorithm — parallel transcode.</b> A 1080p source fans into 5 lower rungs. <b>SequentialTranscodingStrategy</b> runs them one-by-one → wall-clock = <code>2+3+5+8+12 = 30&nbsp;min</code> (sum). <b>ParallelTranscodingStrategy</b> submits all 5 to a 6-thread <code>ExecutorService</code> and blocks on <code>Future.get()</code> → wall-clock = <code>max(2,3,5,8,12) = 12&nbsp;min</code>. Same <b>O(N) compute</b>, but latency drops from O(N) to O(1) rungs — a 2.5× speedup, and exactly why YouTube transcodes across a distributed worker fleet.</div>
+  </section>
+
+  <!-- C · STRATEGY AXES (tabs) -->
+  <section>
+    <div class="sec-h"><span class="n">C</span><h2>Three strategy axes (Strategy pattern ×3)</h2><span class="tag">swap the algorithm, not the service</span></div>
+    <div data-tabscope>
+      <div class="tabs">
+        <button class="tab active" data-tab="tc">Transcoding</button>
+        <button class="tab" data-tab="abr">ABR</button>
+        <button class="tab" data-tab="rec">Recommendation</button>
+        <button class="tab" data-tab="beyond">Beyond MVP</button>
+      </div>
+      <div class="tabpanel active" data-panel="tc">
+        <p><b>TranscodingStrategy</b> — HOW a raw video becomes multiple rungs. <span class="run">held by TranscodingService</span></p>
+        <ul class="tight">
+          <li><b>ParallelTranscodingStrategy</b> (default) — every rung submitted to a fixed thread pool; wall-clock = max of the individual times. Production choice.</li>
+          <li><b>SequentialTranscodingStrategy</b> — one rung at a time; wall-clock = sum. Budget tier / comparison baseline.</li>
+          <li><b>Cost:</b> both O(N) compute; parallel trades peak resource use for lower latency.</li>
+        </ul>
+      </div>
+      <div class="tabpanel" data-panel="abr">
+        <p><b>ABRStrategy</b> — WHICH rung the player fetches next. <span class="run">held by StreamingService</span></p>
+        <ul class="tight">
+          <li><b>ThroughputBasedABR</b> — highest rung ≤ 80% of measured bandwidth. Aggressive, maximizes quality, YouTube-style; risks rebuffering on a sudden dip.</li>
+          <li><b>BufferBasedABR</b> — maps buffer fullness to rung (&lt;5s → lowest, &gt;30s → highest, else interpolate). Conservative, Netflix BBA; avoids stalls.</li>
+        </ul>
+      </div>
+      <div class="tabpanel" data-panel="rec">
+        <p><b>RecommendationStrategy</b> — WHICH videos to suggest. <span class="run">held by RecommendationService</span></p>
+        <ul class="tight">
+          <li><b>TrendingRecommendation</b> — recent uploads sorted by viewCount desc; solves the cold-start problem for new/anonymous users.</li>
+          <li><b>PersonalizedRecommendation</b> — category affinity from WatchHistory × recency × popularity; better for logged-in users with a history.</li>
+        </ul>
+      </div>
+      <div class="tabpanel" data-panel="beyond">
+        <p>Not in the repo, but the interfaces make them drop-in — implement the interface and register in <code>AppConfig</code>:</p>
+        <ul class="tight">
+          <li><b>DistributedTranscodingStrategy</b> — fan jobs across a worker fleet (Kubernetes pods running FFmpeg) instead of one JVM's thread pool.</li>
+          <li><b>HybridABR</b> — blend throughput and buffer signals; the industry direction (e.g. MPC/BOLA).</li>
+          <li><b>CollaborativeFilteringRecommendation</b> — "users like you watched…" via embeddings + cosine similarity.</li>
+        </ul>
+      </div>
+    </div>
+    <table>
+      <thead><tr><th>Axis</th><th>Interface method</th><th>Concrete A</th><th>Concrete B</th><th>Chosen by</th></tr></thead>
+      <tbody>
+        <tr><td>Transcoding</td><td>transcode(video, targets, codec)</td><td>Parallel (thread pool)</td><td>Sequential (loop)</td><td>TranscodingService</td></tr>
+        <tr><td>ABR</td><td>selectResolution(bw, buffer, available)</td><td>Throughput (80%)</td><td>Buffer (5s/30s)</td><td>StreamingService</td></tr>
+        <tr><td>Recommendation</td><td>recommend(userId, limit)</td><td>Trending</td><td>Personalized</td><td>RecommendationService</td></tr>
+      </tbody>
+    </table>
+    <div class="callout"><b>The pattern:</b> each service holds a single strategy field and calls it without branching on type. Adding a new algorithm is a new class + one line in <code>AppConfig</code> — <b>zero</b> changes to the service, controller, or model (Open-Closed Principle). Three orthogonal axes means each can be A/B tested per user cohort independently.</div>
+  </section>
+
+  <!-- D · DATA MODEL -->
+  <section>
+    <div class="sec-h"><span class="n">D</span><h2>Data model detail</h2><span class="tag">Video · Resolution · TranscodeJob · Manifest · WatchHistory</span></div>
+    <div class="grid g2">
+      <div class="card">
+        <div class="kicker">Video — the pipeline entity (Builder + State)</div>
+        <pre class="code">videoId            String   <span class="cm">// final, "vid_"+uuid8</span>
+title, uploaderId  String   <span class="cm">// final, required</span>
+description        String
+durationSeconds    int      <span class="cm">// final</span>
+fileSizeBytes      long     <span class="cm">// final</span>
+originalResolution Resolution
+availableResolutions List&lt;Resolution&gt; <span class="cm">// grows</span>
+codec              Codec    <span class="cm">// H264 default</span>
+status             VideoStatus  <span class="cm">// volatile — state m/c</span>
+createdAt, transcodedAt  LocalDateTime</pre>
+        <p class="muted">Identity fields are <code>final</code>; only <code>status</code> is mutable (<code>volatile</code>). Transitions go through guarded methods — <code>markUploaded / startTranscoding / markReady / markFailed / delete</code> — each throwing <code>IllegalStateException</code> on an illegal jump. State machine: <code>UPLOADING → UPLOADED → TRANSCODING → READY</code>, with <code>FAILED</code> retry back to <code>TRANSCODING</code> and <code>DELETED</code> as terminal.</p>
+      </div>
+      <div class="card">
+        <div class="kicker">Supporting models</div>
+        <pre class="code"><span class="cm">// Resolution — enum with bitrate (Kbps)</span>
+P240..P4K (label, width, height, bitrateKbps)
+
+<span class="cm">// TranscodeJob — one rung of one video</span>
+jobId, videoId, targetResolution, targetCodec
+status  <span class="cm">// QUEUED→PROCESSING→COMPLETED|FAILED</span>
+progress int  <span class="cm">// 0-100, volatile</span>
+
+<span class="cm">// StreamManifest — the HLS/DASH .m3u8/.mpd</span>
+videoId, protocol, List&lt;StreamVariant&gt;
+  StreamVariant(resolution, codec,
+                bitrateKbps, List&lt;String&gt; segmentUrls)
+
+<span class="cm">// WatchHistory — feeds recommendations</span>
+userId, videoId, watchedAt,
+watchDurationSeconds, completionPercent</pre>
+        <p class="muted"><code>VideoChunk</code> and <code>VideoMetadata</code> (viewCount/likeCount as <code>AtomicLong</code>) round out the set. Metadata lives in a shared <code>Map</code> keyed by videoId so Analytics, Search, and both recommenders read the same counters.</p>
+      </div>
+    </div>
+    <div class="callout tip"><b>Why split Video from VideoMetadata?</b> <code>Video</code> holds identity + pipeline state that changes rarely; <code>VideoMetadata</code> holds discovery + engagement data (viewCount increments on every watch). Different write frequencies → different caching and indexing in production (Postgres for Video, a hot counter store for metadata).</div>
+  </section>
+
+  <!-- E · REQUEST SEQUENCES -->
+  <section>
+    <div class="sec-h"><span class="n">E</span><h2>Request handling sequences</h2><span class="tag">which class does what, in order</span></div>
+
+    <div class="collapsible open">
+      <div class="c-head"><h3>POST /videos/upload &nbsp;→&nbsp; upload + transcode</h3></div>
+      <div class="c-body">
+        <pre class="code"><span class="cm">VideoController.handleUpload(...)</span>
+  └─ VideoService.uploadVideo(user, title, desc, size, res)
+       1  new Video.Builder(id, title, user)…build()  <span class="cm">// status=UPLOADING</span>
+       2  videoRepository.save(video)
+       3  uploadService.initiateUpload(video)   <span class="cm">// ceil(size / 5MB) chunks</span>
+       4  for i in 0..N: uploadService.uploadChunk(id, i, data)
+       5  video.markUploaded()                  <span class="cm">// UPLOADING → UPLOADED</span>
+       6  transcodingService.transcodeVideo(video)
+            video.startTranscoding()            <span class="cm">// UPLOADED → TRANSCODING</span>
+            targets = buildResolutionLadder(source)
+            strategy.transcode(video, targets, codec)  <span class="cm">// parallel</span>
+            video.markReady()                   <span class="cm">// TRANSCODING → READY</span>
+  └─ [201] videoId</pre>
+        <p class="muted">The demo drives chunk upload synchronously; in production chunks arrive over many requests and <code>getMissingChunks()</code> powers resume after a dropped connection.</p>
+      </div>
+    </div>
+
+    <div class="collapsible open">
+      <div class="c-head"><h3>GET /videos/{id}/stream &nbsp;→&nbsp; ABR playback + CDN</h3></div>
+      <div class="c-body">
+        <pre class="code"><span class="cm">VideoController.handleStream(id, user, bandwidthKbps)</span>
+  └─ VideoService.streamVideo(id, user, bandwidth)
+       1  getVideo(id)  <span class="cm">// else VideoNotFoundException</span>
+       2  streamingService.simulateStreaming(video, user, bw, 60s):
+            generateManifest(video, "HLS")     <span class="cm">// one variant per rung</span>
+            each tick:
+              abrStrategy.selectResolution(bw, buffer, available)
+              fetch segment → CDNService.getChunk(id, res, i)
+                edge HIT  → return &lt;10ms
+                edge MISS → origin S3, cache at edge (LRU), return
+       3  analyticsService.recordView(id, user, 60)  <span class="cm">// viewCount++, WatchHistory</span>
+  └─ [200] streaming log</pre>
+        <p class="muted">ABR runs the selection every tick; the CDN's access-ordered <code>LinkedHashMap</code> keeps hot segments at the edge and evicts the least-recently-used, driving the ~85% edge hit rate.</p>
+      </div>
+    </div>
+
+    <div class="collapsible open">
+      <div class="c-head"><h3>GET /recommendations &nbsp;→&nbsp; suggest videos</h3></div>
+      <div class="c-body">
+        <pre class="code"><span class="cm">VideoController.handleRecommendations(userId, limit)</span>
+  └─ RecommendationService.recommend(userId, limit)
+       └─ RecommendationStrategy.recommend(userId, limit)
+            Trending      → recent uploads, sort by viewCount desc, top N
+            Personalized  → watch history → category affinity
+                            → score unwatched → sort desc → top N
+  └─ [200] ordered List&lt;Video&gt;</pre>
+      </div>
+    </div>
+  </section>
+
+  <!-- F · DESIGN PATTERNS -->
+  <section>
+    <div class="sec-h"><span class="n">F</span><h2>Design patterns used</h2><span class="tag">GoF-categorized</span></div>
+    <div class="grid g3">
+      <div class="card">
+        <div class="kicker">Creational</div>
+        <ul class="tight">
+          <li><b>Builder</b> — <code>Video.Builder</code>. Required (videoId/title/uploaderId) enforced at construction; many optional fields, immutable identity result.</li>
+          <li><b>Factory</b> — <code>AppConfig</code> is the composition root; the only place concrete classes are <code>new</code>-ed, wired layer by layer.</li>
+        </ul>
+      </div>
+      <div class="card">
+        <div class="kicker">Behavioral</div>
+        <ul class="tight">
+          <li><b>Strategy ×3</b> — Transcoding / ABR / Recommendation. The centrepiece: three orthogonal, swappable axes.</li>
+          <li><b>State</b> — <code>VideoStatus</code> + guarded <code>markUploaded/startTranscoding/markReady</code>; illegal jumps throw.</li>
+          <li><b>Observer</b> — <code>AnalyticsService</code> reacts to view/like events, decoupled from the emitter.</li>
+          <li><b>Template-style flow</b> — <code>transcodeVideo</code> fixes start → transcode → ready; the varying step is the injected strategy.</li>
+        </ul>
+      </div>
+      <div class="card">
+        <div class="kicker">Structural / Architectural</div>
+        <ul class="tight">
+          <li><b>Facade</b> — <code>VideoService</code> hides Upload/Transcoding/Streaming/CDN/Analytics behind one API.</li>
+          <li><b>Repository</b> — Video/User/WatchHistory interfaces over <code>ConcurrentHashMap</code>; swap to Postgres/Cassandra with no service change.</li>
+          <li><b>Pipeline</b> — transcoding as a DAG: validate → split → parallel transcode → stitch → manifest → store → notify.</li>
+        </ul>
+      </div>
+    </div>
+    <div class="callout"><b>Why they cluster:</b> Strategy + Repository + Factory together deliver the Open-Closed Principle — new algorithms and storage backends are <i>additions</i>, never edits. Facade keeps the controller thin; State keeps the pipeline honest; Builder keeps the entity immutable and validated. <span class="run">→ scaling trade-offs &amp; the CDN/transcode-fleet follow-up on canvas 3</span></div>
+  </section>
+
+  <!-- RUN IT -->
+  <section>
+    <div class="sec-h"><span class="n">▶</span><h2>Run it — repo file map</h2><span class="tag">concept → actual Java class</span></div>
+    <table>
+      <thead><tr><th>Concept above</th><th>File in <code>13-video-streaming/src/main/java/…/videostreaming/</code></th></tr></thead>
+      <tbody>
+        <tr><td>Composition root / wiring</td><td><code>config/AppConfig.java</code></td></tr>
+        <tr><td>REST endpoints</td><td><code>controller/VideoController.java</code></td></tr>
+        <tr><td>Facade orchestrator</td><td><code>service/VideoService.java</code></td></tr>
+        <tr><td>Sub-services</td><td><code>service/UploadService.java</code> · <code>TranscodingService.java</code> · <code>StreamingService.java</code> · <code>CDNService.java</code> · <code>AnalyticsService.java</code> · <code>SearchService.java</code> · <code>RecommendationService.java</code></td></tr>
+        <tr><td>Transcoding strategy (§C)</td><td><code>strategy/transcoding/TranscodingStrategy.java</code> · <code>ParallelTranscodingStrategy.java</code> · <code>SequentialTranscodingStrategy.java</code></td></tr>
+        <tr><td>ABR strategy (§B, §C)</td><td><code>strategy/streaming/ABRStrategy.java</code> · <code>ThroughputBasedABR.java</code> · <code>BufferBasedABR.java</code></td></tr>
+        <tr><td>Recommendation strategy (§C)</td><td><code>strategy/recommendation/RecommendationStrategy.java</code> · <code>TrendingRecommendation.java</code> · <code>PersonalizedRecommendation.java</code></td></tr>
+        <tr><td>Domain models (§D)</td><td><code>model/Video.java</code> · <code>VideoStatus.java</code> · <code>Resolution.java</code> · <code>Codec.java</code> · <code>VideoChunk.java</code> · <code>TranscodeJob.java</code> · <code>StreamManifest.java</code> · <code>StreamVariant.java</code> · <code>WatchHistory.java</code> · <code>VideoMetadata.java</code> · <code>User.java</code></td></tr>
+        <tr><td>Object storage + repositories</td><td><code>store/VideoStore.java</code> · <code>InMemoryVideoStore.java</code> · <code>repository/*Repository.java</code></td></tr>
+        <tr><td>Exceptions</td><td><code>exception/VideoStreamingException.java</code> · <code>UploadException.java</code> · <code>TranscodingException.java</code> · <code>VideoNotFoundException.java</code></td></tr>
+        <tr><td>Runnable demo (main)</td><td><code>VideoStreamingApp.java</code></td></tr>
+      </tbody>
+    </table>
+    <div class="callout tip"><b>Run the demo</b> (Gradle <code>application</code> plugin, mainClass <code>VideoStreamingApp</code>, no framework):<br><pre class="code">./gradlew :13-video-streaming:run</pre>It uploads a video in chunks, transcodes the resolution ladder in parallel, generates an HLS manifest, simulates an ABR watch session across varying bandwidth, exercises the CDN edge cache, and prints streaming / CDN hit-rate / transcode-progress stats.</div>
+  </section>
+
+  <!-- GLOSSARY -->
+  <section>
+    <div class="sec-h"><span class="n">§</span><h2>Glossary — one-liners</h2><span class="tag">terms used above</span></div>
+    <div class="grid g2">
+      <div class="card"><table><tbody>
+        <tr><td><b>ABR</b></td><td>adaptive bitrate — pick the next segment's quality from live network conditions</td></tr>
+        <tr><td><b>HLS / DASH</b></td><td>HTTP streaming protocols; a manifest lists every quality variant the player can request</td></tr>
+        <tr><td><b>Manifest</b></td><td>the .m3u8/.mpd index of variants + segment URLs the player reads first</td></tr>
+        <tr><td><b>Transcode ladder</b></td><td>the set of lower rungs a source is re-encoded into (P240…P1080)</td></tr>
+        <tr><td><b>Resumable upload</b></td><td>chunked upload that restarts from the missing chunk, not chunk 0</td></tr>
+      </tbody></table></div>
+      <div class="card"><table><tbody>
+        <tr><td><b>Strategy pattern</b></td><td>family of interchangeable algorithms behind one interface, chosen at runtime</td></tr>
+        <tr><td><b>Facade</b></td><td>one class (VideoService) hiding a subsystem of services behind a simple API</td></tr>
+        <tr><td><b>State machine</b></td><td>guarded status transitions; illegal jumps throw instead of corrupting state</td></tr>
+        <tr><td><b>LRU cache</b></td><td>evict the least-recently-used entry; the CDN edge's access-ordered map</td></tr>
+        <tr><td><b>Edge hit rate</b></td><td>% of chunk requests served from the CDN edge without touching origin (~85%)</td></tr>
+      </tbody></table></div>
+    </div>
+  </section>
+
+  <footer>
+    <p>Use case 13 · Video Streaming — Canvas 2 of 3 (LLD). Grounded in <code>13-video-streaming/docs/lld/</code>, <code>docs/patterns/</code>, and the Java under <code>src/main/java/com/systemdesign/videostreaming</code>.</p>
+    <p class="run">This use case: <a href="hld.html">Canvas 1 · HLD</a> · LLD · <a href="deepdive.html">Canvas 3 · Deep-dive &amp; Trade-offs</a> &nbsp;|&nbsp; Next → <a href="deepdive.html">Canvas 3 · Deep-dive &amp; Trade-offs</a> &nbsp;|&nbsp; <a href="../index.html">Hub</a></p>
+  </footer>
+
+</div>
+<script src="../assets/canvas.js"></script>
+</body>
+</html>

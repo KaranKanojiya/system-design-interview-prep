@@ -1,0 +1,403 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>11 · Payment System — LLD</title>
+<link rel="stylesheet" href="../assets/canvas.css">
+</head>
+<body>
+<div class="wrap">
+
+  <header class="hero">
+    <h1>Payment System — Low-Level Design</h1>
+    <div class="sub">Use case 11 · Canvas 2 of 3. From boxes to classes: the actual Java object model. Start with the <b>interactive class map</b> — click a class to see its responsibility and how <code>AppConfig → Controller → PaymentService (facade) → Strategy/Service/Repository</code> is wired — then dig into the double-entry ledger algorithm, the pluggable processors &amp; fraud checks, the guarded state machine, and the request sequences.</div>
+    <div class="badges">
+      <span class="badge lvl">Use case 11 · LLD</span>
+      <span class="badge">Canvas 2 of 3</span>
+      <span class="badge">interactive</span>
+      <span class="badge">Strategy×2 · State · Facade · Builder · Repository</span>
+    </div>
+    <div class="legend">
+      <span><i class="dot" style="background:var(--eden)"></i> entry / composition root</span>
+      <span><i class="dot" style="background:var(--survivor)"></i> interface / contract</span>
+      <span><i class="dot" style="background:var(--old)"></i> concrete implementation</span>
+      <span><i class="dot" style="background:var(--warn)"></i> domain model</span>
+      <span><i class="dot" style="background:var(--muted)"></i> click a class for its role</span>
+    </div>
+  </header>
+
+  <!-- A · CLASS DESIGN (interactive class map) -->
+  <section>
+    <div class="sec-h"><span class="n">A</span><h2>Class design — click a class in the map</h2><span class="tag">the object model, wired</span></div>
+    <div>
+      <div class="arch">
+        <svg viewBox="0 0 820 360" width="100%" style="max-width:820px" role="img" aria-label="Payment system class map">
+          <defs>
+            <marker id="ah" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" fill="var(--muted)"></path></marker>
+          </defs>
+
+          <!-- wiring arrows (under boxes) -->
+          <line class="arrow" x1="92" y1="58" x2="92" y2="100" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"></line>
+          <line class="arrow" x1="92" y1="142" x2="92" y2="204" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"></line>
+          <line class="arrow" x1="168" y1="208" x2="214" y2="42" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"></line>
+          <line class="arrow" x1="168" y1="214" x2="214" y2="101" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"></line>
+          <line class="arrow" x1="168" y1="222" x2="214" y2="165" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"></line>
+          <line class="arrow" x1="168" y1="230" x2="214" y2="229" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"></line>
+          <line class="arrow" x1="366" y1="101" x2="412" y2="101" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"></line>
+          <path class="arrow" d="M100,246 C 140,290 300,290 412,258" fill="none" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"></path>
+          <line class="arrow" x1="92" y1="246" x2="92" y2="300" stroke="var(--muted)" stroke-width="2" stroke-dasharray="4 3" marker-end="url(#ah)"></line>
+          <path class="arrow" d="M272,186 C 210,240 210,278 262,300" fill="none" stroke="var(--muted)" stroke-width="2" stroke-dasharray="4 3" marker-end="url(#ah)"></path>
+          <line class="arrow" x1="564" y1="92" x2="624" y2="75" stroke="var(--muted)" stroke-width="2" stroke-dasharray="4 3" marker-end="url(#ah)"></line>
+          <line class="arrow" x1="564" y1="110" x2="624" y2="127" stroke="var(--muted)" stroke-width="2" stroke-dasharray="4 3" marker-end="url(#ah)"></line>
+          <line class="arrow" x1="564" y1="250" x2="624" y2="221" stroke="var(--muted)" stroke-width="2" stroke-dasharray="4 3" marker-end="url(#ah)"></line>
+          <line class="arrow" x1="564" y1="257" x2="624" y2="269" stroke="var(--muted)" stroke-width="2" stroke-dasharray="4 3" marker-end="url(#ah)"></line>
+          <line class="arrow" x1="564" y1="264" x2="624" y2="317" stroke="var(--muted)" stroke-width="2" stroke-dasharray="4 3" marker-end="url(#ah)"></line>
+          <text x="98" y="82" fill="var(--faint)" font-size="9">wires</text>
+          <text x="176" y="192" fill="var(--faint)" font-size="9">uses</text>
+
+          <!-- nodes -->
+          <g data-node style="cursor:pointer" data-title="AppConfig  (config)" data-detail="<b>Role:</b> composition root / poor-man's DI container (Factory pattern) — the <i>only</i> class that says <code>new ConcreteClass()</code>.<br><b>Wiring:</b> constructs the 6 InMemory repositories, the <code>Map&lt;PaymentMethod,PaymentProcessor&gt;</code>, the <code>List&lt;FraudCheckStrategy&gt;</code>, then every service and injects them constructor-first. Order matters: repos → strategies → services → controller.<br><b>Seed:</b> also seeds 3 merchants and 7 accounts (customer / merchant / platform / settlement). Swap InMemory→Postgres here, nothing else changes."><rect x="16" y="16" width="152" height="42" rx="9" fill="var(--panel-2)" stroke="var(--eden)"></rect><text x="92" y="36" text-anchor="middle" fill="var(--eden)" font-size="12" font-weight="600">AppConfig</text><text x="92" y="50" text-anchor="middle" fill="var(--faint)" font-size="10">composition root</text></g>
+
+          <g data-node style="cursor:pointer" data-title="PaymentController  (controller)" data-detail="<b>Role:</b> framework-free stand-in for a Spring @RestController.<br><b>Methods:</b> processPayment → 201, refundPayment → 200, getPayment → 200, getBalance / reconcile / webhook-retry endpoints.<br><b>Wiring:</b> holds PaymentService, RefundService, LedgerService, ReconciliationService, WebhookService and simply delegates — no business logic lives here."><rect x="16" y="100" width="152" height="42" rx="9" fill="var(--panel-2)" stroke="var(--border)"></rect><text x="92" y="120" text-anchor="middle" fill="var(--text)" font-size="12" font-weight="600">PaymentController</text><text x="92" y="134" text-anchor="middle" fill="var(--faint)" font-size="10">REST endpoints</text></g>
+
+          <g data-node style="cursor:pointer" data-title="PaymentService  «Facade»" data-detail="<b>Role:</b> THE facade — the single entry point that orchestrates the whole payment flow.<br><b>processPayment():</b> (1) idempotency check → (2) build Payment (INITIATED) → (3) fraud check → (4) select processor from the map &amp; <code>startProcessing()</code> → (5) on APPROVED <code>capture()</code> + ledger entries → (6) save + record idempotency → (7) dispatch webhook.<br><b>Holds:</b> PaymentRepo, MerchantRepo, IdempotencyService, FraudService, LedgerService, WebhookService, <code>Map&lt;PaymentMethod,PaymentProcessor&gt;</code>. Depends on abstractions, not concretes."><rect x="16" y="204" width="152" height="42" rx="9" fill="var(--panel-2)" stroke="var(--border)"></rect><text x="92" y="224" text-anchor="middle" fill="var(--text)" font-size="12" font-weight="600">PaymentService</text><text x="92" y="238" text-anchor="middle" fill="var(--faint)" font-size="10">«Facade» orchestrator</text></g>
+
+          <g data-node style="cursor:pointer" data-title="Payment  (model)" data-detail="<b>Role:</b> the central domain entity, built via the <b>Builder</b> and guarded by a <b>State machine</b>.<br><b>Immutable:</b> paymentId (PAY-uuid), merchantId, customerId, amount, currency, method, idempotencyKey, createdAt.<br><b>Guarded status:</b> the only mutations are <code>startProcessing / authorize / capture / settle / fail / refund / cancel</code> — each checks the current state and throws IllegalStateException on an illegal move. This is the core defence against double-captures."><rect x="16" y="300" width="152" height="42" rx="9" fill="var(--panel-2)" stroke="var(--warn)"></rect><text x="92" y="320" text-anchor="middle" fill="var(--warn)" font-size="12" font-weight="600">Payment</text><text x="92" y="334" text-anchor="middle" fill="var(--faint)" font-size="10">«Builder» + State</text></g>
+
+          <g data-node style="cursor:pointer" data-title="IdempotencyService  (service)" data-detail="<b>Role:</b> retry-safety. Prevents a network-timeout retry from charging the customer twice.<br><b>checkAndGet(key):</b> <code>synchronized</code> on a private lock — looks up the key; returns the cached IdempotencyRecord if present &amp; not expired, else empty (and evicts expired). The synchronized block closes the TOCTOU race where two threads both pass the not-found check.<br><b>record():</b> stores key → (paymentId, status, body) with a 24-hour TTL, matching Stripe."><rect x="214" y="16" width="152" height="42" rx="9" fill="var(--panel-2)" stroke="var(--border)"></rect><text x="290" y="36" text-anchor="middle" fill="var(--text)" font-size="12" font-weight="600">IdempotencyService</text><text x="290" y="50" text-anchor="middle" fill="var(--faint)" font-size="10">retry-safe cache</text></g>
+
+          <g data-node style="cursor:pointer" data-title="FraudService  (service)" data-detail="<b>Role:</b> Chain-of-Responsibility orchestrator over a <code>List&lt;FraudCheckStrategy&gt;</code>.<br><b>checkPayment():</b> runs <i>every</i> strategy (not short-circuit) so all reasons are collected, takes the max risk score, and fails if ANY strategy fails — defence in depth. Returns a combined FraudResult (pass/fail, riskScore, reasons).<br>PaymentService throws FraudDetectedException when the result fails."><rect x="214" y="80" width="152" height="42" rx="9" fill="var(--panel-2)" stroke="var(--border)"></rect><text x="290" y="100" text-anchor="middle" fill="var(--text)" font-size="12" font-weight="600">FraudService</text><text x="290" y="114" text-anchor="middle" fill="var(--faint)" font-size="10">fraud check chain</text></g>
+
+          <g data-node style="cursor:pointer" data-title="LedgerService  (service)" data-detail="<b>Role:</b> THE critical service — double-entry bookkeeping.<br><b>recordPayment():</b> creates exactly two immutable LedgerEntry rows — DEBIT source (+amount), CREDIT merchant (−amount) — so their sum is 0, then credits the merchant Account balance.<br><b>recordRefund():</b> the reverse pair.<br><b>verifyBalance():</b> sums every entry in the system; the invariant is that it equals 0. If not, there is a bug. Depends on LedgerRepository + AccountRepository."><rect x="214" y="144" width="152" height="42" rx="9" fill="var(--panel-2)" stroke="var(--border)"></rect><text x="290" y="164" text-anchor="middle" fill="var(--text)" font-size="12" font-weight="600">LedgerService</text><text x="290" y="178" text-anchor="middle" fill="var(--faint)" font-size="10">double-entry ledger</text></g>
+
+          <g data-node style="cursor:pointer" data-title="WebhookService  (service)" data-detail="<b>Role:</b> pushes payment events to the merchant's endpoint (Observer-style).<br><b>dispatchWebhook():</b> builds a JSON payload, saves a WebhookEvent, computes an HMAC-SHA256 signature over (payload + apiKey), and attempts delivery.<br><b>Retry:</b> on failure it schedules exponential backoff (1s → 2s → 4s → 8s → 16s), max 5 attempts, then EXHAUSTED. <code>deliverPendingWebhooks()</code> is the background sweep. At-least-once — merchants must be idempotent."><rect x="214" y="208" width="152" height="42" rx="9" fill="var(--panel-2)" stroke="var(--border)"></rect><text x="290" y="228" text-anchor="middle" fill="var(--text)" font-size="12" font-weight="600">WebhookService</text><text x="290" y="242" text-anchor="middle" fill="var(--faint)" font-size="10">retry + HMAC</text></g>
+
+          <g data-node style="cursor:pointer" data-title="LedgerEntry  (model)" data-detail="<b>Role:</b> a single immutable line in the ledger — never modified, never deleted (to reverse, append the opposite entry).<br><b>Fields:</b> entryId (LED-xxx), transactionId (the paymentId/refundId link), accountId, signed amount (+DEBIT / −CREDIT), LedgerEntryType, currency, description, createdAt.<br>Created only by LedgerService, in balanced pairs."><rect x="214" y="300" width="152" height="42" rx="9" fill="var(--panel-2)" stroke="var(--warn)"></rect><text x="290" y="320" text-anchor="middle" fill="var(--warn)" font-size="12" font-weight="600">LedgerEntry</text><text x="290" y="334" text-anchor="middle" fill="var(--faint)" font-size="10">immutable · signed</text></g>
+
+          <g data-node style="cursor:pointer" data-title="FraudCheckStrategy  «interface»" data-detail="<b>Role:</b> the fraud Strategy contract — <code>FraudResult checkFraud(Payment)</code> and <code>String getName()</code>.<br><b>Why:</b> FraudService depends only on this interface and holds a list of them, so new detectors (rules, ML, third-party Sift/Riskified) are drop-in — register in AppConfig, zero service changes (OCP). Two implementations ship today."><rect x="412" y="80" width="152" height="42" rx="9" fill="var(--panel-2)" stroke="var(--survivor)"></rect><text x="488" y="100" text-anchor="middle" fill="var(--survivor)" font-size="11" font-weight="600">FraudCheckStrategy</text><text x="488" y="114" text-anchor="middle" fill="var(--faint)" font-size="10">«interface»</text></g>
+
+          <g data-node style="cursor:pointer" data-title="PaymentProcessor  «interface»" data-detail="<b>Role:</b> the processor Strategy contract — <code>Transaction processPayment(Payment)</code>, <code>Transaction processRefund(Refund, Payment)</code>, <code>String getName()</code>.<br><b>Contract:</b> failure is a valid business outcome — returns a Transaction with status DECLINED/ERROR, it does <i>not</i> throw. PaymentService picks the impl by <code>method</code> from a Map. New rail (PayPal, ApplePay) = new class + one map entry."><rect x="412" y="236" width="152" height="42" rx="9" fill="var(--panel-2)" stroke="var(--survivor)"></rect><text x="488" y="256" text-anchor="middle" fill="var(--survivor)" font-size="11" font-weight="600">PaymentProcessor</text><text x="488" y="270" text-anchor="middle" fill="var(--faint)" font-size="10">«interface»</text></g>
+
+          <g data-node style="cursor:pointer" data-title="RuleBasedFraudCheck" data-detail="<b>Role:</b> deterministic rules — amount threshold, per-window velocity limit, and a blacklist of merchant IDs (<code>MERCHANT-BLACKLISTED</code>, <code>MERCHANT-FRAUD</code>).<br><b>name()</b> = &quot;RuleBasedFraudCheck&quot;. Cheap, explainable, catches the obvious fraud. Returns FraudResult.fail(score, reasons) when a rule trips."><rect x="624" y="54" width="150" height="42" rx="9" fill="var(--panel-2)" stroke="var(--old)"></rect><text x="699" y="74" text-anchor="middle" fill="var(--old)" font-size="11" font-weight="600">RuleBasedFraudCheck</text><text x="699" y="88" text-anchor="middle" fill="var(--faint)" font-size="10">threshold · velocity</text></g>
+
+          <g data-node style="cursor:pointer" data-title="MLFraudCheck" data-detail="<b>Role:</b> simulated ML risk scoring — extracts features and returns a risk score 0.0–1.0 against a threshold (~0.7).<br><b>name()</b> = &quot;MLFraudCheck&quot;. Catches the subtle patterns rules miss. Runs alongside the rule check (defence in depth) — the combined result fails if either one does."><rect x="624" y="106" width="150" height="42" rx="9" fill="var(--panel-2)" stroke="var(--old)"></rect><text x="699" y="126" text-anchor="middle" fill="var(--old)" font-size="11" font-weight="600">MLFraudCheck</text><text x="699" y="140" text-anchor="middle" fill="var(--faint)" font-size="10">risk score 0–1</text></g>
+
+          <g data-node style="cursor:pointer" data-title="CreditCardProcessor" data-detail="<b>Role:</b> simulates a Visa/Mastercard gateway (Stripe/Adyen-style).<br><b>Behaviour:</b> ~95% success, ~200ms latency, two-phase auth+capture. Declines carry ISO-8583 codes: 3% insufficient-funds (51), 1% suspected-fraud (59), 1% network-error (91).<br><b>name()</b> = &quot;CreditCardProcessor&quot;. Also handles DEBIT_CARD &amp; BANK_TRANSFER in the wiring."><rect x="624" y="200" width="150" height="42" rx="9" fill="var(--panel-2)" stroke="var(--old)"></rect><text x="699" y="220" text-anchor="middle" fill="var(--old)" font-size="11" font-weight="600">CreditCardProcessor</text><text x="699" y="234" text-anchor="middle" fill="var(--faint)" font-size="10">95% · two-phase</text></g>
+
+          <g data-node style="cursor:pointer" data-title="UPIProcessor" data-detail="<b>Role:</b> simulates a UPI rail (NPCI-style collect request).<br><b>Behaviour:</b> ~98% success, 100–500ms, <i>instant settlement</i> — a single phase, so PROCESSING → CAPTURED directly (no separate authorize).<br><b>name()</b> = &quot;UPIProcessor&quot;."><rect x="624" y="248" width="150" height="42" rx="9" fill="var(--panel-2)" stroke="var(--old)"></rect><text x="699" y="268" text-anchor="middle" fill="var(--old)" font-size="11" font-weight="600">UPIProcessor</text><text x="699" y="282" text-anchor="middle" fill="var(--faint)" font-size="10">98% · instant</text></g>
+
+          <g data-node style="cursor:pointer" data-title="WalletProcessor" data-detail="<b>Role:</b> simulates a pre-funded wallet — deducts the balance atomically.<br><b>Behaviour:</b> ~99% success, 50–200ms (no external network), single phase.<br><b>name()</b> = &quot;WalletProcessor&quot;. Highest success rate because there is no card network to decline."><rect x="624" y="296" width="150" height="42" rx="9" fill="var(--panel-2)" stroke="var(--old)"></rect><text x="699" y="316" text-anchor="middle" fill="var(--old)" font-size="11" font-weight="600">WalletProcessor</text><text x="699" y="330" text-anchor="middle" fill="var(--faint)" font-size="10">99% · balance</text></g>
+        </svg>
+      </div>
+      <div class="node-detail"><span class="nd-title">Click any class</span><div class="nd-body">Its responsibility, key methods, and how it is wired appear here. Dashed arrows are <i>implements</i> / <i>creates</i>; solid arrows are <i>uses</i>. Notice <b>PaymentService</b> depends only on the two <b>«interface»</b> boxes and the service abstractions — that is what makes processors and fraud checks swappable, and what keeps the facade small.</div></div>
+    </div>
+  </section>
+
+  <!-- B · DOUBLE-ENTRY LEDGER -->
+  <section>
+    <div class="sec-h"><span class="n">B</span><h2>Double-entry bookkeeping — the core algorithm</h2><span class="tag">LedgerService.recordPayment</span></div>
+    <div class="grid g2">
+      <div class="card">
+        <div class="kicker">the code (condensed)</div>
+        <pre class="code"><span class="kw">public void</span> <span class="ty">recordPayment</span>(Payment p) {
+  String source = p.getCustomerId() != <span class="kw">null</span>
+      ? p.getCustomerId() : PLATFORM_ACCOUNT_ID;
+  String merchant = p.getMerchantId();
+
+  <span class="cm">// Entry 1 — DEBIT source (+amount = money OUT)</span>
+  LedgerEntry debit = <span class="kw">new</span> LedgerEntry(
+      p.getPaymentId(), source,
+      <span class="num">+</span>p.getAmount(), DEBIT,
+      p.getCurrency(), <span class="st">"…"</span>);
+
+  <span class="cm">// Entry 2 — CREDIT merchant (−amount = money IN)</span>
+  LedgerEntry credit = <span class="kw">new</span> LedgerEntry(
+      p.getPaymentId(), merchant,
+      <span class="num">-</span>p.getAmount(), CREDIT,
+      p.getCurrency(), <span class="st">"…"</span>);
+
+  ledgerRepository.save(debit);
+  ledgerRepository.save(credit);
+  accountRepository.findById(merchant)
+      .ifPresent(a -&gt; a.credit(p.getAmount()));
+}</pre>
+        <p class="muted">Entries are <b>immutable</b> — to reverse a charge you <i>append</i> the opposite pair (<code>recordRefund</code>), never edit history.</p>
+      </div>
+      <div class="card">
+        <div class="kicker">worked example — Alice pays Acme $100.00</div>
+        <pre class="code"><span class="cm">// processPayment → capture → recordPayment</span>
+DEBIT  CUSTOMER-001   <span class="num">+100.00</span>   <span class="cm">// money OUT</span>
+CREDIT MERCHANT-001   <span class="num">-100.00</span>   <span class="cm">// money IN</span>
+                      ────────
+             per-txn sum = <span class="num">0.00</span>  <span class="cm">■ balanced</span>
+
+<span class="cm">// settlement adds the platform fee (2.9% + $0.30)</span>
+DEBIT  PLATFORM       <span class="num">+96.80</span>
+CREDIT MERCHANT-001   <span class="num">-96.80</span>   <span class="cm">// net to merchant</span>
+DEBIT  PLATFORM        <span class="num">+3.20</span>
+CREDIT PLATFORM-FEE    <span class="num">-3.20</span>   <span class="cm">// our revenue</span>
+                      ────────
+             per-txn sum = <span class="num">0.00</span>  <span class="cm">■ balanced</span>
+
+verifyBalance() → Σ(all entries) = <span class="num">0.0000</span></pre>
+        <p class="muted">Every money movement is two (or more) entries summing to zero. The system-wide invariant Σ(all entries)=0 is the single check that proves no money was created or lost.</p>
+      </div>
+    </div>
+    <div class="callout tip"><b>Why double-entry?</b> A naive <code>balance += amount</code> has no audit trail, no cross-reference, and drifts silently. With paired signed entries you get: an <b>audit trail</b> (every dollar traceable to a paymentId), <b>error detection</b> (the sum must be 0 — how banks catch bugs), and <b>reconciliation</b> (match the internal ledger against the processor). The <code>Account.balance</code> field is just a fast cache; the entries are the source of truth. Production swaps <code>double</code> for <code>BigDecimal</code> so the sum is <i>exactly</i> zero.</div>
+  </section>
+
+  <!-- C · STRATEGIES COMPARED (tabs) -->
+  <section>
+    <div class="sec-h"><span class="n">C</span><h2>Processors &amp; fraud checks (Strategy pattern ×2)</h2><span class="tag">swap the rail / detector, not the service</span></div>
+    <div data-tabscope>
+      <div class="tabs">
+        <button class="tab active" data-tab="cc">Card · two-phase</button>
+        <button class="tab" data-tab="upi">UPI · instant</button>
+        <button class="tab" data-tab="wallet">Wallet · balance</button>
+        <button class="tab" data-tab="fraud">Fraud · rules vs ML</button>
+      </div>
+      <div class="tabpanel active" data-panel="cc">
+        <p><b>CreditCardProcessor</b> — simulates a Visa/MC gateway. <span class="run">name() = "CreditCardProcessor" · handles CREDIT_CARD, DEBIT_CARD, BANK_TRANSFER</span></p>
+        <ul class="tight">
+          <li><b>Two-phase:</b> authorize (hold funds) then capture — modelled as PROCESSING → AUTHORIZED → CAPTURED for real card flows.</li>
+          <li><b>Realism:</b> ~95% success, ~200ms latency; declines carry ISO-8583 codes — 51 insufficient-funds, 59 suspected-fraud, 91 issuer-unavailable.</li>
+          <li><b>Returns</b> a <code>Transaction</code> (never throws) with status APPROVED / DECLINED / ERROR.</li>
+        </ul>
+      </div>
+      <div class="tabpanel" data-panel="upi">
+        <p><b>UPIProcessor</b> — simulates an NPCI collect request. <span class="run">name() = "UPIProcessor"</span></p>
+        <ul class="tight">
+          <li><b>Single-phase / instant settlement:</b> no separate auth — the state machine goes PROCESSING → CAPTURED in one shot.</li>
+          <li><b>Realism:</b> ~98% success, 100–500ms.</li>
+          <li>Best for markets where real-time rails dominate.</li>
+        </ul>
+      </div>
+      <div class="tabpanel" data-panel="wallet">
+        <p><b>WalletProcessor</b> — deducts a pre-funded balance atomically. <span class="run">name() = "WalletProcessor"</span></p>
+        <ul class="tight">
+          <li><b>No external network</b> → 50–200ms, ~99% success (highest — nothing to decline but insufficient balance).</li>
+          <li><b>Single-phase</b> like UPI.</li>
+          <li>Ideal for closed-loop / stored-value use cases.</li>
+        </ul>
+      </div>
+      <div class="tabpanel" data-panel="fraud">
+        <p><b>FraudCheckStrategy</b> — a <i>second</i> Strategy axis, chained by <code>FraudService</code> (defence in depth):</p>
+        <ul class="tight">
+          <li><b>RuleBasedFraudCheck:</b> amount threshold, velocity limit, merchant blacklist — cheap, deterministic, explainable.</li>
+          <li><b>MLFraudCheck:</b> simulated model returning a 0.0–1.0 risk score against a ~0.7 threshold — catches subtle patterns.</li>
+          <li><b>Combine:</b> FraudService runs <i>all</i> strategies, takes the max score, and fails if ANY fails — collecting every reason.</li>
+        </ul>
+      </div>
+    </div>
+    <table>
+      <thead><tr><th>Aspect</th><th>Credit Card</th><th>UPI</th><th>Wallet</th></tr></thead>
+      <tbody>
+        <tr><td>Success rate</td><td>~95%</td><td>~98%</td><td>~99%</td></tr>
+        <tr><td>Latency</td><td>~200ms</td><td>100–500ms</td><td>50–200ms</td></tr>
+        <tr><td>Phases</td><td>two (auth + capture)</td><td>one (instant)</td><td>one (deduct)</td></tr>
+        <tr><td>State path</td><td>PROCESSING→AUTHORIZED→CAPTURED</td><td>PROCESSING→CAPTURED</td><td>PROCESSING→CAPTURED</td></tr>
+        <tr><td>Failure mode</td><td>ISO-8583 declines (51/59/91)</td><td>collect timeout</td><td>insufficient balance</td></tr>
+      </tbody>
+    </table>
+    <div class="callout"><b>The pattern:</b> <code>PaymentService</code> holds a <code>Map&lt;PaymentMethod,PaymentProcessor&gt;</code> and never branches on rail — it does <code>processors.get(method).processPayment(payment)</code>. <code>FraudService</code> holds a <code>List&lt;FraudCheckStrategy&gt;</code> and iterates. Adding a <code>PayPalProcessor</code> or a <code>GeoFenceFraudCheck</code> is a new class + one line in <code>AppConfig</code> — <b>zero</b> changes to the services (Open-Closed Principle).</div>
+  </section>
+
+  <!-- D · DATA MODEL -->
+  <section>
+    <div class="sec-h"><span class="n">D</span><h2>Data model detail</h2><span class="tag">Payment state machine + the records</span></div>
+    <div class="grid g2">
+      <div class="card">
+        <div class="kicker">Payment — guarded state machine</div>
+        <pre class="code">paymentId      String   <span class="cm">// PAY-uuid, immutable</span>
+merchantId     String   <span class="cm">// immutable</span>
+customerId     String   <span class="cm">// nullable</span>
+amount         double   <span class="cm">// &gt; 0 (BigDecimal in prod)</span>
+currency       Currency <span class="cm">// USD/EUR/GBP/INR/JPY</span>
+method         PaymentMethod
+status         PaymentStatus  <span class="cm">// guarded ↓</span>
+idempotencyKey String
+processorTxnId String   <span class="cm">// set post-processor</span></pre>
+        <p class="muted">Valid transitions (each method throws on an illegal move):</p>
+        <pre class="code">INITIATED  → PROCESSING | CANCELLED
+PROCESSING → AUTHORIZED | CAPTURED | FAILED
+AUTHORIZED → CAPTURED   | CANCELLED
+CAPTURED   → SETTLED    | REFUNDED
+SETTLED    → REFUNDED
+FAILED / REFUNDED / CANCELLED = terminal</pre>
+      </div>
+      <div class="card">
+        <div class="kicker">the supporting records</div>
+        <pre class="code"><span class="cm">// LedgerEntry — immutable, signed</span>
+entryId, transactionId, accountId
+amount        double  <span class="cm">// +DEBIT / −CREDIT</span>
+type          LedgerEntryType
+currency, description, createdAt
+
+<span class="cm">// IdempotencyRecord — 24h TTL</span>
+key, paymentId, responseStatus
+responseBody, createdAt, expiresAt
+
+<span class="cm">// WebhookEvent — delivery tracking</span>
+eventId, eventType, paymentId, merchantId
+payload, status, attempts / maxAttempts(5)
+nextRetryAt  <span class="cm">// exp. backoff 1→2→4→8→16s</span></pre>
+        <p class="muted">Accounts are typed CUSTOMER / MERCHANT / PLATFORM / SETTLEMENT; <code>Account.balance</code> is a cached read, reconciled against ledger entries.</p>
+      </div>
+    </div>
+    <div class="callout tip"><b>Immutability where it counts:</b> a Payment's identity &amp; amount are <code>final</code> — only <code>status</code> moves, and only through the guarded methods. LedgerEntry and IdempotencyRecord are write-once. That combination (fixed money + append-only ledger + guarded state) is what makes the system auditable and double-charge-proof.</div>
+  </section>
+
+  <!-- E · REQUEST SEQUENCES -->
+  <section>
+    <div class="sec-h"><span class="n">E</span><h2>Request handling sequence</h2><span class="tag">which class does what, in order</span></div>
+
+    <div class="collapsible open">
+      <div class="c-head"><h3>POST /payments &nbsp;→&nbsp; process a payment</h3></div>
+      <div class="c-body">
+        <pre class="code"><span class="cm">PaymentController.processPayment(req)</span>
+  └─ PaymentService.processPayment(merchant, amount, cur, method, idemKey, customer)
+       1  idempotencyService.checkAndGet(idemKey)   <span class="cm">// synchronized</span>
+            present? → DuplicatePaymentException     <span class="cm">// return cached</span>
+       2  new Payment.Builder()...build()            <span class="cm">// status = INITIATED</span>
+       3  fraudService.checkPayment(payment)         <span class="cm">// rules + ML</span>
+            !passed? → payment.fail(); record idem; throw FraudDetectedException
+       4  processor = processors.get(method)
+          payment.startProcessing()                 <span class="cm">// INITIATED → PROCESSING</span>
+          txn = processor.processPayment(payment)    <span class="cm">// APPROVED / DECLINED / ERROR</span>
+       5  "APPROVED"? → payment.capture()            <span class="cm">// → CAPTURED</span>
+                        ledgerService.recordPayment(payment)   <span class="cm">// DEBIT + CREDIT</span>
+                      : payment.fail()               <span class="cm">// → FAILED</span>
+       6  paymentRepository.save(payment)
+          idempotencyService.record(idemKey, id, status, body)
+       7  webhookService.dispatchWebhook("payment.succeeded"|"payment.failed", payment)
+  └─ [201 Created]  Payment</pre>
+        <p class="muted">Idempotency is checked <b>first</b> and recorded <b>even on fraud-block</b>, so a retry of a blocked payment is also rejected — never reprocessed.</p>
+      </div>
+    </div>
+
+    <div class="collapsible open">
+      <div class="c-head"><h3>POST /payments/{id}/refund &nbsp;→&nbsp; refund (full/partial)</h3></div>
+      <div class="c-body">
+        <pre class="code"><span class="cm">PaymentController.refundPayment(id, amount, reason)</span>
+  └─ RefundService.processRefund(paymentId, amount, reason)
+       1  payment = paymentRepository.findById(id)   <span class="cm">// else PaymentException</span>
+       2  guard: status ∈ {CAPTURED, SETTLED}        <span class="cm">// can only refund taken money</span>
+          guard: 0 &lt; amount ≤ payment.amount
+       3  refund = new Refund.Builder()...build()    <span class="cm">// PENDING</span>
+          refund.startProcessing()
+       4  txn = processor.processRefund(refund, payment)
+       5  "APPROVED"?
+            → refund.complete()
+              ledgerService.recordRefund(refund, payment)  <span class="cm">// reverse pair</span>
+              payment.refund()                       <span class="cm">// CAPTURED/SETTLED → REFUNDED</span>
+              webhookService.dispatchWebhook("refund.completed", payment)
+            : refund.fail(); dispatchWebhook("refund.failed", payment)
+  └─ [200 OK]  Refund</pre>
+        <p class="muted">The refund reuses the <i>same</i> processor that took the payment and appends reverse ledger entries — the ledger stays balanced.</p>
+      </div>
+    </div>
+
+    <div class="collapsible open">
+      <div class="c-head"><h3>Webhook delivery &nbsp;→&nbsp; at-least-once with backoff</h3></div>
+      <div class="c-body">
+        <pre class="code"><span class="cm">WebhookService.dispatchWebhook(eventType, payment)</span>
+  1  payload = buildPayload(...)                     <span class="cm">// JSON</span>
+  2  event = new WebhookEvent(type, paymentId, merchantId, payload)  <span class="cm">// PENDING</span>
+  3  sig = HMAC-SHA256(payload + merchant.apiKey)    <span class="cm">// authenticity + integrity</span>
+  4  deliver → 200? event.markDelivered()
+              : event.recordAttempt(false)
+                attempts &lt; 5 ? schedule nextRetryAt = now + 2^(n-1)s
+                             : status = EXHAUSTED     <span class="cm">// alert</span>
+  ── background ──
+  deliverPendingWebhooks(): retry FAILED events whose nextRetryAt has passed</pre>
+        <p class="muted">Delivery is at-least-once, so the merchant must dedupe on <code>eventId</code>. Backoff caps at 5 attempts (1, 2, 4, 8, 16s) before EXHAUSTED.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- F · DESIGN PATTERNS -->
+  <section>
+    <div class="sec-h"><span class="n">F</span><h2>Design patterns used</h2><span class="tag">GoF-categorized</span></div>
+    <div class="grid g3">
+      <div class="card">
+        <div class="kicker">Creational</div>
+        <ul class="tight">
+          <li><b>Builder</b> — <code>Payment.Builder</code> / <code>Refund.Builder</code>. Many fields (currency, metadata, idempotencyKey); <code>build()</code> validates required merchantId &amp; positive amount.</li>
+          <li><b>Factory</b> — <code>AppConfig</code> is the only class that says <code>new ConcreteClass()</code> (composition root).</li>
+          <li><b>Singleton (conceptual)</b> — one <code>CurrencyService</code> is the single source of exchange rates.</li>
+        </ul>
+      </div>
+      <div class="card">
+        <div class="kicker">Behavioral</div>
+        <ul class="tight">
+          <li><b>Strategy ×2</b> — <code>PaymentProcessor</code> (Card/UPI/Wallet) and <code>FraudCheckStrategy</code> (Rule/ML). Two independent axes of variation.</li>
+          <li><b>State</b> — <code>Payment</code> guards its lifecycle; each transition method throws on an illegal move.</li>
+          <li><b>Chain of Responsibility</b> — <code>FraudService</code> runs a list of checks, defence in depth.</li>
+          <li><b>Observer</b> — <code>WebhookService</code> reacts to payment events and notifies merchants off the hot path.</li>
+        </ul>
+      </div>
+      <div class="card">
+        <div class="kicker">Structural (+ architectural)</div>
+        <ul class="tight">
+          <li><b>Facade</b> — <code>PaymentService</code> hides the 7-step subsystem behind one method.</li>
+          <li><b>Repository</b> — 6 repos (Payment, Ledger, Merchant, Account, Idempotency, Webhook) decouple domain from storage.</li>
+          <li><b>Template-style flow</b> — every processor follows validate → process → respond; the skeleton is fixed, the body varies.</li>
+        </ul>
+      </div>
+    </div>
+    <div class="callout"><b>Why they cluster:</b> Facade + Strategy + Repository together deliver the Open-Closed Principle — new rails, new fraud detectors, and new storage backends are <i>additions</i>, never edits to the facade. State + Builder keep the Payment immutable and impossible to double-capture; the synchronized IdempotencyService and double-entry LedgerService keep the money correct. <span class="run">→ concurrency, exactly-once &amp; reconciliation trade-offs on canvas 3</span></div>
+  </section>
+
+  <!-- RUN IT -->
+  <section>
+    <div class="sec-h"><span class="n">▶</span><h2>Run it — repo file map</h2><span class="tag">concept → actual Java class</span></div>
+    <table>
+      <thead><tr><th>Concept above</th><th>File in <code>11-payment-system/src/main/java/com/systemdesign/payment/</code></th></tr></thead>
+      <tbody>
+        <tr><td>Composition root / wiring + seed data</td><td><code>config/AppConfig.java</code></td></tr>
+        <tr><td>REST endpoints</td><td><code>controller/PaymentController.java</code></td></tr>
+        <tr><td>Facade orchestrator (§E)</td><td><code>service/PaymentService.java</code></td></tr>
+        <tr><td>Double-entry ledger (§B)</td><td><code>service/LedgerService.java</code></td></tr>
+        <tr><td>Idempotency / fraud / webhook / refund / currency / reconcile</td><td><code>service/IdempotencyService.java</code> · <code>FraudService.java</code> · <code>WebhookService.java</code> · <code>RefundService.java</code> · <code>CurrencyService.java</code> · <code>ReconciliationService.java</code></td></tr>
+        <tr><td>Processor strategy + impls (§C)</td><td><code>strategy/processor/PaymentProcessor.java</code> · <code>CreditCardProcessor.java</code> · <code>UPIProcessor.java</code> · <code>WalletProcessor.java</code></td></tr>
+        <tr><td>Fraud strategy + impls (§C)</td><td><code>strategy/fraud/FraudCheckStrategy.java</code> · <code>RuleBasedFraudCheck.java</code> · <code>MLFraudCheck.java</code></td></tr>
+        <tr><td>Domain models (§D)</td><td><code>model/Payment.java</code> · <code>PaymentStatus.java</code> · <code>LedgerEntry.java</code> · <code>Transaction.java</code> · <code>Account.java</code> · <code>Merchant.java</code> · <code>Refund.java</code> · <code>WebhookEvent.java</code> · <code>IdempotencyRecord.java</code> · <code>Currency.java</code></td></tr>
+        <tr><td>Storage contracts + InMemory impls</td><td><code>repository/*Repository.java</code> · <code>InMemory*Repository.java</code> (×6)</td></tr>
+        <tr><td>Exceptions (dup / fraud / funds / webhook)</td><td><code>exception/DuplicatePaymentException.java</code> · <code>FraudDetectedException.java</code> · <code>InsufficientFundsException.java</code> · <code>WebhookDeliveryException.java</code></td></tr>
+        <tr><td>Runnable demo (main)</td><td><code>PaymentSystemApp.java</code></td></tr>
+      </tbody>
+    </table>
+    <div class="callout tip"><b>Run the demo</b> (Gradle <code>application</code> plugin, mainClass <code>PaymentSystemApp</code>, no framework):<br><pre class="code">./gradlew :11-payment-system:run</pre>It wires the graph in AppConfig, processes card/UPI/wallet payments, triggers a fraud block and an idempotent retry, runs a partial refund, retries a failed webhook, and finally calls <code>verifyBalance()</code> to prove the ledger sums to zero.</div>
+  </section>
+
+  <!-- GLOSSARY -->
+  <section>
+    <div class="sec-h"><span class="n">§</span><h2>Glossary — one-liners</h2><span class="tag">terms used above</span></div>
+    <div class="grid g2">
+      <div class="card"><table><tbody>
+        <tr><td><b>Double-entry ledger</b></td><td>every movement = one DEBIT + one CREDIT summing to zero; the source of truth for balances</td></tr>
+        <tr><td><b>Idempotency key</b></td><td>client-supplied UUID so a retried request returns the first result instead of charging twice</td></tr>
+        <tr><td><b>State machine</b></td><td>guarded status transitions on Payment; illegal moves throw — no double-capture</td></tr>
+        <tr><td><b>Facade</b></td><td>one method (processPayment) hides idempotency→fraud→process→ledger→webhook</td></tr>
+        <tr><td><b>Strategy pattern</b></td><td>interchangeable algorithms behind one interface, chosen at runtime</td></tr>
+      </tbody></table></div>
+      <div class="card"><table><tbody>
+        <tr><td><b>Chain of Responsibility</b></td><td>run a list of fraud checks; fail if any flags (defence in depth)</td></tr>
+        <tr><td><b>HMAC-SHA256</b></td><td>keyed hash signing the webhook so the merchant verifies authenticity + integrity</td></tr>
+        <tr><td><b>Exponential backoff</b></td><td>retry delays double (1→2→4→8→16s) up to a cap, then EXHAUSTED</td></tr>
+        <tr><td><b>TOCTOU</b></td><td>check-then-act race; fixed by the synchronized block in IdempotencyService</td></tr>
+        <tr><td><b>Reconciliation</b></td><td>verify internal ledger (Σ = 0) matches external processor records</td></tr>
+      </tbody></table></div>
+    </div>
+  </section>
+
+  <footer>
+    <p>Use case 11 · Payment System — Canvas 2 of 3 (LLD). Grounded in <code>11-payment-system/docs/lld/</code>, <code>docs/patterns/</code>, and the Java under <code>src/main/java/com/systemdesign/payment</code>.</p>
+    <p class="run">This use case: <a href="hld.html">Canvas 1 · HLD</a> · LLD · <a href="deepdive.html">Canvas 3 · Deep-dive &amp; Trade-offs</a> &nbsp;|&nbsp; Next → <a href="deepdive.html">Canvas 3 · Deep-dive &amp; Trade-offs</a> &nbsp;|&nbsp; <a href="../index.html">Hub</a></p>
+  </footer>
+
+</div>
+<script src="../assets/canvas.js"></script>
+</body>
+</html>
