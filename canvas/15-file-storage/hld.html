@@ -1,0 +1,393 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>15 · File Storage — HLD</title>
+<link rel="stylesheet" href="../assets/canvas.css">
+</head>
+<body>
+<div class="wrap">
+
+  <header class="hero">
+    <h1>File Storage (Google Drive / Dropbox / OneDrive) — High-Level Design</h1>
+    <div class="sub">Use case 15 · Canvas 1 of 3. Design a system storing <b>2.5 EB</b> of files for <b>500 M users</b> with chunked resumable uploads, <b>block-level deduplication</b> (~40% storage saved), <b>delta sync</b> across devices, and version history. Requirements, back-of-envelope math, and an <b>interactive architecture</b> — click a component to see its role, then step through the <b>upload</b> and <b>download</b> flows. Star of the interview: <b>content-addressable dedup</b> — a single blob shared by every user who ever uploaded the same file.</div>
+    <div class="badges">
+      <span class="badge lvl">Use case 15 · HLD</span>
+      <span class="badge">Canvas 1 of 3</span>
+      <span class="badge">interactive</span>
+      <span class="badge">CP metadata · AP sync</span>
+      <span class="badge">content-addressable</span>
+    </div>
+    <div class="legend">
+      <span><i class="dot" style="background:var(--eden)"></i> client / entry</span>
+      <span><i class="dot" style="background:var(--survivor)"></i> upload path</span>
+      <span><i class="dot" style="background:var(--eden)"></i> current step</span>
+      <span><i class="dot" style="background:var(--old)"></i> data stores</span>
+      <span><i class="dot" style="background:var(--warn)"></i> async / eventing</span>
+    </div>
+  </header>
+
+  <!-- A · PROBLEM & REQUIREMENTS -->
+  <section>
+    <div class="sec-h"><span class="n">A</span><h2>Problem &amp; requirements</h2><span class="tag">clarify first</span></div>
+    <div class="grid g2">
+      <div class="card">
+        <div class="kicker">functional</div>
+        <ul class="tight">
+          <li><b>Upload / download</b> — files up to 50 GB. Small (&lt; 4 MB) = single PUT; large = chunked.</li>
+          <li><b>Chunked resumable upload</b> — split into 4 MB chunks, upload parallel (up to 4), retry only failed chunks, SHA-256 per chunk.</li>
+          <li><b>Delta sync</b> across devices — detect local change, upload only <b>changed chunks</b> (Δ), notify other devices via cursor protocol.</li>
+          <li><b>Versioning</b> — keep last 30 versions; copy-on-write via <b>chunk sharing</b> (unchanged chunks reused between versions).</li>
+          <li><b>Sharing</b> — files/folders shared with users OR public links; roles Viewer / Editor / Owner; folder perms inherit.</li>
+          <li><b>Folders</b> — 20-level nesting; materialized path; move / rename / soft-delete recursively.</li>
+          <li><b>Trash</b> — soft-delete, 30-day recovery, then permanent purge (chunks garbage-collected by ref count = 0).</li>
+          <li><b>Quota</b> — 15 GB free / 2 TB paid; enforce at upload start; reserve/release on partial upload.</li>
+        </ul>
+      </div>
+      <div class="card">
+        <div class="kicker">non-functional</div>
+        <ul class="tight">
+          <li><b>Upload latency</b> &lt; 5 s for a 10 MB file (chunked + parallel).</li>
+          <li><b>Download</b> first-byte &lt; 2 s (CDN edge).</li>
+          <li><b>Sync latency</b> &lt; 10 s cross-device (edit → notify → download Δ).</li>
+          <li><b>Durability</b> ≥ 99.99 % — S3 offers 11 nines via erasure coding across 3 AZs.</li>
+          <li><b>Availability</b> 99.9 % — reads / writes survive AZ loss.</li>
+          <li><b>Throughput</b> 100 M uploads/day (~1 150/s avg, ~3.5 K/s peak); 300 M downloads/day.</li>
+          <li><b>Storage efficiency</b> 30–50 % savings via block-level dedup.</li>
+          <li><b>Consistency</b> — <b>strong</b> for file tree/metadata (CP); <b>eventual</b> for sync notifications (AP).</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <!-- B · ESTIMATION -->
+  <section>
+    <div class="sec-h"><span class="n">B</span><h2>Back-of-envelope estimation</h2><span class="tag">Dropbox-scale · 500 M users</span></div>
+    <div class="chips">
+      <div class="chip"><span class="k">Users</span><span class="v">500 M · 100 M DAU</span></div>
+      <div class="chip"><span class="k">Avg storage / user</span><span class="v">5 GB</span></div>
+      <div class="chip"><span class="k">Raw storage</span><span class="v">2.5 EB</span></div>
+      <div class="chip"><span class="k">After dedup (40 %)</span><span class="v">1.5 EB</span></div>
+      <div class="chip"><span class="k">Uploads / day</span><span class="v">100 M</span></div>
+      <div class="chip"><span class="k">Upload throughput</span><span class="v">~1.16 GB/s · peak 3.5</span></div>
+      <div class="chip"><span class="k">Downloads / day</span><span class="v">300 M (3× reads)</span></div>
+      <div class="chip"><span class="k">Download throughput</span><span class="v">~7 GB/s · peak 21</span></div>
+      <div class="chip"><span class="k">File records</span><span class="v">250 B rows</span></div>
+      <div class="chip"><span class="k">Metadata size</span><span class="v">~125 TB</span></div>
+      <div class="chip"><span class="k">Unique chunks</span><span class="v">~300 B (after dedup)</span></div>
+      <div class="chip"><span class="k">Sync connections</span><span class="v">150 M (1.5 devices/DAU)</span></div>
+    </div>
+    <div class="callout tip"><b>The dedup insight:</b> Dropbox's blog revealed <b>~75 % storage savings</b> at their scale — the same "chunk 0" of every fresh Mac OS install, every Node.js <code>node_modules</code>, every Chrome download, every meme image lives in ONE blob referenced N times. At 2.5 EB × $0.023/GB S3 = <b>~$60 M/month</b>, cutting 40 % is <b>$24 M/month saved</b>. This one design choice pays for the entire eng team.</div>
+    <div class="callout"><b>Separate metadata from blobs:</b> file records (250 B rows @ 500 B ≈ 125 TB) live in <b>Postgres</b> (indexed, transactional, small rows). Blobs (2.5 EB) live in <b>object storage</b> (S3/GCS — cheap, immutable, presigned URLs bypass the app). Very different scaling curves — never mix them in one system.</div>
+  </section>
+
+  <!-- C · INTERACTIVE ARCHITECTURE -->
+  <section data-flowscope>
+    <div class="sec-h"><span class="n">C</span><h2>Architecture — click components, then step the flows</h2><span class="tag">the design, from the diagram</span></div>
+    <div>
+      <div class="arch">
+        <svg viewBox="0 0 900 420" width="100%" style="max-width:900px" role="img" aria-label="File storage architecture">
+          <defs>
+            <marker id="ah" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" fill="var(--muted)"></path></marker>
+          </defs>
+
+          <!-- ═══════ arrows ═══════ -->
+          <!-- Upload flow arrows -->
+
+          <!-- 1: Client → API Gateway -->
+          <line class="arrow" x1="150" y1="48" x2="205" y2="48" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"
+                data-flow="upload" data-upload="1"
+                data-desc-upload="Client sends POST /files/upload/chunked/init with fileName, size, totalChunks and per-chunk SHA-256 hashes."></line>
+          <!-- 2: API Gateway → Upload Service -->
+          <line class="arrow" x1="335" y1="70" x2="205" y2="108" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"
+                data-flow="upload" data-upload="2"
+                data-desc-upload="API Gateway validates JWT, applies rate-limit (per-user + per-IP), routes to Upload Service."></line>
+          <!-- 3: Upload Service → Redis (state) -->
+          <line class="arrow" x1="335" y1="108" x2="620" y2="232" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"
+                data-flow="upload" data-upload="3"
+                data-desc-upload="Upload Service stores in-progress state in Redis: uploadId → {userId, totalChunks, uploadedChunks[], TTL 24 h}. Enables resumable retries."></line>
+          <!-- 4: Upload Service → Dedup Service -->
+          <line class="arrow" x1="335" y1="108" x2="395" y2="108" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"
+                data-flow="upload" data-upload="4"
+                data-desc-upload="Dedup Service checks each chunk hash — 'do we already have this SHA-256?'. Uses Bloom filter + Redis for fast negative check + Postgres for definitive."></line>
+          <!-- 5: Dedup Service → Block Store (index) -->
+          <line class="arrow" x1="525" y1="108" x2="620" y2="108" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"
+                data-flow="upload" data-upload="5"
+                data-desc-upload="Block Store index answers per-hash EXISTS?. Returns 'existingChunks=[0,1,4,5,6,8,11], missingChunks=[2,3,7,9,10,12]'. On average ~40 % dedup hit rate."></line>
+          <!-- 6: Client ← presigned URLs (curve back to client) -->
+          <path class="arrow" d="M395,116 C 260,180 160,120 100,80" fill="none" stroke="var(--muted)" stroke-width="2" stroke-dasharray="4 3" marker-end="url(#ah)"
+                data-flow="upload" data-upload="6"
+                data-desc-upload="Upload Service returns presigned S3 URLs — but ONLY for the missing chunks. Client's 4 MB × dedup-hit-rate = only what needs to travel."></path>
+          <!-- 7: Client → Block Store direct (PUT chunks) -->
+          <path class="arrow" d="M150,60 C 400,20 600,50 620,86" fill="none" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"
+                data-flow="upload" data-upload="7"
+                data-desc-upload="Client PUTs new chunks DIRECTLY to S3 via presigned URL — bypasses our app servers (no CPU / bandwidth cost). Up to 4 parallel. S3 verifies signature + content-length + optional MD5."></path>
+          <!-- 8: Client → Upload Service (complete) -->
+          <line class="arrow" x1="150" y1="55" x2="205" y2="108" stroke="var(--muted)" stroke-width="2" stroke-dasharray="2 2" marker-end="url(#ah)"
+                data-flow="upload" data-upload="8"
+                data-desc-upload="Client POSTs /complete. Upload Service verifies every chunk hash matches what S3 stored, then hands off to Metadata Service."></line>
+          <!-- 9: Upload Service → Metadata Service -->
+          <line class="arrow" x1="335" y1="130" x2="395" y2="48" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"
+                data-flow="upload" data-upload="9"
+                data-desc-upload="Metadata Service creates File + FileVersion + FileChunk rows (transactional) — file points to chunk list, each chunk points to a blockHash."></line>
+          <!-- 10: Metadata Service → Metadata DB -->
+          <line class="arrow" x1="525" y1="48" x2="620" y2="48" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"
+                data-flow="upload" data-upload="10"
+                data-desc-upload="Postgres — sharded by userId. Metadata rows are ~500 B each; 250 B rows total ≈ 125 TB. Strong consistency for the file tree (CP)."></line>
+          <!-- 11: Upload Service → Kafka (async fan-out) -->
+          <line class="arrow" x1="335" y1="130" x2="395" y2="352" stroke="var(--muted)" stroke-width="2" stroke-dasharray="4 3" marker-end="url(#ah)"
+                data-flow="upload" data-upload="11"
+                data-desc-upload="Publish file_created event to Kafka topic. Async — the response returns to the user immediately; sync notification happens off-band."></line>
+          <!-- 12: Kafka → Consumers (other devices) -->
+          <line class="arrow" x1="525" y1="352" x2="620" y2="352" stroke="var(--muted)" stroke-width="2" stroke-dasharray="4 3" marker-end="url(#ah)"
+                data-flow="upload" data-upload="12"
+                data-desc-upload="Sync Service consumes events, fans out to WebSocket / long-poll connections held for the user's other devices. Target &lt; 10 s cross-device."></line>
+
+          <!-- Download flow arrows -->
+
+          <!-- D1: Client → API Gateway -->
+          <line class="arrow" x1="150" y1="172" x2="205" y2="172" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"
+                data-flow="download" data-download="1"
+                data-desc-download="Client sends GET /files/{fileId}/download (optionally with Range: bytes=X-Y for partial download / resume)."></line>
+          <!-- D2: API Gateway → Download Service -->
+          <line class="arrow" x1="335" y1="70" x2="205" y2="172" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"
+                data-flow="download" data-download="2"
+                data-desc-download="API Gateway routes to Download Service after auth. Enforces per-user download rate-limit + permission check upstream."></line>
+          <!-- D3: Download Service → Metadata Service -->
+          <line class="arrow" x1="335" y1="172" x2="395" y2="48" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"
+                data-flow="download" data-download="3"
+                data-desc-download="Download Service asks Metadata Service for the file's chunk list — an ordered array of blockHashes plus sizes."></line>
+          <!-- D4: Metadata Service → Metadata DB -->
+          <line class="arrow" x1="525" y1="48" x2="620" y2="48" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"
+                data-flow="download" data-download="4"
+                data-desc-download="One indexed query: FileVersion + FileChunk join by fileId. Read from Postgres read-replica for scalability."></line>
+          <!-- D5: Download Service → CDN check -->
+          <line class="arrow" x1="335" y1="172" x2="620" y2="172" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"
+                data-flow="download" data-download="5"
+                data-desc-download="If file is 'hot' (accessed &gt; 10× in the last hour), return a 302 to the CDN edge URL. First byte &lt; 2 s at the nearest PoP."></line>
+          <!-- D6: Download Service → Block Store -->
+          <line class="arrow" x1="335" y1="172" x2="620" y2="108" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"
+                data-flow="download" data-download="6"
+                data-desc-download="For cold files: fetch chunks in parallel from S3 (each chunk keyed by blockHash). Stream them back reassembled — no buffering on the app server."></line>
+          <!-- D7: Client ← streamed file -->
+          <path class="arrow" d="M205,180 C 160,220 130,200 100,180" fill="none" stroke="var(--muted)" stroke-width="2" stroke-dasharray="4 3" marker-end="url(#ah)"
+                data-flow="download" data-download="7"
+                data-desc-download="Stream reassembled bytes to client. Supports Range: bytes=X-Y — Download Service computes which chunks contain [X, Y] and serves 206 Partial Content."></path>
+
+          <!-- Sync loop arrow (both flows share Sync Service ↔ Metadata DB) -->
+          <line class="arrow" x1="335" y1="232" x2="620" y2="48" stroke="var(--muted)" stroke-width="1.5" stroke-dasharray="2 3" marker-end="url(#ah)"></line>
+          <text class="edge-label" x="500" y="215">sync: changes since cursor</text>
+
+          <!-- Sharing → Metadata (permission check) -->
+          <line class="arrow" x1="335" y1="292" x2="395" y2="292" stroke="var(--muted)" stroke-width="1.5" stroke-dasharray="4 3" marker-end="url(#ah)"></line>
+
+          <!-- Version Service uses Dedup for chunk sharing -->
+          <line class="arrow" x1="460" y1="130" x2="460" y2="172" stroke="var(--muted)" stroke-width="1.5" stroke-dasharray="4 3" marker-end="url(#ah)"></line>
+
+          <!-- Trash → BlockStore GC -->
+          <line class="arrow" x1="525" y1="232" x2="620" y2="108" stroke="var(--muted)" stroke-width="1.5" stroke-dasharray="4 3" marker-end="url(#ah)"></line>
+          <text class="edge-label" x="540" y="150">GC ref_count=0</text>
+
+          <!-- Dedup uses Block Store index (already have arrow 5) -->
+
+          <!-- ═══════ NODES ═══════ -->
+
+          <!-- Col 1: Clients -->
+          <g data-node style="cursor:pointer" data-title="Client apps (Desktop · Mobile · Web)" data-detail="<b>Role:</b> the smart part of the system.<br><b>Desktop / mobile clients do:</b> (1) filesystem watcher (inotify on Linux, FSEvents on macOS, ReadDirectoryChangesW on Windows) → detect local changes in ~ms. (2) <b>Chunking + SHA-256 hashing</b> — split file into 4 MB chunks, hash each. (3) <b>Delta detection</b> — rolling Rabin fingerprint identifies which chunks changed since last sync. (4) Presigned-URL uploads direct to S3 (no traffic through our servers). (5) Reassembly on download. (6) Local block cache for offline.<br>Web client uses browser File API + Fetch."><rect x="20" y="26" width="130" height="44" rx="9" fill="var(--panel-2)" stroke="var(--eden)"></rect><text x="85" y="46" text-anchor="middle" fill="var(--eden)" font-size="12" font-weight="600">Clients</text><text x="85" y="60" text-anchor="middle" fill="var(--faint)" font-size="10">chunk · hash · sync</text></g>
+
+          <!-- Col 2: API Gateway + services -->
+          <g data-node style="cursor:pointer" data-title="API Gateway / Load Balancer" data-detail="<b>Role:</b> single entry. TLS termination, JWT validation, per-user rate limiting (upload/download separately), request routing to services.<br><b>Behind it:</b> horizontal fleet — service discovery via a mesh (Envoy, Linkerd) or DNS. Sticky sessions NOT needed (stateless services)."><rect x="205" y="26" width="130" height="44" rx="9" fill="var(--panel-2)" stroke="var(--border)"></rect><text x="270" y="46" text-anchor="middle" fill="var(--text)" font-size="12" font-weight="600">API Gateway / LB</text><text x="270" y="60" text-anchor="middle" fill="var(--faint)" font-size="10">TLS · JWT · rate limit</text></g>
+
+          <g data-node style="cursor:pointer" data-title="Upload Service" data-detail="<b>Role:</b> orchestrates the upload pipeline (from <code>UploadService.java</code>).<br><b>Two paths:</b> (a) <b>Single PUT</b> for files &lt; 4 MB — hash → dedup → store. (b) <b>Chunked/resumable</b> — <code>initResumableUpload</code> returns fileId + presigned URLs for missing chunks only; <code>uploadChunk(fileId, idx, data)</code> streams individual chunks; <code>finalizeResumableUpload(fileId)</code> creates FileMetadata + FileVersion.<br>Also: <b>quota check</b> before starting, checksum verify per chunk, publish <code>file_created</code> to Kafka on completion."><rect x="205" y="86" width="130" height="44" rx="9" fill="var(--panel-2)" stroke="var(--border)"></rect><text x="270" y="106" text-anchor="middle" fill="var(--text)" font-size="12" font-weight="600">Upload Service</text><text x="270" y="120" text-anchor="middle" fill="var(--faint)" font-size="10">chunked · resumable</text></g>
+
+          <g data-node style="cursor:pointer" data-title="Download Service" data-detail="<b>Role:</b> serve file downloads.<br>(1) Ask Metadata for chunk list. (2) Decide CDN vs origin — hot files (&gt; 10 reqs/hr) return 302 to CDN edge; cold files stream from S3. (3) <b>Range support</b> — for <code>Range: bytes=X-Y</code>, compute which chunks contain [X, Y] and stream only those (206 Partial Content).<br><b>Zero buffering</b> — chunks stream through the service to the client via HTTP chunked transfer."><rect x="205" y="150" width="130" height="44" rx="9" fill="var(--panel-2)" stroke="var(--border)"></rect><text x="270" y="170" text-anchor="middle" fill="var(--text)" font-size="12" font-weight="600">Download Service</text><text x="270" y="184" text-anchor="middle" fill="var(--faint)" font-size="10">range · CDN · stream</text></g>
+
+          <g data-node style="cursor:pointer" data-title="Sync Service" data-detail="<b>Role:</b> device sync via cursor protocol (from <code>SyncService.java</code>).<br><b>Contract:</b> <code>GET /sync/changes?cursor=X</code> → returns events after timestamp X plus a new cursor. Cursor is opaque (server timestamp) — client stores it.<br><b>Delivery:</b> WebSocket for online clients (push), long-poll fallback for restrictive networks, catch-up-on-connect for offline devices.<br><b>Conflict resolution</b> via <code>ConflictStrategy</code> — LastWriterWins (Google Drive) or KeepBoth (Dropbox: filename_conflict_alice.pdf)."><rect x="205" y="210" width="130" height="44" rx="9" fill="var(--panel-2)" stroke="var(--border)"></rect><text x="270" y="230" text-anchor="middle" fill="var(--text)" font-size="12" font-weight="600">Sync Service</text><text x="270" y="244" text-anchor="middle" fill="var(--faint)" font-size="10">cursor · delta · conflict</text></g>
+
+          <g data-node style="cursor:pointer" data-title="Sharing Service" data-detail="<b>Role:</b> ACL and share links.<br><b>Model:</b> <code>SharePermission</code> row per (resource, principal, role). Roles: VIEWER / EDITOR / OWNER. <b>Folder perms inherit</b> — walk the path materialized on Folder rows to find the nearest permission.<br><b>Public links:</b> generate <code>linkUrl</code> + optional bcrypt password + expiresAt. Anonymous fetch checks link validity, no auth needed.<br>Sits in front of Metadata Service — every read/write via Sharing first for permission check."><rect x="205" y="270" width="130" height="44" rx="9" fill="var(--panel-2)" stroke="var(--border)"></rect><text x="270" y="290" text-anchor="middle" fill="var(--text)" font-size="12" font-weight="600">Sharing Service</text><text x="270" y="304" text-anchor="middle" fill="var(--faint)" font-size="10">ACL · share links</text></g>
+
+          <!-- Col 3: internal services -->
+          <g data-node style="cursor:pointer" data-title="Metadata Service" data-detail="<b>Role:</b> CRUD on File, Folder, FileVersion, FileChunk. The 'brain' of the file tree.<br><b>Stores small structured data</b> — never file bytes. Row types (from source): <code>FileMetadata</code>, <code>Folder</code>, <code>FileVersion</code>, <code>FileChunk</code>.<br><b>Sharded by userId</b> — a user's whole tree lives on one shard for fast folder listings. Cross-user reads (sharing) fan out.<br><b>Materialized path</b> on Folder rows for O(1) 'find nearest permission' walks."><rect x="395" y="26" width="130" height="44" rx="9" fill="var(--panel-2)" stroke="var(--border)"></rect><text x="460" y="46" text-anchor="middle" fill="var(--text)" font-size="12" font-weight="600">Metadata Service</text><text x="460" y="60" text-anchor="middle" fill="var(--faint)" font-size="10">files · folders · versions</text></g>
+
+          <g data-node style="cursor:pointer" data-title="Dedup Service ★" data-detail="<b>Role — THE STAR:</b> content-addressable dedup (from <code>DeduplicationService.java</code> + <code>HashBasedDedup.java</code>).<br><b>Contract:</b> <code>boolean storeChunk(FileChunk chunk, byte[] data)</code> — returns true if the chunk was a duplicate.<br><b>Flow:</b> (1) <code>strategy.isDuplicate(hash)</code> — check global hash index. (2) If dup → skip bytes, increment blockStore ref count. (3) If new → store in blockStore + register hash.<br><b>Global hash index:</b> Postgres index of every unique SHA-256 (~300 B rows @ 64 B = 20 TB), cached hot-set in Redis (~500 GB) + Bloom filter (~2 GB) for fast negative check.<br><b>Savings:</b> ~40 % storage (~$24 M/month at 2.5 EB scale)."><rect x="395" y="86" width="130" height="44" rx="9" fill="var(--panel-2)" stroke="var(--border)"></rect><text x="460" y="106" text-anchor="middle" fill="var(--text)" font-size="12" font-weight="600">Dedup Service ★</text><text x="460" y="120" text-anchor="middle" fill="var(--faint)" font-size="10">content-addressable</text></g>
+
+          <g data-node style="cursor:pointer" data-title="Version Service" data-detail="<b>Role:</b> keep last N versions (default 30) via copy-on-write chunk sharing.<br><b>Trick:</b> a new FileVersion is just a new row + a new FileChunk list — but <b>most chunk rows point to the same blockHash</b> as the previous version. Only <i>changed</i> chunks add new blocks. Storage cost of 'save' ≈ delta size, not full-file size.<br><b>Rollback:</b> promote an old FileVersion to current — instant, just an integer swap on the File row."><rect x="395" y="150" width="130" height="44" rx="9" fill="var(--panel-2)" stroke="var(--border)"></rect><text x="460" y="170" text-anchor="middle" fill="var(--text)" font-size="12" font-weight="600">Version Service</text><text x="460" y="184" text-anchor="middle" fill="var(--faint)" font-size="10">CoW · chunk sharing</text></g>
+
+          <g data-node style="cursor:pointer" data-title="Trash Service (soft-delete + GC)" data-detail="<b>Role:</b> soft-delete then permanent purge.<br>(1) <code>softDelete(fileId)</code> — sets <code>isDeleted=true, deletedAt=now</code>. File tree hides it; 30-day recovery window.<br>(2) Background cron: files with <code>deletedAt &gt; 30 d</code> → hard delete metadata → decrement blockStore ref count for each chunk.<br>(3) <b>GC pass</b> on BlockStore: any block with <code>referenceCount = 0</code> is deleted from S3 (bytes freed).<br>Never delete a block eagerly — some other user may reference it right now."><rect x="395" y="210" width="130" height="44" rx="9" fill="var(--panel-2)" stroke="var(--border)"></rect><text x="460" y="230" text-anchor="middle" fill="var(--text)" font-size="12" font-weight="600">Trash Service</text><text x="460" y="244" text-anchor="middle" fill="var(--faint)" font-size="10">soft-delete · GC</text></g>
+
+          <g data-node style="cursor:pointer" data-title="Kafka — event bus" data-detail="<b>Role:</b> async fan-out of file events. Topics: <code>file.events</code> (created/modified/deleted/moved), <code>dedup.events</code>, <code>purge.events</code>.<br><b>Partitioning by userId</b> — all events for a user land on the same partition ⇒ per-user ordering. Sync Service consumers subscribe by partition.<br><b>Retention:</b> 7 days (enough for offline-device catch-up on reconnect)."><rect x="395" y="330" width="130" height="44" rx="9" fill="var(--panel-2)" stroke="var(--warn)"></rect><text x="460" y="350" text-anchor="middle" fill="var(--warn)" font-size="12" font-weight="600">Kafka (event bus)</text><text x="460" y="364" text-anchor="middle" fill="var(--faint)" font-size="10">file.events · sync fan-out</text></g>
+
+          <!-- Col 4: data stores -->
+          <g data-node style="cursor:pointer" data-title="Metadata DB (Postgres — sharded)" data-detail="<b>Stores:</b> File, Folder, FileVersion, FileChunk, ShareLink, StorageQuota, User rows. ~125 TB total.<br><b>Sharded by userId</b> — Vitess/Citus or manual sharding across ~100 nodes. Read replicas for folder listing / search.<br><b>Why relational not NoSQL:</b> file tree has strict integrity (parent-child, unique names in a folder), rollback needs transactions, permissions need JOINs. Postgres wins over DynamoDB here."><rect x="620" y="26" width="150" height="44" rx="9" fill="var(--panel-2)" stroke="var(--old)"></rect><text x="695" y="46" text-anchor="middle" fill="var(--old)" font-size="12" font-weight="600">Metadata DB</text><text x="695" y="60" text-anchor="middle" fill="var(--faint)" font-size="10">Postgres · sharded by userId</text></g>
+
+          <g data-node style="cursor:pointer" data-title="Block Store (S3 / GCS — content-addressed)" data-detail="<b>Where the bytes live.</b> ~1.5 EB after dedup.<br><b>Key = SHA-256 of content</b> (from <code>BlockStore.java</code>) → <b>content-addressable storage</b>. Same key ⇒ same bytes always ⇒ dedup is a pure function.<br><b>Row shape:</b> <code>{blockHash, storageUrl s3://bucket/{hash-prefix}/{hash}, size, referenceCount, createdAt}</code>. Hash-prefix sharding avoids S3 hot-partition rate limits.<br><b>Durability</b> 11 nines via erasure coding across 3+ AZs. <b>Cost:</b> ~$0.023/GB × 1.5 EB × month ≈ $36 M/month before dedup savings."><rect x="620" y="86" width="150" height="44" rx="9" fill="var(--panel-2)" stroke="var(--old)"></rect><text x="695" y="106" text-anchor="middle" fill="var(--old)" font-size="12" font-weight="600">Block Store (S3)</text><text x="695" y="120" text-anchor="middle" fill="var(--faint)" font-size="10">content-addressed · 11 nines</text></g>
+
+          <g data-node style="cursor:pointer" data-title="CDN (CloudFront / Akamai / Cloud CDN)" data-detail="<b>Role:</b> edge cache for popular downloads. First-byte latency &lt; 2 s from any PoP.<br><b>Signed URLs</b> — a short-lived signed URL is generated per download so we can revoke access if the share link is deleted. TTL matches share expiry.<br><b>Cache key = blockHash</b> — same immutable content-addressed key S3 uses. Eviction: LRU + TTL 1 h for hot / 5 min for lukewarm."><rect x="620" y="150" width="150" height="44" rx="9" fill="var(--panel-2)" stroke="var(--old)"></rect><text x="695" y="170" text-anchor="middle" fill="var(--old)" font-size="12" font-weight="600">CDN</text><text x="695" y="184" text-anchor="middle" fill="var(--faint)" font-size="10">edge cache · signed URLs</text></g>
+
+          <g data-node style="cursor:pointer" data-title="Redis — upload state, dedup cache, sync cursors" data-detail="<b>Three roles:</b><br>(1) <b>Upload state</b> — key <code>upload:{uploadId}</code> → JSON of uploaded chunks. TTL 24 h. Enables resumable across process restarts.<br>(2) <b>Dedup cache</b> — hot hash set for O(1) 'is duplicate?' — avoids hitting Postgres for the common case. Bloom filter in front (in-process) for even faster no-answer.<br>(3) <b>Sync cursors</b> — per-device cursor per user. Fast read on every sync poll.<br>Redis Cluster, ~500 GB total. Persistent (AOF)."><rect x="620" y="210" width="150" height="44" rx="9" fill="var(--panel-2)" stroke="var(--old)"></rect><text x="695" y="230" text-anchor="middle" fill="var(--old)" font-size="12" font-weight="600">Redis</text><text x="695" y="244" text-anchor="middle" fill="var(--faint)" font-size="10">upload · dedup cache · cursors</text></g>
+
+          <g data-node style="cursor:pointer" data-title="Other devices (sync consumers)" data-detail="<b>Role:</b> Sync Service holds WebSocket connections or long-poll requests per device. When Kafka delivers a file event, Sync Service:<br>(1) Looks up connected devices for the userId.<br>(2) Pushes <code>{type, fileId, changedChunks: [2,4]}</code> to each connected device.<br>(3) Devices download ONLY the changed chunks (delta sync). If offline, they catch up on next connect via the cursor.<br><b>Latency target:</b> edit → other device sees it in &lt; 10 s."><rect x="620" y="330" width="150" height="44" rx="9" fill="var(--panel-2)" stroke="var(--warn)"></rect><text x="695" y="350" text-anchor="middle" fill="var(--warn)" font-size="12" font-weight="600">Other devices</text><text x="695" y="364" text-anchor="middle" fill="var(--faint)" font-size="10">WebSocket · long-poll</text></g>
+
+        </svg>
+      </div>
+      <div class="node-detail"><span class="nd-title">Click any component</span><div class="nd-body">Its role, tech, and scaling note appear here. Then use the buttons below to step through the <b>upload</b> and <b>download</b> flows one hop at a time.</div></div>
+
+      <div class="flowctl" data-flowctl>
+        <button class="btn" data-flow="upload">Upload path (12 steps)</button>
+        <button class="btn" data-flow="download">Download path (7 steps)</button>
+        <span style="flex:1"></span>
+        <button class="btn" data-flowstep="prev">◀ Prev</button>
+        <button class="btn" data-flowstep="next">Next ▶</button>
+      </div>
+      <div class="flowlabel" data-flowlabel>Pick <b>Upload</b> or <b>Download</b>, then press "Next ▶" to walk the numbered request flow one hop at a time.</div>
+
+      <div class="cloudmap">
+        <div class="kicker" style="margin-top:4px">Managed-service mapping — the same design on each cloud</div>
+        <table class="cloudtable">
+          <thead><tr>
+            <th>Component</th>
+            <th><span class="hdrlogo"><span class="logochip"><img src="../assets/logos/aws.svg" alt="AWS"></span>AWS</span></th>
+            <th><span class="hdrlogo"><span class="logochip"><img src="../assets/logos/gcp.svg" alt="GCP"></span>GCP</span></th>
+            <th><span class="hdrlogo"><span class="logochip"><img src="../assets/logos/azure.svg" alt="Azure"></span>Azure</span></th>
+          </tr></thead>
+          <tbody>
+            <tr><td>API Gateway</td><td><img class="svcicon" src="../assets/logos/services/aws-apigw.svg" alt="">API Gateway + ALB</td><td><img class="svcicon" src="../assets/logos/services/gcp-apigw.svg" alt="">API Gateway + GLB</td><td><img class="svcicon" src="../assets/logos/services/azure-apim.svg" alt="">API Management + App GW</td></tr>
+            <tr><td>Compute (services)</td><td><img class="svcicon" src="../assets/logos/services/aws-ecs.svg" alt="">ECS / EKS / Lambda</td><td><img class="svcicon" src="../assets/logos/services/gcp-run.svg" alt="">Cloud Run / GKE</td><td><img class="svcicon" src="../assets/logos/services/azure-aks.svg" alt="">AKS / Container Apps</td></tr>
+            <tr><td><b>Block store (bytes)</b></td><td><img class="svcicon" src="../assets/logos/services/aws-s3.svg" alt="">S3 (11 nines)</td><td><img class="svcicon" src="../assets/logos/services/gcp-cloudstorage.svg" alt="">Cloud Storage</td><td><img class="svcicon" src="../assets/logos/services/azure-blob.svg" alt="">Blob Storage</td></tr>
+            <tr><td>Metadata DB</td><td><img class="svcicon" src="../assets/logos/services/aws-rds.svg" alt="">RDS Postgres / Aurora</td><td><img class="svcicon" src="../assets/logos/services/gcp-cloudsql.svg" alt="">Cloud SQL / Spanner</td><td><img class="svcicon" src="../assets/logos/services/azure-sql.svg" alt="">Azure SQL / Postgres</td></tr>
+            <tr><td>Cache (upload state · dedup)</td><td><img class="svcicon" src="../assets/logos/services/aws-elasticache.svg" alt="">ElastiCache Redis</td><td><img class="svcicon" src="../assets/logos/services/gcp-memorystore.svg" alt="">Memorystore Redis</td><td><img class="svcicon" src="../assets/logos/services/azure-redis.svg" alt="">Azure Cache for Redis</td></tr>
+            <tr><td>Event bus</td><td><img class="svcicon" src="../assets/logos/services/aws-msk.svg" alt="">MSK (Kafka) / SNS+SQS</td><td><img class="svcicon" src="../assets/logos/services/gcp-pubsub.svg" alt="">Pub/Sub</td><td><img class="svcicon" src="../assets/logos/services/azure-eventhubs.svg" alt="">Event Hubs</td></tr>
+            <tr><td>CDN</td><td><img class="svcicon" src="../assets/logos/services/aws-cloudfront.svg" alt="">CloudFront</td><td><img class="svcicon" src="../assets/logos/services/gcp-cloudcdn.svg" alt="">Cloud CDN</td><td><img class="svcicon" src="../assets/logos/services/azure-cdn.svg" alt="">Azure CDN / Front Door</td></tr>
+            <tr><td>Search (file names)</td><td><img class="svcicon" src="../assets/logos/services/aws-opensearch.svg" alt="">OpenSearch</td><td><img class="svcicon" src="../assets/logos/services/gcp-bigquery.svg" alt="">BigQuery / Cloud Search</td><td><img class="svcicon" src="../assets/logos/services/azure-search.svg" alt="">Cognitive Search</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+
+  <!-- D · API -->
+  <section>
+    <div class="sec-h"><span class="n">D</span><h2>API design</h2><span class="tag">chunked upload · download · sync</span></div>
+    <table>
+      <thead><tr><th>Endpoint</th><th>Purpose</th><th>Response</th></tr></thead>
+      <tbody>
+        <tr><td><code>POST /files/upload</code></td><td>small file (&lt; 4 MB) single-PUT with multipart/form-data</td><td>201 + FileMetadata</td></tr>
+        <tr><td><code>POST /files/upload/chunked/init</code></td><td>large file — send fileName, size, chunk hashes → get back missing chunks + presigned URLs</td><td>200 + <code>{uploadId, existingChunks[], missingChunks[], presignedUrls}</code></td></tr>
+        <tr><td><code>PUT presigned-url</code> (direct to S3)</td><td>upload each missing chunk in parallel; S3 verifies SHA-256 checksum</td><td>200 OK from S3</td></tr>
+        <tr><td><code>POST /files/upload/chunked/{uploadId}/complete</code></td><td>signal all chunks uploaded — creates FileMetadata + FileVersion</td><td>201 + FileMetadata (with <code>storageSaved: "62%"</code>)</td></tr>
+        <tr><td><code>GET /files/{fileId}/download</code></td><td>full or range download; hot files return 302 to CDN, cold stream from S3</td><td>200 or 206 + bytes</td></tr>
+        <tr><td><code>GET /files/{fileId}/versions</code></td><td>version history (last N)</td><td>200 + list of FileVersion</td></tr>
+        <tr><td><code>POST /files/{fileId}/share</code></td><td>share with user (role: VIEWER/EDITOR/OWNER)</td><td>201 + SharePermission</td></tr>
+        <tr><td><code>POST /files/{fileId}/share-link</code></td><td>public link with optional password + expiry</td><td>201 + <code>{linkUrl, expiresAt}</code></td></tr>
+        <tr><td><code>GET /sync/changes?cursor=X</code></td><td>changes since cursor — returns events + new cursor + <code>changedChunks[]</code> per file</td><td>200 + list of SyncEvent</td></tr>
+        <tr><td><code>DELETE /files/{fileId}</code></td><td>soft-delete (30-day trash)</td><td>204 No Content</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <!-- E · DATA MODEL -->
+  <section>
+    <div class="sec-h"><span class="n">E</span><h2>Data model</h2><span class="tag">7 core tables · the split matters</span></div>
+    <div class="grid g2">
+      <div class="card">
+        <div class="kicker">Metadata side (Postgres — 125 TB)</div>
+        <pre class="code">File                     <span class="cm">// 250 B rows · shard by userId</span>
+  fileId, userId, folderId
+  name, size, mimeType
+  currentVersion, checksum
+  isDeleted, deletedAt
+
+Folder                   <span class="cm">// 50 B rows · shard by userId</span>
+  folderId, userId, parentId
+  name, path              <span class="cm">// materialized path</span>
+  depth                   <span class="cm">// 0–20 max</span>
+  isShared, isDeleted
+
+FileVersion              <span class="cm">// 750 B rows · shard by fileId</span>
+  versionId, fileId
+  versionNum              <span class="cm">// 1, 2, 3 …</span>
+  size, checksum
+  modifiedBy, changeNote
+  createdAt
+
+FileChunk                <span class="cm">// version ↔ blockHash mapping</span>
+  chunkId, versionId
+  chunkIndex              <span class="cm">// position in file</span>
+  blockHash               <span class="cm">// FK → BlockStore</span>
+  size</pre>
+      </div>
+      <div class="card">
+        <div class="kicker">Blob side + shared (S3 · Redis)</div>
+        <pre class="code">BlockStore               <span class="cm">// 300 B unique blocks in S3</span>
+  blockHash (SHA-256)     <span class="cm">// content-addressable key</span>
+  storageUrl              <span class="cm">// s3://bucket/{prefix}/{hash}</span>
+  size
+  referenceCount          <span class="cm">// # of FileChunk rows</span>
+  createdAt
+
+ShareLink / SharePermission
+  shareId
+  resourceId, resourceType (FILE|FOLDER)
+  sharedByUser, sharedWithUser
+  role (VIEWER|EDITOR|OWNER)
+  linkUrl, passwordHash, expiresAt
+
+SyncCursor               <span class="cm">// per-device sync position</span>
+  cursorId, userId, deviceId
+  cursorToken             <span class="cm">// opaque server timestamp</span>
+  lastSyncAt
+
+StorageQuota
+  userId, totalLimit, usedStorage
+  planType (FREE|BASIC|PREMIUM|ENTERPRISE)</pre>
+      </div>
+    </div>
+    <div class="callout tip"><b>The critical relationship:</b> <code>File → FileVersion → FileChunk → blockHash → BlockStore</code>. FileChunk rows are the join table that lets many versions AND many users share the SAME blockHash. Deleting a version decrements <code>referenceCount</code>; hitting zero triggers S3 delete.</div>
+  </section>
+
+  <!-- F · KEY CHOICES -->
+  <section>
+    <div class="sec-h"><span class="n">F</span><h2>Key design choices (deep-dived on canvas 3)</h2><span class="tag">defend these</span></div>
+    <div class="grid g3">
+      <div class="card"><div class="kicker">the split</div><h3>Metadata (Postgres) vs blob (S3)</h3><p class="muted">Different scaling curves — 125 TB of small indexed rows vs 1.5 EB of immutable bytes. Never one system for both. <span class="run">→ canvas 3 · storage split</span></p></div>
+      <div class="card"><div class="kicker">dedup</div><h3>Content-addressable blocks</h3><p class="muted">Key = SHA-256(content). Same file → same key → stored once. ~40 % storage saved. <span class="run">→ canvas 3 · dedup math</span></p></div>
+      <div class="card"><div class="kicker">chunking</div><h3>Fixed 4 MB vs content-defined (Rabin)</h3><p class="muted">Fixed is simple (Google Drive); Rabin fingerprint tolerates insertions without shifting every boundary (Dropbox). Strategy pattern — swappable.</p></div>
+      <div class="card"><div class="kicker">upload</div><h3>Presigned URLs — direct to S3</h3><p class="muted">Client uploads bypass our app servers. Zero bandwidth cost, zero CPU cost. S3 verifies signature + checksum.</p></div>
+      <div class="card"><div class="kicker">sync</div><h3>Cursor protocol + delta chunks</h3><p class="muted">Opaque server timestamp; client polls or long-polls. On modify, only <b>changed chunks</b> travel — 20 MB edit ⇒ ~8 MB uploaded.</p></div>
+      <div class="card"><div class="kicker">versioning</div><h3>Copy-on-write via chunk sharing</h3><p class="muted">New version = new FileChunk rows, most pointing at OLD blockHashes. Save cost ≈ delta, not full file. Rollback = one int swap.</p></div>
+    </div>
+  </section>
+
+  <!-- GLOSSARY -->
+  <section>
+    <div class="sec-h"><span class="n">§</span><h2>Glossary — one-liners</h2><span class="tag">terms used above</span></div>
+    <div class="grid g2">
+      <div class="card"><table><tbody>
+        <tr><td><b>Content-addressable storage</b></td><td>storage keyed by hash of the content itself</td></tr>
+        <tr><td><b>Chunk</b></td><td>fixed-size (4 MB) piece of a file, hashed independently</td></tr>
+        <tr><td><b>Block</b></td><td>the on-disk representation of a unique chunk (one per hash)</td></tr>
+        <tr><td><b>Deduplication</b></td><td>store each unique block once regardless of how many files reference it</td></tr>
+        <tr><td><b>Reference count</b></td><td>how many FileChunk rows point to this block; 0 = garbage-collect</td></tr>
+        <tr><td><b>Presigned URL</b></td><td>time-limited signed S3 URL letting the client PUT/GET without app-server bandwidth</td></tr>
+      </tbody></table></div>
+      <div class="card"><table><tbody>
+        <tr><td><b>Delta sync</b></td><td>upload/download only chunks that changed since last sync</td></tr>
+        <tr><td><b>Sync cursor</b></td><td>opaque server-time token telling 'I have seen events up to X'</td></tr>
+        <tr><td><b>Rabin fingerprint</b></td><td>rolling hash of a sliding window; used to find content-defined chunk boundaries</td></tr>
+        <tr><td><b>Copy-on-write versioning</b></td><td>a new version reuses unchanged blocks; only writes new blocks for changes</td></tr>
+        <tr><td><b>Materialized path</b></td><td>full folder path stored on each Folder row for O(1) ancestor walks</td></tr>
+        <tr><td><b>Last-writer-wins</b></td><td>on sync conflict, keep the version with the newest timestamp (Google Drive)</td></tr>
+      </tbody></table></div>
+    </div>
+  </section>
+
+  <footer>
+    <p>Use case 15 · File Storage — Canvas 1 of 3 (HLD). Grounded in <code>15-file-storage/docs/hld/HIGH_LEVEL_DESIGN.md</code> and the real Java under <code>15-file-storage/src/</code>.</p>
+    <p class="run">This use case: HLD · <a href="lld.html">Canvas 2 · LLD</a> · <a href="deepdive.html">Canvas 3 · Deep-dive &amp; Trade-offs</a> &nbsp;|&nbsp; <a href="../index.html">Hub</a></p>
+  </footer>
+
+</div>
+<script src="../assets/canvas.js"></script>
+</body>
+</html>

@@ -1,0 +1,387 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>19 · API Gateway &amp; Service Mesh — Deep-dive &amp; Trade-offs</title>
+<link rel="stylesheet" href="../assets/canvas.css">
+</head>
+<body>
+<div class="wrap">
+
+  <header class="hero">
+    <h1>API Gateway &amp; Service Mesh — Deep-dive &amp; Trade-offs</h1>
+    <div class="sub">Canvas 3 of 3. The staff-engineer answers. Gateway vs mesh (when to use each), <b>circuit-breaker state-machine deep-dive</b>, <b>token bucket vs leaky bucket vs sliding window</b>, <b>zero-trust mTLS</b> (SPIFFE / SPIRE, auto-rotation), <b>canary deploys with automated rollback</b>, split <b>CAP</b> (data plane AP · control plane CP), <b>8 failure modes</b>, cloud mapping, an <b>11-decision trade-off table</b>, and an <b>8-phase interview walkthrough</b>.</div>
+    <div class="badges">
+      <span class="badge lvl">Use case 19 · Deep-dive</span>
+      <span class="badge">Canvas 3 of 3</span>
+      <span class="badge">interview-ready</span>
+      <span class="badge">data plane AP · control plane CP</span>
+      <span class="badge">&lt; 1 ms overhead</span>
+    </div>
+  </header>
+
+  <!-- A · GATEWAY vs MESH -->
+  <section>
+    <div class="sec-h"><span class="n">A</span><h2>Gateway vs mesh — when to use each</h2><span class="tag">the most-common interview confusion</span></div>
+    <div data-tabscope>
+      <div class="tabs">
+        <div class="tab active" data-tab="gw-vs-mesh">Side-by-side</div>
+        <div class="tab" data-tab="gw-only">Gateway only?</div>
+        <div class="tab" data-tab="mesh-only">Mesh only?</div>
+        <div class="tab" data-tab="both">Both together</div>
+      </div>
+      <div class="tabpanel active" data-panel="gw-vs-mesh">
+        <table>
+          <thead><tr><th>Concern</th><th>API Gateway (N-S)</th><th>Service Mesh (E-W)</th></tr></thead>
+          <tbody>
+            <tr><td>Traffic direction</td><td>External clients → cluster</td><td>Service ↔ service inside cluster</td></tr>
+            <tr><td>Deployment</td><td>Centralised fleet (2–4 instances)</td><td>Sidecar per pod (thousands)</td></tr>
+            <tr><td>Trust model</td><td>Untrusted callers → auth mandatory</td><td>Zero-trust via mTLS between pods</td></tr>
+            <tr><td>Typical RPS</td><td>100 K</td><td>1 M–100 M (10–100× fan-out)</td></tr>
+            <tr><td>Latency budget</td><td>&lt; 1 ms overhead</td><td>&lt; 0.5 ms overhead (per hop)</td></tr>
+            <tr><td>Auth style</td><td>JWT / OAuth2 / API Key (external principals)</td><td>mTLS cert-based (service identity)</td></tr>
+            <tr><td>Rate limiting</td><td>per-client (user / partner)</td><td>per-service pair (calling relationship)</td></tr>
+            <tr><td>Config source</td><td>Ops team registers routes</td><td>Control plane pushes via xDS</td></tr>
+            <tr><td>Failure blast radius</td><td>All external traffic if gateway down</td><td>One service pair if a sidecar misbehaves</td></tr>
+            <tr><td>Products</td><td>Kong, Zuul, Kong, AWS APIGW, Apigee</td><td>Istio, Linkerd, Consul Connect, AWS App Mesh</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="tabpanel" data-panel="gw-only">
+        <p><b>Choose gateway-only when:</b></p>
+        <ul class="tight">
+          <li>You have &lt; 20 services and internal calls are direct (no fan-out).</li>
+          <li>All internal traffic is on a trusted network (VPC + private subnets) — you're OK skipping mTLS.</li>
+          <li>Team size &lt; 30 — the operational complexity of a mesh isn't worth it yet.</li>
+          <li>You need external API management (developer portal, quotas, billing) — Apigee / Kong shine here.</li>
+        </ul>
+      </div>
+      <div class="tabpanel" data-panel="mesh-only">
+        <p><b>Choose mesh-only when:</b></p>
+        <ul class="tight">
+          <li>Your ingress is a plain L4 load balancer (NLB) — you don't need JWT/OAuth/API-key features.</li>
+          <li>All clients are internal / mobile apps using long-lived mTLS certs (rare in practice).</li>
+          <li>Your team already runs Istio and doesn't want two vendors.</li>
+        </ul>
+        <p class="muted">In practice this is uncommon — even mesh-heavy shops use a lightweight gateway for TLS termination and rate-limiting at the edge.</p>
+      </div>
+      <div class="tabpanel" data-panel="both">
+        <p><b>The standard architecture — use both:</b></p>
+        <ol class="tight">
+          <li><b>API Gateway</b> at the edge handles ingress: JWT, rate-limit, WAF, DDoS protection, TLS termination, request-shape validation.</li>
+          <li>Gateway forwards to the <b>first internal hop's sidecar</b> (or directly to service if that hop has no sidecar).</li>
+          <li>All subsequent service-to-service calls go <b>sidecar → sidecar</b> with mTLS, circuit-breaking, and retries applied by the mesh.</li>
+        </ol>
+        <p class="muted">This is what Netflix, Uber, Airbnb, LinkedIn all run. Gateway ≠ mesh; they're complementary.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- B · CIRCUIT BREAKER DEEP-DIVE -->
+  <section>
+    <div class="sec-h"><span class="n">B</span><h2>Circuit breaker — the resilience keystone</h2><span class="tag">stops cascading failure</span></div>
+    <div class="grid g2">
+      <div class="card">
+        <div class="kicker">why it exists</div>
+        <p><b>Without circuit breakers:</b> backend B is slow (2 s per request). Callers wait full timeout (5 s), holding a thread each. At 100 RPS, threads pile up ⇒ caller pool exhausted ⇒ caller returns 503 ⇒ its callers also pile up ⇒ <b>cascade</b> until the entire mesh is on fire.</p>
+        <p><b>With circuit breakers:</b> after 5 consecutive failures/timeouts, circuit trips OPEN. New requests fail-fast (&lt; 1 μs) with 503 instead of waiting. Threads freed. Caller's caller gets a fast 503 and can degrade gracefully (cached response, alternative service).</p>
+      </div>
+      <div class="card">
+        <div class="kicker">the recovery dance (HALF_OPEN)</div>
+        <p><b>The tricky part.</b> After 30 s in OPEN, we don't just flip back to CLOSED — the backend might still be broken. Instead we transition to HALF_OPEN and allow <b>ONE test request</b>.</p>
+        <ul class="tight">
+          <li>If test succeeds → wait for SUCCESS_THRESHOLD (3) more successes → CLOSED.</li>
+          <li>If test fails → back to OPEN, another 30 s cooldown.</li>
+        </ul>
+        <p class="muted"><b>Thundering herd:</b> if 1 000 callers all HALF_OPEN at the same moment, that's 1 000 test requests hitting the recovering backend simultaneously ⇒ they all fail ⇒ back to OPEN, worse than before. <b>Mitigation:</b> jitter the OPEN_DURATION (30 s ± 20 %) so not everyone probes at the same instant.</p>
+      </div>
+    </div>
+    <div class="callout tip"><b>Advanced tuning:</b> our code uses <b>consecutive-count</b> thresholds (5 fails in a row). Production circuit breakers (Hystrix, Resilience4j, Envoy) use <b>error-rate percentage</b> over a rolling window (e.g., open if &gt;50 % of the last 100 requests failed AND at least 20 requests happened). More robust for sparse traffic and less prone to over-reaction on isolated blips.</div>
+    <div class="callout"><b>Bulkhead pattern (companion):</b> beyond CB, isolate resources per downstream — dedicated thread pool of size 20 per target service. If backend B slows down, only 20 threads are ever tied up on it — other services are unaffected. Combined with CB, blast radius stays contained.</div>
+  </section>
+
+  <!-- C · RATE LIMITING -->
+  <section>
+    <div class="sec-h"><span class="n">C</span><h2>Rate limiting algorithms — token bucket vs alternatives</h2><span class="tag">interviews always ask</span></div>
+    <div data-tabscope>
+      <div class="tabs">
+        <div class="tab active" data-tab="rl-token">Token bucket (chosen)</div>
+        <div class="tab" data-tab="rl-leaky">Leaky bucket</div>
+        <div class="tab" data-tab="rl-fixed">Fixed window</div>
+        <div class="tab" data-tab="rl-sliding">Sliding window log</div>
+        <div class="tab" data-tab="rl-cmp">comparison</div>
+      </div>
+      <div class="tabpanel active" data-panel="rl-token">
+        <p><b>Bucket has N tokens.</b> Refill at rate R per second (up to capacity). Each request consumes 1 token; deny if 0.</p>
+        <pre class="code"><span class="cm">// On request for key = (client, route):</span>
+now = System.currentTimeMillis()
+bucket.tokens = min(bucket.capacity,
+                    bucket.tokens + (now - bucket.lastRefill) * bucket.rate / 1000)
+bucket.lastRefill = now
+if (bucket.tokens &gt;= 1) {
+  bucket.tokens--
+  return ALLOW (remainingTokens = floor(bucket.tokens))
+} else {
+  retryAfterMs = (1 - bucket.tokens) / bucket.rate * 1000
+  return DENY (429, Retry-After: retryAfterMs)
+}</pre>
+        <p class="muted"><b>Pros:</b> allows burst up to capacity; naturally smooth; O(1) memory per key.<br><b>Cons:</b> a coordinated flood of bursts can still overwhelm downstream — must be paired with concurrency limits.</p>
+      </div>
+      <div class="tabpanel" data-panel="rl-leaky">
+        <p><b>Bucket leaks at constant rate R.</b> Incoming requests fill the bucket; if full, deny. Requests processed at rate R regardless of input.</p>
+        <pre class="code"><span class="cm">// Equivalent formulation: FIFO queue with capacity N, drain at rate R</span>
+if (queue.size &lt; capacity) {
+  queue.offer(request)
+  return ALLOW
+} else {
+  return DENY (429)
+}</pre>
+        <p class="muted"><b>Pros:</b> perfectly smooth downstream traffic — no bursts pass through.<br><b>Cons:</b> latency increases as queue fills; poor UX for sporadic-burst traffic (mobile push, cron jobs).</p>
+      </div>
+      <div class="tabpanel" data-panel="rl-fixed">
+        <p><b>Count requests in the current 1-second window.</b> Reset counter at second boundary.</p>
+        <pre class="code">if (currentSecond != bucket.windowStart) {
+  bucket.count = 0
+  bucket.windowStart = currentSecond
+}
+bucket.count++
+return bucket.count &lt;= limit ? ALLOW : DENY</pre>
+        <p class="muted"><b>Pros:</b> trivial O(1).<br><b>Cons:</b> <b>edge burst</b> — a client can hit 2× limit by sending N requests at second 0.999 and another N at 1.001. Simple but leaky in practice.</p>
+      </div>
+      <div class="tabpanel" data-panel="rl-sliding">
+        <p><b>Store timestamps of the last N requests.</b> Deny if oldest &gt; window-size ago.</p>
+        <pre class="code">bucket.timestamps.removeIf(t -&gt; t &lt; now - WINDOW_MS)
+if (bucket.timestamps.size &lt; limit) {
+  bucket.timestamps.add(now)
+  return ALLOW
+}
+return DENY (Retry-After: bucket.timestamps.get(0) + WINDOW_MS - now)</pre>
+        <p class="muted"><b>Pros:</b> most accurate — no edge-burst; precise remaining-quota reporting.<br><b>Cons:</b> O(limit) memory per key — expensive at millions of clients × routes. Use only for high-value endpoints (login, payment).</p>
+      </div>
+      <div class="tabpanel" data-panel="rl-cmp">
+        <table>
+          <thead><tr><th>Algorithm</th><th>Memory / key</th><th>Burst allowed</th><th>Accuracy</th><th>Best for</th></tr></thead>
+          <tbody>
+            <tr><td><b>Token bucket</b></td><td>O(1) — 2 longs</td><td>up to capacity</td><td>high</td><td>general APIs (our default)</td></tr>
+            <tr><td>Leaky bucket</td><td>O(1) — 2 longs</td><td>none</td><td>high</td><td>strict smoothing (e.g., payment gateway)</td></tr>
+            <tr><td>Fixed window</td><td>O(1) — 2 longs</td><td>up to 2× at edges</td><td>low</td><td>internal dashboards, coarse limits</td></tr>
+            <tr><td>Sliding window log</td><td>O(limit) — timestamp array</td><td>none</td><td>perfect</td><td>login, checkout, security-critical</td></tr>
+            <tr><td>Sliding window counter (hybrid)</td><td>O(2) — two window counters</td><td>small</td><td>high</td><td>Cloudflare-scale, best all-round</td></tr>
+          </tbody>
+        </table>
+        <p class="muted"><b>Distributed setup:</b> in-memory works per-gateway-instance only. For global rate limits across the fleet, use <b>Redis with a Lua script</b> for atomic token-bucket ops. Cost: one Redis RTT (~0.5 ms) added to hot path. Alternative: soft local limit + eventually-consistent global counter for high-throughput / low-cost endpoints.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- D · ZERO-TRUST mTLS -->
+  <section>
+    <div class="sec-h"><span class="n">D</span><h2>Zero-trust mTLS — cert rotation at 200 K/day</h2><span class="tag">SPIFFE · SPIRE · SVIDs</span></div>
+    <div class="grid g2">
+      <div class="card">
+        <div class="kicker">what "zero trust" means</div>
+        <p><b>Traditional trust:</b> "we're in the same VPC, so I'll accept HTTP without auth." Breaks the moment an attacker gets a foothold — lateral movement is trivial.</p>
+        <p><b>Zero-trust:</b> every service pair authenticates via mutual TLS on EVERY connection. No network-based trust. Compromised pod A cannot make requests as pod B without pod B's cert.</p>
+        <p><b>Identity = SPIFFE ID:</b> <code>spiffe://cluster.local/ns/prod/sa/order-service</code>. The mesh CA issues short-lived X.509 certs (SVIDs) with this URI in the SAN field. Auto-rotated every 24 h (or on cert refresh signal).</p>
+      </div>
+      <div class="card">
+        <div class="kicker">the rotation problem</div>
+        <p>At 50 000 pods × 1 rotation/day = 200 K cert issuances/day. Manual is impossible. Automated via <b>SPIRE agents</b>:</p>
+        <ol class="tight">
+          <li>Pod starts; SPIRE agent on the node attests it (validates via k8s ServiceAccount + node identity).</li>
+          <li>Agent requests SVID from SPIRE server on behalf of pod.</li>
+          <li>SPIRE server signs a short-lived cert (1 h TTL) with the pod's SPIFFE ID.</li>
+          <li>Agent injects cert + private key into the pod's sidecar via SPIFFE Workload API.</li>
+          <li>Sidecar hot-reloads cert every ~30 min; no downtime.</li>
+        </ol>
+        <p class="muted"><b>Failure mode:</b> if SPIRE server is unreachable at rotation, sidecar uses last-known-good cert until it expires. Grace window (usually 2× rotation interval) buys time to recover.</p>
+      </div>
+    </div>
+    <div class="callout tip"><b>Interview zinger:</b> zero-trust with mTLS also solves <b>internal replay attacks</b> — even if an attacker records ciphertext, they can't replay it (session keys are unique per handshake) and can't forge new requests (no client cert). This is genuinely stronger than any network-perimeter model.</div>
+  </section>
+
+  <!-- E · CANARY -->
+  <section>
+    <div class="sec-h"><span class="n">E</span><h2>Canary deploys with automated rollback</h2><span class="tag">1 000 deploys/day at Netflix</span></div>
+    <div class="grid g2">
+      <div class="card">
+        <div class="kicker">the flow</div>
+        <ol class="tight">
+          <li>Deploy v2 alongside v1; v2 registered with weight=0 (0 % traffic).</li>
+          <li>Gradually shift weight: 0 → 1 → 5 → 25 → 50 → 100 over 30 min.</li>
+          <li>At each step, <b>SLO monitor</b> compares v2 vs v1: error rate, p99 latency, saturation.</li>
+          <li>If v2 within 2 % of v1 baseline → proceed to next step.</li>
+          <li>If v2 worse by &gt; anomaly threshold → <b>automatic rollback</b>: set v2 weight = 0, page on-call.</li>
+          <li>If all steps pass → v1 weight = 0, then decommission v1 pods.</li>
+        </ol>
+      </div>
+      <div class="card">
+        <div class="kicker">two ways to canary</div>
+        <p><b>1. Weighted (CanaryTrafficStrategy)</b> — random 5 % of external users hit v2. Statistically representative; requires enough traffic to detect anomalies (usually &gt; 1 000 RPS).</p>
+        <p><b>2. Header-based (HeaderBasedTrafficStrategy)</b> — <code>X-Canary: true</code> or specific internal test accounts hit v2. Deterministic; great for QA / dogfooding; doesn't need traffic volume.</p>
+        <p class="muted"><b>Best practice:</b> combine both. Start header-based for internal validation, then weighted for real-user data, then full rollout.</p>
+      </div>
+    </div>
+    <div class="callout warn"><b>Rollback within 60 s</b> requires: (1) SLO computation on 30-s windows (not 5-min); (2) alert-to-traffic-shift automation (no human in the loop for red-alarm anomalies); (3) idempotent rollback API — the same "set v2 weight=0" call safe to retry.</div>
+  </section>
+
+  <!-- F · CAP -->
+  <section>
+    <div class="sec-h"><span class="n">F</span><h2>CAP theorem — data plane AP · control plane CP</h2><span class="tag">split answer again</span></div>
+    <div class="callout tip"><b>The insight:</b> the <b>data plane</b> (gateway request-handling, sidecar-to-sidecar proxying) MUST be highly available — a partition to the control plane must not stop traffic. So the data plane is <b>AP</b>. The <b>control plane</b> (route registration, policy config, cert issuance) must be strongly consistent — you don't want half the fleet on v1 config and half on v2. So control plane is <b>CP</b>.</div>
+    <table>
+      <thead><tr><th>Component</th><th>Consistency</th><th>Availability</th><th>Behaviour on partition</th></tr></thead>
+      <tbody>
+        <tr><td><b>Data plane (gateway request handling)</b></td><td>Eventual (AP)</td><td>always available</td><td>keeps serving with last-known-good config; new routes/policies wait for control-plane recovery</td></tr>
+        <tr><td><b>Data plane (sidecar-to-sidecar)</b></td><td>Eventual (AP)</td><td>always available</td><td>uses cached xDS config + cached certs; no impact for 24 h+</td></tr>
+        <tr><td><b>Control plane (route registration)</b></td><td>Strong (CP)</td><td>blocks writes on partition</td><td>ops can't push new routes until healed; safer than half-fleet split</td></tr>
+        <tr><td><b>Control plane (cert issuance)</b></td><td>Strong (CP)</td><td>blocks new issuances</td><td>existing sidecars unaffected; new pods can't start until CA reachable</td></tr>
+        <tr><td>Service registry (heartbeats)</b></td><td>Eventual (AP)</td><td>always available</td><td>stale entries may briefly linger; LB tolerates via health filter</td></tr>
+        <tr><td>Circuit-breaker state</td><td>local per gateway/sidecar</td><td>always available</td><td>each instance keeps its own state; no need to sync globally</td></tr>
+        <tr><td>Rate-limit counter (distributed)</td><td>Strong (CP) via Redis Lua</td><td>Redis unavailable → local fallback</td><td>either use local soft limit OR fail-open, per policy</td></tr>
+        <tr><td>Distributed traces</td><td>Eventual</td><td>best-effort</td><td>drop spans on backpressure; sampling degrades gracefully</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <!-- G · BOTTLENECKS -->
+  <section>
+    <div class="sec-h"><span class="n">G</span><h2>Bottlenecks &amp; mitigations</h2><span class="tag">8 failure modes · defence against each</span></div>
+    <div class="grid g2">
+      <div class="card collapsible"><div class="c-head">Control-plane outage <span class="muted">(Istio Pilot down)</span></div><div class="c-body"><p><b>Symptom:</b> can't push new routes / policies; new pods can't get certs.</p><p><b>Mitigation:</b> data plane keeps operating on last-known-good config — that's WHY sidecars cache. Sidecar SVIDs valid for hours; xDS config valid indefinitely until push. Alert on control-plane down but don't panic — traffic keeps flowing. Multi-AZ control plane; automatic failover.</p></div></div>
+      <div class="card collapsible"><div class="c-head">Certificate rotation storm</div><div class="c-body"><p><b>Symptom:</b> at 3 AM, 50 K sidecars all try to rotate certs simultaneously → SPIRE server saturated → some rotations fail → some sidecars hit expiration → mTLS handshake failures spike.</p><p><b>Mitigation:</b> <b>jitter rotation windows</b> (each pod rotates at random offset within 24 h). Cache cert-request results at SPIRE server. Scale SPIRE horizontally by k8s namespace.</p></div></div>
+      <div class="card collapsible"><div class="c-head">Thundering herd on OPEN → HALF_OPEN</div><div class="c-body"><p><b>Symptom:</b> 1 000 gateway threads all see OPEN_DURATION elapsed at t=30 s → all send probe → recovering backend crushed by 1 000 concurrent requests → all fail → back to OPEN.</p><p><b>Mitigation:</b> <b>jitter the OPEN_DURATION</b> (30 s ± 20 %). Optionally: only ONE probe per cooldown (queue others in HALF_OPEN pending); rate-limit test requests per second.</p></div></div>
+      <div class="card collapsible"><div class="c-head">Hot route in the routing table</div><div class="c-body"><p><b>Symptom:</b> route table has 5 000 entries; the lookup for <code>/api/users/*</code> scans them all each request → CPU-bound at 10 K RPS.</p><p><b>Mitigation:</b> <b>trie / radix tree</b> keyed by path segment for O(k) lookup where k = path depth (typically 3–5), not O(n). Envoy does this natively. Also: pre-compile globs to regex ONCE at registration, not per-request.</p></div></div>
+      <div class="card collapsible"><div class="c-head">TLS handshake overhead</div><div class="c-body"><p><b>Symptom:</b> new mTLS handshake = 2 RTTs + 4 cert-verify ops. At 10 K new connections/s, sidecar CPU pegged on handshake.</p><p><b>Mitigation:</b> <b>HTTP/2 with long-lived connections</b> — one handshake amortized over thousands of requests. TLS session resumption. Cache parsed cert chains in memory.</p></div></div>
+      <div class="card collapsible"><div class="c-head">Rate-limit inconsistency across gateway fleet</div><div class="c-body"><p><b>Symptom:</b> local per-gateway limits mean a client can send 4× the intended rate by hitting different gateways.</p><p><b>Mitigation:</b> <b>Redis with Lua atomic INCR</b> for global limits — one RTT (~0.5 ms) on hot path. For less critical routes: local limit at 1/N-th (N = gateway count) — cheap approximation. Use global limits only where correctness matters (payment, auth).</p></div></div>
+      <div class="card collapsible"><div class="c-head">JWT validation cost</div><div class="c-body"><p><b>Symptom:</b> RSA signature verify = ~0.5 ms per request → at 100 K RPS = 50 gateway cores just verifying JWTs.</p><p><b>Mitigation:</b> <b>cache verified JWT results by (tokenHash → AuthResult)</b> for the token's TTL. Second request with same token = 0.01 ms cache hit. ~99 % hit rate for logged-in users. For DDoS spikes: rate-limit BEFORE auth so bad tokens don't consume CPU.</p></div></div>
+      <div class="card collapsible"><div class="c-head">Stuck instances in registry</div><div class="c-body"><p><b>Symptom:</b> instance crashed but registry still lists it as healthy for 10 s (heartbeat timeout) → LB routes requests to dead instance → 503s spike.</p><p><b>Mitigation:</b> shorten heartbeat window (3 s instead of 10 s). Combine with <b>active health probes</b> (LB sends periodic /health checks and evicts on failure). Kill-switch API for ops to force-deregister an instance immediately.</p></div></div>
+    </div>
+  </section>
+
+  <!-- H · CLOUD -->
+  <section>
+    <div class="sec-h"><span class="n">H</span><h2>Cloud mapping — the design on each provider</h2><span class="tag">reference — quote the managed service</span></div>
+    <div class="cloudmap">
+      <table class="cloudtable">
+        <thead><tr>
+          <th>Concern</th>
+          <th><span class="hdrlogo"><span class="logochip"><img src="../assets/logos/aws.svg" alt="AWS"></span>AWS</span></th>
+          <th><span class="hdrlogo"><span class="logochip"><img src="../assets/logos/gcp.svg" alt="GCP"></span>GCP</span></th>
+          <th><span class="hdrlogo"><span class="logochip"><img src="../assets/logos/azure.svg" alt="Azure"></span>Azure</span></th>
+        </tr></thead>
+        <tbody>
+          <tr><td><b>Managed API Gateway</b></td><td><img class="svcicon" src="../assets/logos/services/aws-apigw.svg" alt="">API Gateway (REST / HTTP / WebSocket)</td><td><img class="svcicon" src="../assets/logos/services/gcp-apigw.svg" alt="">API Gateway / Apigee</td><td><img class="svcicon" src="../assets/logos/services/azure-apim.svg" alt="">API Management</td></tr>
+          <tr><td><b>Managed Service Mesh</b></td><td><img class="svcicon" src="../assets/logos/services/aws-ecs.svg" alt="">App Mesh (Envoy-based)</td><td><img class="svcicon" src="../assets/logos/services/gcp-run.svg" alt="">Anthos Service Mesh (Istio)</td><td><img class="svcicon" src="../assets/logos/services/azure-aks.svg" alt="">Open Service Mesh (deprecated) → Istio on AKS</td></tr>
+          <tr><td>Kubernetes (mesh host)</td><td><img class="svcicon" src="../assets/logos/services/aws-ecs.svg" alt="">EKS</td><td><img class="svcicon" src="../assets/logos/services/gcp-run.svg" alt="">GKE</td><td><img class="svcicon" src="../assets/logos/services/azure-aks.svg" alt="">AKS</td></tr>
+          <tr><td>Load Balancer (edge)</td><td><img class="svcicon" src="../assets/logos/services/aws-elb.svg" alt="">ALB / NLB</td><td><img class="svcicon" src="../assets/logos/services/gcp-elb.svg" alt="">Cloud Load Balancing</td><td><img class="svcicon" src="../assets/logos/services/azure-appgw.svg" alt="">Azure Load Balancer / App GW</td></tr>
+          <tr><td>Certificate Mgmt (mTLS CA)</td><td>ACM Private CA (SPIFFE via cert-manager)</td><td>Certificate Authority Service</td><td>Key Vault (cert manager)</td></tr>
+          <tr><td>Rate limiter (distributed)</td><td><img class="svcicon" src="../assets/logos/services/aws-elasticache.svg" alt="">ElastiCache Redis (Lua)</td><td><img class="svcicon" src="../assets/logos/services/gcp-memorystore.svg" alt="">Memorystore Redis</td><td><img class="svcicon" src="../assets/logos/services/azure-redis.svg" alt="">Azure Cache for Redis</td></tr>
+          <tr><td>Config store (control plane)</td><td>etcd (self-managed) or DynamoDB</td><td>etcd (GKE) or Firestore</td><td>etcd (AKS) or Cosmos DB</td></tr>
+          <tr><td>Observability (traces)</td><td>X-Ray + CloudWatch</td><td>Cloud Trace + Monitoring</td><td>App Insights + Azure Monitor</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <!-- I · TRADE-OFFS -->
+  <section>
+    <div class="sec-h"><span class="n">I</span><h2>Trade-offs summary — 11 decisions</h2><span class="tag">every choice has an opportunity cost</span></div>
+    <table>
+      <thead><tr><th>Decision</th><th>Chosen</th><th>Alternative</th><th>Why chosen</th></tr></thead>
+      <tbody>
+        <tr><td>N-S vs E-W</td><td><b>Split</b> — gateway + mesh</td><td>Gateway only (all traffic through it)</td><td>Central gateway can't handle 100× RPS fan-out; sidecars scale linearly</td></tr>
+        <tr><td>Rate limiting algorithm</td><td><b>Token bucket</b></td><td>Leaky bucket / sliding window</td><td>Allows burst; O(1) memory; good default for most APIs</td></tr>
+        <tr><td>Circuit breaker trigger</td><td><b>Consecutive count</b> (5 fails)</td><td>Error-rate percentage</td><td>Simpler; upgrade to rate-based in production</td></tr>
+        <tr><td>Default LB strategy</td><td><b>Round-Robin</b></td><td>Weighted / Consistent-Hash</td><td>Uniform when instances are equal; swap for canary / cache-affinity</td></tr>
+        <tr><td>Auth default</td><td><b>JWT</b></td><td>API Key / OAuth2 opaque token</td><td>Stateless — no lookup in hot path; scale by verifying signature only</td></tr>
+        <tr><td>Auth verify cost</td><td><b>Cache per (tokenHash, TTL)</b></td><td>Verify every request</td><td>~99 % hit ⇒ 100× CPU reduction</td></tr>
+        <tr><td>mTLS scope</td><td><b>All E-W traffic</b></td><td>Only sensitive services</td><td>Zero-trust; stops lateral movement</td></tr>
+        <tr><td>Cert TTL</td><td><b>1 hour</b> (rotate ~30 min)</td><td>1 day / 1 year</td><td>Short = small blast radius on cert theft; SPIRE automates it</td></tr>
+        <tr><td>Data plane consistency</td><td><b>AP</b></td><td>CP</td><td>Traffic MUST keep flowing during control-plane blips</td></tr>
+        <tr><td>Control plane consistency</td><td><b>CP</b></td><td>AP</td><td>Half-fleet on old config = worse than briefly blocked writes</td></tr>
+        <tr><td>Canary strategy</td><td><b>Weighted + header hybrid</b></td><td>Only weighted OR only header</td><td>Header for QA / dogfood; weighted for real users; safest rollout</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <!-- J · INTERVIEW -->
+  <section>
+    <div class="sec-h"><span class="n">J</span><h2>Interview walkthrough — 8 phases</h2><span class="tag">45-min structure · green &amp; red flags</span></div>
+    <div class="grid g2">
+      <div class="card">
+        <div class="kicker">phase 1 — clarify (2 min)</div>
+        <p>Ask: external clients only, or internal too? # services and RPS? SLA target? On-prem or cloud-managed?</p>
+        <div class="muted">Green: "external RPS 100 K, internal 1 M, 200 services, GCP." Red: skipping straight to Envoy without knowing scale.</div>
+      </div>
+      <div class="card">
+        <div class="kicker">phase 2 — separate concerns (3 min)</div>
+        <p>Draw the two planes: N-S (gateway) vs E-W (mesh). Explain why one system can't do both — fan-out ratio.</p>
+        <div class="muted">Green: "gateway = ingress, mesh = internal, complementary". Red: "the gateway handles internal calls too" (breaks at scale).</div>
+      </div>
+      <div class="card">
+        <div class="kicker">phase 3 — gateway pipeline (5 min)</div>
+        <p>10 steps: route → auth → authz → rate-limit → CB → LB → forward → record → respond. Cheapest filters first, fail-fast.</p>
+        <div class="muted">Green: draw the pipeline; explain ordering. Red: "the gateway does auth" without saying WHEN in the pipeline.</div>
+      </div>
+      <div class="card">
+        <div class="kicker">phase 4 — mesh architecture (5 min)</div>
+        <p>Sidecar per pod (Envoy). Control plane (Istio/Consul) pushes config via xDS. mTLS via SPIRE. All apps unchanged.</p>
+        <div class="muted">Green: "sidecar intercepts via iptables; app code unaware". Red: "each service does its own mTLS" (defeats mesh point).</div>
+      </div>
+      <div class="card">
+        <div class="kicker">phase 5 — deep dives (15 min)</div>
+        <p>Pick 2–3: <b>circuit breaker</b> (3-state machine), <b>token bucket</b> (refill math), <b>consistent hash LB</b> (ring + vnodes), <b>mTLS + SPIFFE</b>, <b>canary + auto-rollback</b>.</p>
+        <div class="muted">Green: verbatim state-machine code, refill formula. Red: "we do circuit breaking" without state transitions.</div>
+      </div>
+      <div class="card">
+        <div class="kicker">phase 6 — CAP &amp; failures (5 min)</div>
+        <p>Data plane AP (traffic must flow during CP blips). Control plane CP. 8 bottlenecks (thundering herd, cert storm, hot route, TLS handshake).</p>
+        <div class="muted">Green: "split answer — data plane AP for availability, control plane CP for correctness". Red: "the whole system is CP".</div>
+      </div>
+      <div class="card">
+        <div class="kicker">phase 7 — scale (5 min)</div>
+        <p>2–4 gateway instances × 50 K RPS = 100 K RPS. Mesh: 50 K pods × 1 sidecar each. Redis for global rate limits. Prometheus for metrics.</p>
+        <div class="muted">Green: quote per-instance numbers + headroom. Red: "we can scale to any RPS" without numbers.</div>
+      </div>
+      <div class="card">
+        <div class="kicker">phase 8 — extensions (5 min)</div>
+        <p>WAF at edge. Bot detection (Cloudflare). WebSocket / gRPC support. Multi-cluster mesh federation (across regions). API versioning strategy.</p>
+        <div class="muted">Green: name the extension AND the trade-off. Red: "we can add WebSocket easily" (not trivial in a mesh).</div>
+      </div>
+    </div>
+  </section>
+
+  <!-- GLOSSARY -->
+  <section>
+    <div class="sec-h"><span class="n">§</span><h2>Glossary — deep-dive terms</h2></div>
+    <div class="grid g2">
+      <div class="card"><table><tbody>
+        <tr><td><b>SPIFFE</b></td><td>Secure Production Identity Framework For Everyone — standard for service identity</td></tr>
+        <tr><td><b>SPIRE</b></td><td>SPIFFE Runtime Environment — reference impl that issues short-lived certs (SVIDs)</td></tr>
+        <tr><td><b>SVID</b></td><td>SPIFFE Verifiable Identity Document — an X.509 or JWT-format identity cert</td></tr>
+        <tr><td><b>xDS</b></td><td>Envoy's Discovery Service API — control plane pushes config via gRPC stream</td></tr>
+        <tr><td><b>Bulkhead</b></td><td>isolate resources per downstream (dedicated thread pool) so one failure can't consume all threads</td></tr>
+        <tr><td><b>Thundering herd</b></td><td>N callers all attempt recovery simultaneously and re-overload the backend</td></tr>
+      </tbody></table></div>
+      <div class="card"><table><tbody>
+        <tr><td><b>Sidecar</b></td><td>proxy container in the same pod as the service; intercepts all traffic</td></tr>
+        <tr><td><b>Envoy</b></td><td>the C++ proxy at the heart of Istio, Consul Connect, AWS App Mesh</td></tr>
+        <tr><td><b>iptables intercept</b></td><td>kernel-level rule that redirects pod traffic through the sidecar transparently</td></tr>
+        <tr><td><b>Data plane vs control plane</b></td><td>data = handles actual traffic; control = distributes config</td></tr>
+        <tr><td><b>Canary deploy</b></td><td>send small % of traffic to a new version to detect regressions before full rollout</td></tr>
+        <tr><td><b>SLO</b></td><td>Service Level Objective — target for reliability (e.g., 99.9 % availability, p99 &lt; 100 ms)</td></tr>
+      </tbody></table></div>
+    </div>
+  </section>
+
+  <footer>
+    <p>Use case 19 · API Gateway &amp; Service Mesh — Canvas 3 of 3 (Deep-dive &amp; Trade-offs). Grounded in <code>19-api-gateway-service-mesh/docs/hld/HIGH_LEVEL_DESIGN.md</code>, <code>docs/tradeoffs/</code>, and the real Java source.</p>
+    <p class="run"><a href="hld.html">← Canvas 1 · HLD</a> · <a href="lld.html">Canvas 2 · LLD</a> · Canvas 3 · Deep-dive &nbsp;|&nbsp; <a href="../index.html">Hub</a></p>
+  </footer>
+
+</div>
+<script src="../assets/canvas.js"></script>
+</body>
+</html>

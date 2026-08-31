@@ -1,0 +1,476 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>18 · Observability Platform — Deep-dive &amp; Trade-offs</title>
+<link rel="stylesheet" href="../assets/canvas.css">
+</head>
+<body>
+
+<div class="wrap">
+
+  <header class="hero">
+    <h1>Observability Platform — Deep-dive &amp; Trade-offs</h1>
+    <div class="sub">Canvas 3 of 3. Staff-engineer defensible answers for a full interview. Push vs pull ingestion · Prometheus <code>scrape</code> vs OTLP push · Gorilla-compression time-series vs Parquet columnar traces vs Elasticsearch inverted-index logs · <b>split CAP</b> (ingest AP · alerting CP) · cardinality explosion + limiter · LSM-tree query · <b>8 bottlenecks</b> with mitigations · AWS / GCP / Azure mapping · 11-row trade-off table · 35-minute interview walkthrough.</div>
+    <div class="badges">
+      <span class="badge lvl">Use case 18 · Deep-dive</span>
+      <span class="badge">Canvas 3 of 3</span>
+      <span class="badge">interview-defensible</span>
+      <span class="badge">Datadog · New Relic · Prometheus + Grafana · Splunk</span>
+    </div>
+    <div class="legend">
+      <span><i class="dot" style="background:var(--eden)"></i> preferred / winner</span>
+      <span><i class="dot" style="background:var(--survivor)"></i> conditional / hybrid</span>
+      <span><i class="dot" style="background:var(--warn)"></i> avoid / red flag</span>
+      <span><i class="dot" style="background:var(--fig)"></i> deep-dive detail</span>
+    </div>
+  </header>
+
+  <!-- A · INGESTION MODEL -->
+  <section>
+    <div class="sec-h"><span class="n">A</span><h2>Ingestion model — push vs pull, agent vs agentless</h2><span class="tag">the "how does data get in" question</span></div>
+    <div data-tabscope>
+      <div class="tabs">
+        <div class="tab active" data-tab="ing-side">side by side</div>
+        <div class="tab" data-tab="ing-pull">Prometheus <code>scrape</code> (pull)</div>
+        <div class="tab" data-tab="ing-push">OTLP + StatsD (push)</div>
+        <div class="tab" data-tab="ing-agent">Agent vs agentless</div>
+        <div class="tab" data-tab="ing-decide">decision matrix</div>
+      </div>
+      <div class="tabpanel active" data-panel="ing-side">
+        <table>
+          <thead><tr><th>Aspect</th><th>Pull (Prometheus scrape)</th><th>Push (OTLP / StatsD) <span style="color:var(--eden)">← ours for spans/logs</span></th></tr></thead>
+          <tbody>
+            <tr><td>Who initiates</td><td>Prometheus polls <code>/metrics</code> endpoint every 15 s</td><td>Application / SDK sends to collector on emit</td></tr>
+            <tr><td>Service discovery</td><td>Prometheus needs to KNOW target — SD via K8s API / Consul / DNS</td><td>Application knows collector endpoint (env var)</td></tr>
+            <tr><td>Firewall</td><td>Prometheus needs INBOUND access to every target</td><td>Applications need OUTBOUND to collector (easier)</td></tr>
+            <tr><td>Short-lived jobs</td><td>Miss it — scrape may not happen before job exits. Use Pushgateway.</td><td>Native fit — job pushes final metrics before <code>exit</code></td></tr>
+            <tr><td>Health signal</td><td>Free — <code>up{}</code> metric = 1 when scrape succeeds</td><td>Silence when down — need liveness probe separately</td></tr>
+            <tr><td>Back-pressure</td><td>Prometheus controls rate — target can't overwhelm it</td><td>Collector must handle bursts — Kafka buffer required</td></tr>
+            <tr><td>Best for</td><td><b>Metrics from long-running services</b> (deployments, statefulsets)</td><td><b>Traces + logs + short-lived batch jobs + serverless</b></td></tr>
+          </tbody>
+        </table>
+        <p class="muted" style="margin-top:10px"><b>The reality:</b> big shops run BOTH. Prometheus pulls metrics from services (self-healing on target churn), while OTLP pushes traces and logs (matches the request-response lifecycle). Our platform accepts both — the OTel Collector is the funnel that unifies them.</p>
+      </div>
+      <div class="tabpanel" data-panel="ing-pull">
+        <div class="kicker">Prometheus scrape — pull model</div>
+        <pre class="code"><span class="cm"># prometheus.yml — service discovery + scrape interval</span>
+scrape_configs:
+  - job_name: 'k8s-pods'
+    kubernetes_sd_configs:
+      - role: pod
+    relabel_configs:                <span class="cm"># which pods to scrape</span>
+      - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_scrape]
+        action: keep
+        regex: true
+    scrape_interval: 15s
+    metrics_path: /metrics
+
+<span class="cm"># On the application side — expose /metrics via client library</span>
+<span class="cm"># Prometheus GET /metrics every 15 s → returns text exposition format:</span>
+<span class="cm">#</span>
+<span class="cm">#   # HELP http_requests_total Number of HTTP requests</span>
+<span class="cm">#   # TYPE http_requests_total counter</span>
+<span class="cm">#   http_requests_total{method="POST",status="200"} 1027</span>
+<span class="cm">#   http_requests_total{method="POST",status="500"} 3</span></pre>
+        <p><b>Wins:</b> service-discovery-driven — no config change when pods rescheduled · <code>up{}</code> for free · Prometheus is the source of truth for what's alive · target can't overwhelm Prometheus (Prometheus paces itself).</p>
+        <p><b>Loses:</b> can't scrape past NAT / firewall · misses short-lived jobs (use Pushgateway workaround) · no partial-second precision · scrape lag (up to 15 s stale).</p>
+      </div>
+      <div class="tabpanel" data-panel="ing-push">
+        <div class="kicker">OTLP push — application initiates</div>
+        <pre class="code"><span class="cm">// Instrumented app — OpenTelemetry SDK, gRPC or HTTP push</span>
+OpenTelemetrySdk otel = OpenTelemetrySdk.builder()
+    .setTracerProvider(SdkTracerProvider.builder()
+        .addSpanProcessor(BatchSpanProcessor.builder(
+            OtlpGrpcSpanExporter.builder()
+                .setEndpoint("http://otel-collector:4317")
+                .build())
+            .setMaxExportBatchSize(512)     <span class="cm">// batch — amortize network</span>
+            .setScheduleDelay(5, SECONDS)   <span class="cm">// flush every 5 s or on full</span>
+            .build())
+        .build())
+    .build();
+
+<span class="cm">// Emit a span — non-blocking, queued for batch export</span>
+Span span = tracer.spanBuilder("checkout")
+    .setAttribute("user_id", userId)
+    .startSpan();
+try (Scope scope = span.makeCurrent()) {
+  processCheckout();
+} finally { span.end(); }</pre>
+        <p><b>Wins:</b> works across firewalls (outbound only) · sub-second granularity · natural fit for request-response spans and log streams · vendor-neutral (OTLP is standard).</p>
+        <p><b>Loses:</b> back-pressure only via retry / drop (Kafka buffer + collector queue essential) · silent when the app is down (need external liveness) · SDK adds ~1-3 % CPU overhead on instrumented services.</p>
+      </div>
+      <div class="tabpanel" data-panel="ing-agent">
+        <table>
+          <thead><tr><th>Aspect</th><th>Agent (Datadog agent, otel-collector-agent DaemonSet)</th><th>Agentless (SDK sends direct to backend)</th></tr></thead>
+          <tbody>
+            <tr><td>Where it runs</td><td>Sidecar / node-local process — one per host or pod</td><td>Nothing extra on host — SDK talks direct to collector</td></tr>
+            <tr><td>Buffering during outage</td><td><b>Yes</b> — local disk buffer, resends when backend recovers</td><td>App must retry / drop — no local buffer</td></tr>
+            <tr><td>Batching</td><td>Cross-service batching (multiple apps → 1 agent → 1 batch)</td><td>Per-app batching only</td></tr>
+            <tr><td>Enrichment</td><td>Adds host/K8s metadata cheaply (queries kubelet locally)</td><td>SDK must fetch metadata (extra latency + API load)</td></tr>
+            <tr><td>Cost</td><td>Small CPU / memory per host (~50 MB · 1 % CPU)</td><td>Zero per-host — all cost in SDK + backend</td></tr>
+            <tr><td>Overhead on app</td><td>Minimal — SDK dumps to localhost:4317</td><td>SDK does compression + retry itself</td></tr>
+          </tbody>
+        </table>
+        <p class="muted" style="margin-top:10px"><b>Our pick:</b> DaemonSet OTel Collector (agent per K8s node). Pod → localhost collector → central collector fleet → Kafka. Local buffer for outage tolerance, cross-pod batching, and metadata enrichment happen at the agent — the app SDK stays cheap.</p>
+      </div>
+      <div class="tabpanel" data-panel="ing-decide">
+        <div class="card"><div class="kicker">picking push vs pull, per signal type</div>
+        <ul class="tight">
+          <li><b>Long-running service metrics</b> (K8s deployments, cron pods) → <b>Prometheus pull</b>. Free <code>up{}</code>, service-discovery-driven, right cadence (15 s).</li>
+          <li><b>Batch jobs / serverless / Lambda</b> → <b>OTLP push</b>. Prometheus can't scrape a dead job.</li>
+          <li><b>Traces (spans)</b> → <b>OTLP push</b>. Span lifecycle is inherently push (start / end at real times).</li>
+          <li><b>Logs</b> → <b>OTLP push</b> or agent tail (Fluentbit / Vector) reading files.</li>
+          <li><b>Custom business metrics with high cardinality</b> → OTLP push through the sampling pipeline — Prometheus pull would break cardinality limits.</li>
+        </ul></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- B · STORAGE MODEL -->
+  <section>
+    <div class="sec-h"><span class="n">B</span><h2>Storage — Gorilla time-series · Parquet traces · inverted-index logs</h2><span class="tag">3 signals, 3 physical stores, 1 correlation key</span></div>
+    <div data-tabscope>
+      <div class="tabs">
+        <div class="tab active" data-tab="stor-metrics">Metrics · Gorilla + TSDB</div>
+        <div class="tab" data-tab="stor-traces">Traces · Parquet columnar</div>
+        <div class="tab" data-tab="stor-logs">Logs · inverted index</div>
+        <div class="tab" data-tab="stor-cmp">side by side</div>
+      </div>
+      <div class="tabpanel active" data-panel="stor-metrics">
+        <div class="kicker">Gorilla compression (Facebook, 2015) — the 10-20× shrink</div>
+        <pre class="code"><span class="cm">// Timestamp encoding — delta-of-delta</span>
+<span class="cm">// Metrics have STABLE cadence (15 s scrape). Deltas are near-constant → deltas of deltas are near-zero → variable-length encoding fits most in 1-7 bits.</span>
+
+t0 = 1_700_000_000
+t1 = 1_700_000_015  → Δ=15
+t2 = 1_700_000_030  → Δ=15  → ΔΔ=0  (encode "same delta" = 1 bit)
+t3 = 1_700_000_046  → Δ=16  → ΔΔ=1  (encode ΔΔ in 7 bits)
+
+<span class="cm">// Value encoding — XOR with previous</span>
+<span class="cm">// Consecutive metric values are close (CPU 32.1 %, then 32.3 %) → XOR has many trailing zeros → encode leading + trailing zeros + meaningful bits.</span>
+
+v0 = 32.1  → store full 64-bit float
+v1 = 32.3  → XOR(v0, v1) = 0x00...0000abc  → "5 leading zero bytes + 12 bits" ≈ 20 bits total
+
+<span class="cm">// Result: 16 bytes/point raw → 1.37 bytes/point avg. 10-12× shrink.</span>
+<span class="cm">// Combined with block-level Zstd on cold blocks → 20× shrink.</span></pre>
+        <p><b>In our engine:</b> <code>TimeSeriesStore</code> uses in-memory <code>TreeMap&lt;Long, List&lt;MetricPoint&gt;&gt;</code> (uncompressed for O(1) modification). In prod (VictoriaMetrics / InfluxDB), the hot bucket is uncompressed; blocks &gt; 2 hr old get compacted to Gorilla-compressed columnar chunks on disk.</p>
+      </div>
+      <div class="tabpanel" data-panel="stor-traces">
+        <div class="kicker">Parquet + object storage — the trace long-tail</div>
+        <pre class="code">Trace store layout (Grafana Tempo / Jaeger with S3 backend):
+
+s3://traces-bucket/
+├── year=2026/month=08/day=31/hour=14/
+│   ├── block-abc123.parquet          <span class="cm"># 1-hour blocks, columnar</span>
+│   ├── block-abc123.index            <span class="cm"># traceId → block-offset bloom filter</span>
+│   └── ...
+
+Column groups in the Parquet block:
+  traceId (STRING)                    <span class="cm"># dictionary encoded — repeats hugely</span>
+  spanId (STRING)                     <span class="cm"># dictionary encoded</span>
+  parentSpanId (STRING, nullable)
+  serviceName (STRING)                <span class="cm"># dictionary encoded — ~500 unique</span>
+  operationName (STRING)              <span class="cm"># dictionary encoded — ~10K unique</span>
+  startTime (INT64)                   <span class="cm"># delta-of-delta</span>
+  durationMs (INT32)                  <span class="cm"># RLE + bit-packing</span>
+  status (INT8)                       <span class="cm"># RLE — mostly OK</span>
+  tags (MAP&lt;STRING,STRING&gt;)           <span class="cm"># optional (heavy — often dropped for cost)</span></pre>
+        <p><b>Why Parquet not TSDB:</b> traces are WRITE-once, READ-rare. 99 % of traces are read 0 times. Row-based storage wastes disk; columnar allows column-level projection (return only <code>traceId, serviceName, durationMs</code> for a service map — never touch <code>tags</code> column). Bloom filter on <code>traceId</code> in each block: query "get trace X" hits ~1 block, not the whole day.</p>
+        <p><b>Retention tiers:</b> 24 h hot (SSD) · 7 d warm (S3 Standard) · 30 d cold (S3 Glacier IR) · then delete. Errors + long tail (kept via tail-sampling) retained 30 d always.</p>
+      </div>
+      <div class="tabpanel" data-panel="stor-logs">
+        <div class="kicker">Inverted index (Elasticsearch / OpenSearch / Loki)</div>
+        <pre class="code"><span class="cm">// Inverted index — the "which docs contain this word" lookup</span>
+<span class="cm">// Same idea as a book index at the back.</span>
+
+Documents:
+  doc1: "user 42 login failed"
+  doc2: "user 17 login ok"
+  doc3: "payment 42 failed"
+
+Inverted index:
+  "user"     → [doc1, doc2]
+  "42"       → [doc1, doc3]
+  "login"    → [doc1, doc2]
+  "failed"   → [doc1, doc3]
+  "payment"  → [doc3]
+  "ok"       → [doc2]
+
+Query: "user AND failed"
+  → intersect(user_postings, failed_postings)
+  → {doc1, doc2} ∩ {doc1, doc3}  = {doc1}   ← O(smaller-list)</pre>
+        <p><b>Loki alternative</b> (lighter weight): index ONLY on labels (service, level, env, host), leave message body unindexed → LogQL scans block bodies with a full-text grep. Cheaper storage (no inverted index for body), slower for full-text queries. Good when queries mostly filter by service/level and use free-text only for the last mile.</p>
+        <p><b>Retention:</b> 24 h hot (fast full-text) · 3 d warm (cheaper storage class) · 7 d cold (compressed, slow) · delete. Errors kept longer via routing rule.</p>
+      </div>
+      <div class="tabpanel" data-panel="stor-cmp">
+        <table>
+          <thead><tr><th>Signal</th><th>Store</th><th>Access pattern</th><th>Write:Read ratio</th><th>Compression</th></tr></thead>
+          <tbody>
+            <tr><td>Metrics</td><td>TSDB (Gorilla + LSM)</td><td>Range-by-time + label filter</td><td>1 : 1000 (dashboards refresh often)</td><td>10-20× (delta-of-delta + XOR)</td></tr>
+            <tr><td>Traces</td><td>Object store + Parquet</td><td>Point lookup by traceId</td><td>1 : 0.01 (99 % never read)</td><td>5-10× (columnar + dict + Zstd)</td></tr>
+            <tr><td>Logs</td><td>Inverted index (ES) OR label-only (Loki)</td><td>Boolean query + time range</td><td>1 : 0.1 (searched during incidents)</td><td>3-5× (index overhead) OR 10× (Loki)</td></tr>
+            <tr><td>Alert rules</td><td>Postgres / DynamoDB</td><td>List by status; small</td><td>1 : 1</td><td>N/A (structured)</td></tr>
+          </tbody>
+        </table>
+        <p class="muted" style="margin-top:10px"><b>Correlation glue:</b> every signal carries <code>traceId</code> + <code>spanId</code>. A dashboard error spike ⇒ click ⇒ query trace store by traceId ⇒ click ⇒ query log store by traceId. Three stores, one lookup pattern — that's what turns "logs" into "observability".</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- C · CAP SPLIT -->
+  <section>
+    <div class="sec-h"><span class="n">C</span><h2>CAP split — AP ingest, CP alerting</h2><span class="tag">from <code>docs/tradeoffs/CAP_THEOREM.md</code></span></div>
+    <table>
+      <thead><tr><th>Subsystem</th><th>Choice</th><th>Why</th><th>Failure mode</th></tr></thead>
+      <tbody>
+        <tr><td>Metric / trace / log ingestion</td><td><b style="color:var(--eden)">AP</b> — availability + partition tolerance</td><td>Never block application producers. Applications must not slow down because observability is unhappy.</td><td>During partition: keep buffering to Kafka, may temporarily lose durability guarantees. Eventual consistency once reconnected.</td></tr>
+        <tr><td>Kafka event bus</td><td><b style="color:var(--eden)">AP</b> (with ISR)</td><td><code>acks=1</code> per-partition — availability-first. Replication factor 3 gives durability; ISR shrink allowed during partition.</td><td>May lose &lt; 1 s of un-replicated writes on broker failure. Producers keep publishing.</td></tr>
+        <tr><td>TSDB reads (dashboards)</td><td><b style="color:var(--survivor)">AP with staleness bound</b></td><td>Dashboards can return "last known good" during partition — a 30 s stale dashboard is fine.</td><td>Query proxy caches last successful query per panel (30 s TTL).</td></tr>
+        <tr><td>Alert rule evaluator</td><td><b style="color:var(--warn)">CP</b> — consistency + partition tolerance</td><td>An alert firing at 12:00 must query <b>fresh</b> data — a cached "CPU 40 %" would MISS a spike to 95 %. Better to fail evaluation than to be silently wrong.</td><td>During partition to TSDB: alert evaluator returns <b>error</b>, on-call is paged with "eval failed" alert.</td></tr>
+        <tr><td>Alert rules table</td><td><b style="color:var(--warn)">CP</b> — strong consistency</td><td>A newly-created rule must be visible on the next 60 s eval cycle across all nodes. Postgres with row-level replication.</td><td>Rule create returns 503 during partition to primary. Rule reads may go to replica (may miss latest for a few seconds).</td></tr>
+        <tr><td>Notification dedup</td><td><b style="color:var(--warn)">CP</b> — Redis <code>SETNX</code></td><td>Prevent double-page: <code>SETNX alert:{ruleId}:{timestamp}</code> with 5 min TTL — only ONE notification per alert-window across ALL nodes.</td><td>During Redis partition: prefer double-page over silent miss (fail-open on notification).</td></tr>
+        <tr><td>Service map</td><td><b style="color:var(--eden)">AP</b></td><td>Eventually consistent — service edges derived from trace assembly. A newly-deployed edge may take 60 s to appear.</td><td>Missing edges shown as "recently added" hint. Never a hard error.</td></tr>
+        <tr><td>Aggregation cache (5 min p99)</td><td><b style="color:var(--eden)">AP</b> — Redis with TTL</td><td>Dashboard aggregates cached; a 5 min stale p99 chart is fine (dashboards are exploratory).</td><td>Cache miss on Redis partition → recompute from TSDB.</td></tr>
+      </tbody>
+    </table>
+    <div class="callout warn" style="margin-top:12px"><b>The split is the interview soundbite:</b> "We are AP for ingestion (never block the app) and CP for alerting (never lie to on-call). Everything else lives on the spectrum — dashboards cache aggressively, alert rules replicate strongly, service map is best-effort. Trying to be CP everywhere would make the platform itself the outage; trying to be AP everywhere would miss real incidents."</div>
+  </section>
+
+  <!-- D · CARDINALITY -->
+  <section>
+    <div class="sec-h"><span class="n">D</span><h2>Cardinality management — the label explosion trap</h2><span class="tag">why <code>user_id</code> is a career-ending tag</span></div>
+    <div class="grid g2">
+      <div class="card"><div class="kicker">the explosion</div>
+      <pre class="code"><span class="cm">// Two metrics look identical to a developer. </span>
+<span class="cm">// One will bankrupt your cluster.</span>
+
+<span class="cm">// SAFE — bounded cardinality:</span>
+http_requests_total{
+  service="checkout",     <span class="cm">// ~500 services</span>
+  method="POST",          <span class="cm">// ~10 methods</span>
+  status="200",           <span class="cm">// ~30 status codes</span>
+  endpoint="/api/orders"  <span class="cm">// ~200 endpoints</span>
+}
+<span class="cm">// = 500 × 10 × 30 × 200 = 30 M unique series</span>
+<span class="cm">// large but bounded — grows with deployment</span>
+
+<span class="cm">// TOXIC — unbounded cardinality:</span>
+http_requests_total{
+  ...,
+  user_id="u_193847",     <span class="cm">// 200 M users</span>
+  request_id="uuid",      <span class="cm">// infinite</span>
+  trace_id="uuid"         <span class="cm">// infinite</span>
+}
+<span class="cm">// = 30 M × 200 M × ∞ × ∞ = HEAT DEATH</span>
+<span class="cm">// TSDB memory grows with unique tag combos. </span>
+<span class="cm">// Per-series overhead: ~3 KB.  200M × 3KB = 600 GB </span>
+<span class="cm">// per hour PER METRIC. Cluster crashes.</span></pre></div>
+      <div class="card"><div class="kicker">the fix — hard cap at ingest</div>
+      <pre class="code"><span class="cm">// At the OTel Collector: cardinality-limiter processor</span>
+
+processors:
+  cardinalitylimit:
+    max_cardinality_per_metric: 10000
+    action_on_exceed: drop        <span class="cm"># or "aggregate_into_bucket"</span>
+    drop_labels_regex: ".*_id$"   <span class="cm"># drop trace_id, user_id, request_id</span>
+    high_cardinality_labels:
+      - request_id: drop
+      - user_id: hash_to_bucket   <span class="cm"># 200M → 100 buckets</span>
+      - session_id: drop
+
+<span class="cm">// Backend also enforces — belt-and-suspenders</span>
+<span class="cm">// VictoriaMetrics: -search.maxUniqueTimeseries=10000</span>
+<span class="cm">// Prometheus: sample_limit + label_limit per scrape target</span>
+
+<span class="cm">// Escalation path:</span>
+<span class="cm">// 1. Metric exceeds cap → drop labels, emit warning metric</span>
+<span class="cm">// 2. Metric persistently exceeds → email metric owner</span>
+<span class="cm">// 3. Repeated → auto-quarantine metric name</span></pre></div>
+    </div>
+    <div class="callout tip"><b>The rule of thumb:</b> a label is safe if its cardinality grows with deployment size (service count, region count, host count) — not with traffic (user_id, request_id, timestamp). "Would this label value have existed yesterday?" — if <b>no</b>, don't tag it. Use it in a <b>trace</b> instead — traces are meant for high-cardinality per-request context; metrics are for aggregate rates.</div>
+  </section>
+
+  <!-- E · QUERY PERFORMANCE -->
+  <section>
+    <div class="sec-h"><span class="n">E</span><h2>Query performance — LSM tree · block index · downsampling router</h2><span class="tag">how p99 stays &lt; 1 s at 1 M series</span></div>
+    <div class="grid g2">
+      <div class="card"><div class="kicker">LSM tree layout (VictoriaMetrics / InfluxDB IOx)</div>
+      <pre class="code">MEMORY (hot writes):
+  ├── active bucket (last 2 hr uncompressed)
+  ├── flushed to WAL (append-only durability)
+
+DISK — L0 (recent, 2-24 hr):
+  ├── block-{start}-{end}.chunk       <span class="cm"># Gorilla-compressed</span>
+  ├── block-{start}-{end}.index       <span class="cm"># tag → posting list</span>
+  ├── block-{start}-{end}.bloom       <span class="cm"># label existence</span>
+
+DISK — L1 (24 hr - 7 d, compacted):
+  ├── merged blocks, 1-hr downsampled
+
+OBJECT STORE — L2 (&gt; 7 d):
+  ├── S3 / GCS / Blob — cheap, 5-min downsampled
+
+Query 'rate(http_requests_total[5m])' from 12:00 to 13:00:
+  1. Parse selector → tag posting list intersection
+  2. Bloom filter each L0 block → keep candidates only
+  3. subMap scan candidate blocks → collect points
+  4. Apply rate() → return series
+  Total: ~50-200 ms for typical dashboard panel</pre></div>
+      <div class="card"><div class="kicker">downsampling router — cheapest tier that fits</div>
+      <pre class="code"><span class="cm">// PromQL router pseudo-code</span>
+Duration range = to.minus(from);
+Duration step  = query.step ?? (range / 300);
+                     <span class="cm">// aim for ~300 points per chart</span>
+
+if (step &lt;= 30s)  return queryRaw(name, from, to);       <span class="cm">// L0 raw</span>
+if (step &lt;= 5m)   return query1MinRollup(name, from, to);<span class="cm">// L0 downsampled</span>
+if (step &lt;= 1h)   return query5MinRollup(name, from, to);<span class="cm">// L1</span>
+if (step &lt;= 1d)   return query1HrRollup(name, from, to); <span class="cm">// L1</span>
+                  return queryArchive(name, from, to);   <span class="cm">// L2 (S3)</span>
+
+<span class="cm">// Result — same query, different tier by range:</span>
+<span class="cm">//   last 1 hr chart  → raw (60 pts, 10 ms)</span>
+<span class="cm">//   last 24 hr chart → 5-min (288 pts, 30 ms)</span>
+<span class="cm">//   last 30 d chart  → 1-hr (720 pts, 100 ms)</span>
+<span class="cm">//   last 1 yr chart  → 1-hr (8760 pts, 500 ms)</span></pre></div>
+    </div>
+    <div class="callout tip"><b>Alert queries are the exception</b> — they intentionally hit raw / L0 (no cache). A 60 s alert eval window of <code>rate(errors[1m]) &gt; 100</code> must see the true 12:34:00 - 12:35:00 slice, not a 5-min bucket that may have started at 12:32. This is the CP boundary from Section C — <code>AlertService.evaluateRules</code> in the LLD calls <code>metricService.query</code> directly, never the cache.</div>
+  </section>
+
+  <!-- F · BOTTLENECKS -->
+  <section>
+    <div class="sec-h"><span class="n">F</span><h2>8 bottlenecks + mitigations</h2><span class="tag">where the platform actually breaks</span></div>
+    <table>
+      <thead><tr><th>#</th><th>Bottleneck</th><th>Symptom</th><th>Mitigation</th></tr></thead>
+      <tbody>
+        <tr><td>1</td><td><b>Cardinality explosion</b> (bad tag from a deploy)</td><td>TSDB memory doubles in 15 min · dashboards timeout · ingester OOM restart loop</td><td>Cardinality limiter at OTel Collector (hard cap 10 K unique series/metric) + backend <code>maxUniqueTimeseries</code> + auto-quarantine metric name after 3 breaches</td></tr>
+        <tr><td>2</td><td><b>Trace sampling too aggressive</b> — errors dropped along with baseline</td><td>Real incident spans missing from Jaeger during post-mortem</td><td>Layer 3 sampling: head 10 % baseline · <b>tail-based 100 % keep on error</b> · rate limit 1 K/s. TailBasedSamplingStrategy in LLD sec C.</td></tr>
+        <tr><td>3</td><td><b>Log ingest overload</b> — noisy deploy fills Kafka</td><td>Log pipeline lag &gt; 5 min · dashboards behind real-time</td><td>Rate limit at Collector (drop DEBUG in prod) · route level filter · elastic scale on Kafka consumer lag · dead-letter to S3 (never lose without a trace)</td></tr>
+        <tr><td>4</td><td><b>Cross-service trace loss</b> — spans arrive at different collectors</td><td>Trace assembly returns <code>Optional.empty()</code> — root span missing, buffer OOM</td><td>Partition Kafka <b>by traceId</b> — all spans of one trace hit one collector. <code>TraceAssembler.pendingSpans</code> in LLD sec F handles reordering.</td></tr>
+        <tr><td>5</td><td><b>Query fan-out</b> — dashboard queries 20 panels · each hits raw TSDB</td><td>p99 dashboard load 15 s · Grafana browser stall</td><td>Query engine cache (Redis, 30 s TTL) · pre-compute common aggregations · <b>downsampling router</b> (sec E) picks 5-min rollup for 24 h ranges</td></tr>
+        <tr><td>6</td><td><b>Alert storm</b> — infra outage triggers 200 correlated alerts</td><td>PagerDuty ping-flood · on-call can't triage</td><td>Notification dedup via Redis <code>SETNX</code> (CP) · alert grouping (by service tag) · maintenance-window suppression · anomaly-strategy that requires N-of-M breaches</td></tr>
+        <tr><td>7</td><td><b>Retention cost</b> — 1 TB logs/day × 30 d = 30 TB hot ($700/mo)</td><td>Cloud bill 3× projected · finance escalation</td><td>Tiered retention (sec D of LLD): 24 h hot · 7 d warm · 30 d cold Glacier · delete. Sampling logs (keep 100 % of ERROR, 1 % of INFO)</td></tr>
+        <tr><td>8</td><td><b>Kafka lag during traffic surge</b> — ingest gets ahead of processors</td><td>Metrics visible 30 s late · alerts miss the true window · on-call flying blind</td><td>Auto-scale consumers on lag &gt; 5 s · partition count sized for 3× peak · consumer group with sticky assignment · back-pressure signal to Collector to drop low-priority signals</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <!-- G · CLOUD MAPPING -->
+  <section>
+    <div class="sec-h"><span class="n">G</span><h2>Cloud service mapping</h2><span class="tag">from <code>docs/cloud/CLOUD_SERVICES.md</code></span></div>
+    <table>
+      <thead><tr><th>Component</th><th>AWS</th><th>GCP</th><th>Azure</th><th>Notes</th></tr></thead>
+      <tbody>
+        <tr><td>Collector (agent)</td><td>ADOT Collector on ECS/EKS · CloudWatch Agent</td><td>Ops Agent on GCE · OpenTelemetry Collector on GKE</td><td>Azure Monitor Agent</td><td>All support OTLP. ADOT = AWS Distro for OpenTelemetry.</td></tr>
+        <tr><td>Event bus (ingest)</td><td>MSK · Kinesis Data Streams</td><td>Pub/Sub · Dataflow</td><td>Event Hubs</td><td>Kinesis has native at-least-once + 24 h retention. Pub/Sub for global. MSK for exact Kafka semantics.</td></tr>
+        <tr><td>TSDB (metrics)</td><td><b>Amazon Managed Service for Prometheus (AMP)</b> · CloudWatch Metrics · Timestream</td><td>Cloud Monitoring · Managed Service for Prometheus</td><td>Azure Monitor Metrics · Managed Prometheus</td><td>Managed Prometheus is the least lock-in. Native services (CloudWatch / Monitor) tie to the cloud.</td></tr>
+        <tr><td>Trace store</td><td><b>AWS X-Ray</b> · Managed Grafana Tempo</td><td><b>Cloud Trace</b></td><td><b>Application Insights</b></td><td>X-Ray sampling controlled from console. Cloud Trace is free tier generous. App Insights strong on .NET.</td></tr>
+        <tr><td>Log store</td><td>OpenSearch Service · CloudWatch Logs</td><td>Cloud Logging</td><td>Log Analytics Workspace (Kusto / KQL)</td><td>KQL is unique + powerful for logs. CloudWatch Logs pricey at scale. OpenSearch scales best.</td></tr>
+        <tr><td>Aggregation cache</td><td>ElastiCache Redis</td><td>Memorystore for Redis</td><td>Azure Cache for Redis</td><td>All managed Redis with cluster mode. Redis Enterprise for cross-region.</td></tr>
+        <tr><td>Alert rules DB</td><td>RDS Postgres · DynamoDB</td><td>Cloud SQL · Firestore</td><td>Azure SQL · Cosmos DB</td><td>Rules small, structured — SQL is fine. Multi-region for CP alerting: DynamoDB Global Tables.</td></tr>
+        <tr><td>Cold archive</td><td>S3 · S3 Glacier IR</td><td>Cloud Storage · Archive class</td><td>Blob Storage · Archive tier</td><td>Same lifecycle policies. Glacier IR = "instant retrieval" — best for observability archive.</td></tr>
+        <tr><td>Dashboard</td><td>Managed Grafana · CloudWatch Dashboards</td><td>Managed Grafana · Cloud Monitoring dashboards</td><td>Managed Grafana · Azure Workbooks</td><td>Managed Grafana is the vendor-neutral choice everywhere.</td></tr>
+        <tr><td>Notification</td><td>SNS · EventBridge Pipes → PagerDuty</td><td>Pub/Sub → Cloud Functions → PagerDuty</td><td>Notification Hubs · Logic Apps → PagerDuty</td><td>PagerDuty / Opsgenie is universal. Cloud-native routing is for internal channels.</td></tr>
+        <tr><td>Managed all-in-one</td><td>Datadog / New Relic / Chronosphere via Marketplace</td><td>Same</td><td>Same</td><td>Pay-per-host or pay-per-ingest. Cheaper to build under a certain scale; cheaper to buy above it. Break-even at ~$200-400K/yr observability spend.</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <!-- H · TRADE-OFFS TABLE -->
+  <section>
+    <div class="sec-h"><span class="n">H</span><h2>Trade-offs — the defensible answers table</h2><span class="tag">what a staff engineer says</span></div>
+    <table>
+      <thead><tr><th>Decision</th><th>Pick</th><th>Alt</th><th>Why</th></tr></thead>
+      <tbody>
+        <tr><td>Metrics ingest</td><td><b>Pull (Prometheus scrape)</b> for long-lived services</td><td>OTLP push for all</td><td>Service-discovery-driven · <code>up{}</code> health free · self-paced (no back-pressure engineering). Push for short-lived + traces.</td></tr>
+        <tr><td>Trace collector</td><td><b>OTel Collector DaemonSet</b> per K8s node</td><td>App SDK direct to backend</td><td>Local buffer during backend outage · metadata enrichment cheap · cross-pod batching. SDK stays &lt; 1 % CPU.</td></tr>
+        <tr><td>Event bus</td><td><b>Kafka partitioned by traceId</b></td><td>Kinesis / SNS+SQS</td><td>Trace assembly requires same-collector delivery — traceId partition guarantees that. Kinesis works too but Kafka has richer replay + tooling.</td></tr>
+        <tr><td>Storage (metrics)</td><td><b>Gorilla-compressed TSDB</b> (VictoriaMetrics / InfluxDB IOx / AMP)</td><td>Postgres + timescale</td><td>10-20× compression at Gorilla vs 3× on row-store. Range queries via subMap not indexed scan. Purpose-built beats general.</td></tr>
+        <tr><td>Storage (traces)</td><td><b>Parquet on S3</b> + traceId bloom index</td><td>Same TSDB as metrics</td><td>99 % of traces are read 0 times — cheap storage matters more than fast query. Parquet columnar is 10× smaller than JSON.</td></tr>
+        <tr><td>Storage (logs)</td><td><b>Loki (label-only index)</b> for volume · <b>Elasticsearch</b> for search-heavy</td><td>Elasticsearch for everything</td><td>Loki is 10× cheaper at the same volume when you mostly filter by service. ES / OpenSearch for when full-text over log body is the primary query.</td></tr>
+        <tr><td>Sampling</td><td><b>Layered: head 10 % + tail keep-error + rate 1 K/s</b></td><td>Fixed 1 % head</td><td>Never lose errors (tail 100 %) · bounded cost (rate limit) · representative baseline (head). Fixed 1 % head loses too many real incidents.</td></tr>
+        <tr><td>Alert eval consistency</td><td><b>CP — fresh TSDB read, NO cache</b></td><td>Cache 30 s for consistency with dashboards</td><td>An alert that fires on stale data misses real incidents. Better to fail-noisy (return error, on-call sees "eval failed") than to fail-silent.</td></tr>
+        <tr><td>Alert dedup</td><td><b>Redis <code>SETNX</code></b> + <code>firingRules</code> in-process map</td><td>Fire-every-eval</td><td>Prevents "60 pages/hour for one outage". SETNX gives cross-node dedup; in-process map gives per-node fast-path.</td></tr>
+        <tr><td>Cardinality</td><td><b>Hard cap 10 K series/metric at collector</b></td><td>Trust engineers</td><td>One bad deploy with <code>user_id</code> label crashes the cluster in 15 min. Trust is not a strategy — hardcode the limit.</td></tr>
+        <tr><td>Retention</td><td><b>Tiered — 1 h raw · 24 h 1-min · 7 d 5-min · 1 yr 1-hr · then archive</b></td><td>Flat 30 d raw</td><td>Flat 30 d raw = 30× the cost with 0 % more insight. Ops queries at hours use 5-min fine; nobody needs 15 s granularity on last month.</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <!-- I · INTERVIEW WALKTHROUGH -->
+  <section>
+    <div class="sec-h"><span class="n">I</span><h2>35-minute interview walkthrough</h2><span class="tag">the answer, timed</span></div>
+    <div class="grid g2">
+      <div class="card">
+        <div class="kicker">phase 1 · clarify (2–3 min)</div>
+        <ul class="tight">
+          <li>"Scale — mid (Shopify) or hyperscaler (Netflix)? I'll assume <b>100 M metrics/s · 1 B spans/day · 1 TB logs/day</b>."</li>
+          <li>"Multi-tenant or single? Single tenant simplifies isolation; I'll assume single."</li>
+          <li>"3 pillars in scope — metrics, traces, logs? Alerting too? Yes."</li>
+          <li>"Query p99 target? &lt; 1 s for dashboards, &lt; 60 s alert eval latency."</li>
+        </ul>
+      </div>
+      <div class="card">
+        <div class="kicker">phase 2 · draw architecture (5–7 min)</div>
+        <ul class="tight">
+          <li>3-col: instrumented apps · OTel Collector · <b>Kafka</b> as unifying bus.</li>
+          <li>3 processor lanes → 3 stores: <b>TSDB · Trace Store · Log Store</b>. Correlation via <code>traceId</code>.</li>
+          <li><b>Split CAP:</b> ingest = AP (never block apps); alert eval = CP (fresh TSDB).</li>
+          <li>Query Engine + Grafana on the read path; Alert Manager on the eval + notify path.</li>
+        </ul>
+      </div>
+      <div class="card">
+        <div class="kicker">phase 3 · storage deep dive (8–10 min)</div>
+        <ul class="tight">
+          <li>TSDB: <b>Gorilla compression</b> = delta-of-delta timestamps + XOR values → 10-20× shrink.</li>
+          <li>TreeMap bucketed by epochSec — <code>subMap</code> is O(log n) range seek. Show it on the board.</li>
+          <li>Traces: <b>Parquet on S3</b>, dictionary-encoded columns, bloom index on traceId. Write once, read rarely.</li>
+          <li>Logs: <b>inverted index</b> (ES) OR <b>label-only</b> (Loki) — trade-off is search flexibility vs cost.</li>
+          <li>Downsampling router: cheapest tier that satisfies the query resolution.</li>
+        </ul>
+      </div>
+      <div class="card">
+        <div class="kicker">phase 4 · cardinality &amp; sampling (5–7 min)</div>
+        <ul class="tight">
+          <li>Cardinality trap: <code>user_id</code> as a tag ⇒ 200 M series ⇒ cluster OOM. Hard cap 10 K at collector.</li>
+          <li>Sampling layers: head 10 % (hash % 100) + tail 100 % errors + rate 1 K/s ceiling.</li>
+          <li>Tail-based needs Kafka partition by traceId so all spans hit the same collector.</li>
+          <li>"Would this label have existed yesterday?" — if no, don't tag it, put it in a trace.</li>
+        </ul>
+      </div>
+      <div class="card">
+        <div class="kicker">phase 5 · alerting &amp; scale (5–7 min)</div>
+        <ul class="tight">
+          <li>Alert eval 60 s cadence · reads <b>directly from TSDB, no cache</b> (CP).</li>
+          <li><code>firingRules</code> in-process map + Redis <code>SETNX</code> across nodes = dedup, no double-page.</li>
+          <li>Strategy pattern — Threshold for infra (CPU &gt; 80 %), Anomaly (k · σ) for app metrics.</li>
+          <li>Kafka lag &gt; 5 s ⇒ auto-scale consumers · back-pressure signal ⇒ drop low-priority DEBUG.</li>
+        </ul>
+      </div>
+      <div class="card">
+        <div class="kicker">phase 6 · trade-offs defended (3–5 min)</div>
+        <ul class="tight">
+          <li>Why <b>Kafka not Kinesis</b> — replay tooling, at-scale ecosystem, self-hosted flexibility.</li>
+          <li>Why <b>tiered retention</b> — 30 d raw costs 30× with 0 % more insight.</li>
+          <li>Why <b>build not buy</b> — break-even ~$200-400K/yr; below that, Datadog / New Relic win.</li>
+          <li>Why <b>AP ingest + CP alert</b> — the two SLAs have opposite priorities; force-fitting one hurts both.</li>
+        </ul>
+      </div>
+    </div>
+    <div class="callout tip"><b>30-second pitch:</b> "Three pillars — metrics, traces, logs — unified by a shared <code>traceId</code> for correlation. Push and pull ingest through an OTel Collector fleet into <b>Kafka partitioned by traceId</b>. Three lanes fan out to purpose-built stores: <b>Gorilla-compressed TSDB</b> for metrics, <b>Parquet columnar on S3</b> for traces, <b>inverted-index or label-only</b> for logs. Alert Manager evaluates rules every 60 s against <b>fresh TSDB reads</b> — that's the CP boundary — with Redis <code>SETNX</code> dedup on notify. Cardinality hard-capped at 10 K series per metric to prevent one bad label crashing the cluster. Layered sampling (head 10 % + tail-all-errors + rate 1 K/s) delivers bounded cost with zero missed errors."</div>
+    <div class="callout warn"><b>Interview red flags to avoid:</b><br>• "Store everything raw forever." (no tiering = 30× cost)<br>• "Add <code>user_id</code> as a metric label." (cardinality bomb)<br>• "Cache alert query results for 30 s." (silent alert misses — CP violation)<br>• "Trust Prometheus pull for everything." (misses batch jobs, serverless)<br>• "Sample traces at fixed 1 %." (drops real errors 99 % of the time)<br>• "Log everything at DEBUG in prod." (Kafka lag, log pipeline collapse)<br>• "Use the same TSDB for metrics and traces." (wrong access pattern, wastes storage)</div>
+  </section>
+
+  <footer>
+    <p>Use case 18 · Observability Platform — Canvas 3 of 3 (Deep-dive &amp; Trade-offs). Grounded in <code>18-observability-platform/docs/</code> and the real Java under <code>18-observability-platform/src/</code>.</p>
+    <p class="run"><a href="hld.html">← Canvas 1 · HLD</a> · <a href="lld.html">Canvas 2 · LLD</a> · Canvas 3 · Deep-dive &amp; Trade-offs &nbsp;|&nbsp; <a href="../index.html">Hub</a></p>
+  </footer>
+
+</div>
+<script src="../assets/canvas.js"></script>
+</body>
+</html>

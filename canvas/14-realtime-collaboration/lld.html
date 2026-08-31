@@ -1,0 +1,576 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>14 · Real-time Collaboration — LLD</title>
+<link rel="stylesheet" href="../assets/canvas.css">
+</head>
+<body>
+
+<div class="wrap">
+
+  <header class="hero">
+    <h1>Real-time Collaboration — Low-Level Design</h1>
+    <div class="sub">Canvas 2 of 3. Real Java under <code>14-realtime-collaboration/src/main/java/com/systemdesign/collaboration/</code>. Composition root <code>AppConfig</code> → <code>CollaborationController</code> → <b>Facade <code>CollaborationService</code></b> → <b><code>OTSyncStrategy</code> → <code>OTResolver</code></b> (the 4-case transform) → <code>OperationService</code> mutates <code>Document</code> (synchronized StringBuilder) → <code>BroadcastService</code> fans out to other WebSockets → <code>PresenceService</code> shifts remote cursors. Two pluggable strategies (OT / CRDT sync · Snapshot / EventSourced persistence) sit behind interfaces. Click any class for its file path + methods.</div>
+    <div class="badges">
+      <span class="badge lvl">Use case 14 · LLD</span>
+      <span class="badge">Canvas 2 of 3</span>
+      <span class="badge">grounded in code</span>
+      <span class="badge">Strategy · Facade · Repository · Builder · Command · Memento</span>
+    </div>
+    <div class="legend">
+      <span><i class="dot" style="background:var(--eden)"></i> composition root</span>
+      <span><i class="dot" style="background:var(--survivor)"></i> facade &amp; services</span>
+      <span><i class="dot" style="background:var(--warn)"></i> OT engine (star)</span>
+      <span><i class="dot" style="background:var(--fig)"></i> strategies (swappable)</span>
+      <span><i class="dot" style="background:var(--old)"></i> domain models &amp; repos</span>
+    </div>
+  </header>
+
+  <!-- A · CLASS MAP -->
+  <section>
+    <div class="sec-h"><span class="n">A</span><h2>Class map — click any class</h2><span class="tag">from <code>src/main/java/com/systemdesign/collaboration/</code></span></div>
+    <div>
+      <div class="arch">
+        <svg viewBox="0 0 900 520" width="100%" style="max-width:900px" role="img" aria-label="Real-time collaboration class map">
+          <defs>
+            <marker id="ah14l" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" fill="var(--muted)"></path></marker>
+          </defs>
+          <!-- Grid: 3 cols (x=20 w=240, x=330 w=240, x=640 w=240), 6 rows (y=30,110,190,270,350,430, h=54).
+               Gutters at x=260-330 (70 px) and x=570-640 (70 px). Row-gaps 26 px. -->
+
+          <!-- ═══════ arrows ═══════ -->
+
+          <!-- Col 1 verticals (composition + facade lane) -->
+          <line class="arrow" x1="140" y1="84" x2="140" y2="110" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah14l)"></line>
+          <line class="arrow" x1="140" y1="164" x2="140" y2="190" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah14l)"></line>
+          <line class="arrow" x1="140" y1="244" x2="140" y2="270" stroke="var(--muted)" stroke-width="1.5" stroke-dasharray="4 3" marker-end="url(#ah14l)"></line>
+          <line class="arrow" x1="140" y1="324" x2="140" y2="350" stroke="var(--muted)" stroke-width="1.5" stroke-dasharray="4 3" marker-end="url(#ah14l)"></line>
+          <line class="arrow" x1="140" y1="404" x2="140" y2="430" stroke="var(--muted)" stroke-width="1.2" stroke-dasharray="2 3" marker-end="url(#ah14l)"></line>
+
+          <!-- ★ CollaborationService → OTSyncStrategy — THE STAR CALL — L-path through col1-2 gutter, row 3 → row 1 -->
+          <path class="arrow" d="M260,217 L295,217 L295,57 L330,57" fill="none" stroke="var(--warn)" stroke-width="2.5" marker-end="url(#ah14l)"></path>
+          <text class="edge-label" x="295" y="137" text-anchor="middle" fill="var(--warn)" font-weight="700" font-size="10">applyOperation</text>
+
+          <!-- OTSyncStrategy → OTResolver (col 2 vertical, R1 → R2) -->
+          <line class="arrow" x1="450" y1="84" x2="450" y2="110" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah14l)"></line>
+
+          <!-- OTSyncStrategy → OperationService (col 2 R1 → R3 via right side, skips OTResolver) -->
+          <path class="arrow" d="M570,60 L595,60 L595,217 L570,217" fill="none" stroke="var(--muted)" stroke-width="1.5" stroke-dasharray="4 3" marker-end="url(#ah14l)"></path>
+
+          <!-- CollaborationService → other services (col 1 R3 → col 2 R3/R4/R5/R6) horizontal into gutter1 -->
+          <line class="arrow" x1="260" y1="207" x2="330" y2="217" stroke="var(--muted)" stroke-width="1.5" stroke-dasharray="4 3" marker-end="url(#ah14l)"></line>
+          <line class="arrow" x1="260" y1="217" x2="330" y2="297" stroke="var(--muted)" stroke-width="1.5" stroke-dasharray="4 3" marker-end="url(#ah14l)"></line>
+          <line class="arrow" x1="260" y1="222" x2="330" y2="377" stroke="var(--muted)" stroke-width="1.5" stroke-dasharray="4 3" marker-end="url(#ah14l)"></line>
+          <line class="arrow" x1="260" y1="227" x2="330" y2="457" stroke="var(--muted)" stroke-width="1.5" stroke-dasharray="4 3" marker-end="url(#ah14l)"></line>
+
+          <!-- OperationService → Document (col2→col3 horizontal via gutter2, R3 → R1 upward diagonal) -->
+          <line class="arrow" x1="570" y1="207" x2="640" y2="57" stroke="var(--muted)" stroke-width="1.5" marker-end="url(#ah14l)"></line>
+          <text class="edge-label" x="605" y="130" text-anchor="middle" font-size="10">applyInsert</text>
+
+          <!-- OTResolver → Operation (col2→col3 R2 → R2 horizontal via gutter2) -->
+          <line class="arrow" x1="570" y1="137" x2="640" y2="137" stroke="var(--muted)" stroke-width="1.5" stroke-dasharray="4 3" marker-end="url(#ah14l)"></line>
+
+          <!-- OTResolver ↔ CRDT alternatives (col 3 R2 → R3, dashed = "or") -->
+          <line class="arrow" x1="760" y1="164" x2="760" y2="190" stroke="var(--muted)" stroke-width="1.2" stroke-dasharray="2 3" marker-end="url(#ah14l)"></line>
+
+          <!-- OTSyncStrategy uses PersistenceStrategy (col 2 R1 → col 3 R4, dashed) — routed via right gutter -->
+          <path class="arrow" d="M570,50 L620,50 L620,297 L640,297" fill="none" stroke="var(--muted)" stroke-width="1.2" stroke-dasharray="2 3" marker-end="url(#ah14l)"></path>
+
+          <!-- OperationService → Repositories (col 2 R3 → col 3 R6, dashed via right gutter) -->
+          <path class="arrow" d="M570,225 L605,225 L605,457 L640,457" fill="none" stroke="var(--muted)" stroke-width="1.2" stroke-dasharray="2 3" marker-end="url(#ah14l)"></path>
+
+          <!-- PresenceService → Models (col 2 R5 → col 3 R5, horizontal via gutter2) -->
+          <line class="arrow" x1="570" y1="377" x2="640" y2="377" stroke="var(--muted)" stroke-width="1.2" stroke-dasharray="2 3" marker-end="url(#ah14l)"></line>
+
+          <!-- BroadcastService → Models (col 2 R6 → col 3 R5, horizontal via gutter2) -->
+          <line class="arrow" x1="570" y1="450" x2="640" y2="385" stroke="var(--muted)" stroke-width="1.2" stroke-dasharray="2 3" marker-end="url(#ah14l)"></line>
+
+          <!-- ═══════ NODES (18 total) ═══════ -->
+
+          <!-- Col 1 — composition + facade + reads -->
+          <g data-node style="cursor:pointer" data-title="AppConfig (Factory · composition root)" data-detail="<b>Path:</b> <code>config/AppConfig.java</code>. The ONLY place where <code>new ConcreteClass()</code> appears.<br><b>Wired (in order):</b><br>(1) Repositories — In-Memory Document, Operation, Version.<br>(2) ConflictResolvers — <code>OTResolver</code> + <code>CRDTResolver</code>.<br>(3) SyncStrategies — <code>OTSyncStrategy(otResolver)</code> + <code>CRDTSyncStrategy</code>.<br>(4) PersistenceStrategies — <code>SnapshotPersistence</code> + <code>EventSourcedPersistence</code>.<br>(5) Services — Permission, Document, Operation, Presence, Version, Broadcast.<br>(6) <b>CollaborationService (Facade)</b> — defaults to OT + EventSourced.<br>(7) Controller.<br>(8) StatsDisplay.<br><b>Also:</b> <code>createCrdtCollaborationService()</code> — swaps the sync strategy for A/B demo."><rect x="20" y="30" width="240" height="54" rx="9" fill="var(--panel-2)" stroke="var(--eden)"></rect><text x="140" y="55" text-anchor="middle" fill="var(--eden)" font-size="13" font-weight="600">AppConfig</text><text x="140" y="72" text-anchor="middle" fill="var(--faint)" font-size="11">composition root · factory</text></g>
+
+          <g data-node style="cursor:pointer" data-title="CollaborationController (REST + WS adapter)" data-detail="<b>Path:</b> <code>controller/CollaborationController.java</code>. Simulated REST + WebSocket — thin adapter.<br><b>Handlers:</b> <code>handleCreateDocument(title, ownerId)</code>, <code>handleEditDocument(docId, userId, op)</code> — the edit hot path, <code>handleGetDocument(docId)</code>, <code>handleGetHistory(docId)</code>, <code>handleShareDocument(docId, userId, role, grantedBy)</code>, <code>handleGetActiveUsers(docId)</code>, <code>handleJoinDocument(userId, name, docId)</code>, <code>handleLeaveDocument(userId, docId)</code>.<br><b>Zero business logic</b> — every method delegates to the Facade / service tier. Error handling: <code>PermissionDeniedException → 403</code>, <code>DocumentNotFoundException → 404</code>, <code>CollaborationException → 400</code>."><rect x="20" y="110" width="240" height="54" rx="9" fill="var(--panel-2)" stroke="var(--border)"></rect><text x="140" y="135" text-anchor="middle" fill="var(--text)" font-size="13" font-weight="600">CollaborationController</text><text x="140" y="152" text-anchor="middle" fill="var(--faint)" font-size="11">REST + WS · thin adapter</text></g>
+
+          <g data-node style="cursor:pointer" data-title="CollaborationService (Facade)" data-detail="<b>Path:</b> <code>service/CollaborationService.java</code>. THE ONE DOOR for edits.<br><b>Method:</b> <code>Document processOperation(String docId, String userId, Operation op)</code>:<br>(1) permissionService.canEdit → PermissionDeniedException.<br>(2) documentService.getDocument.<br>(3) opService.getOperationsSince(docId, op.baseVersion) → pending.<br>(4) <b>syncStrategy.applyOperation(doc, op, pending)</b> — enters OT engine.<br>(5) opService.saveOperation + persistenceStrategy.saveOperation.<br>(6) broadcastService.broadcastOperation(docId, op', excludeUser).<br>(7) presenceService.updateCursor + adjustCursors for others.<br>(8) versionService.createSnapshot every SNAPSHOT_INTERVAL (10 in demo, 100 in prod).<br><b>Full code walk on Section B.</b>"><rect x="20" y="190" width="240" height="54" rx="9" fill="var(--panel-2)" stroke="var(--survivor)"></rect><text x="140" y="215" text-anchor="middle" fill="var(--survivor)" font-size="13" font-weight="600">CollaborationService</text><text x="140" y="232" text-anchor="middle" fill="var(--faint)" font-size="11">Facade · processOperation</text></g>
+
+          <g data-node style="cursor:pointer" data-title="DocumentService (CRUD)" data-detail="<b>Path:</b> <code>service/DocumentService.java</code>. Non-real-time surface — creation, retrieval, delete.<br><b>Methods:</b> <code>createDocument(title, ownerId)</code> — builds Document via Builder, saves to repo, auto-grants OWNER permission. <code>getDocument(docId)</code> — throws DocumentNotFoundException. <code>deleteDocument(docId)</code>. <code>getDocumentContent(docId)</code>. <code>getAllDocuments()</code>.<br><b>NOT the edit path.</b> Edit goes CollaborationService → SyncStrategy → OperationService.<br><b>Prod:</b> load path adds snapshot-fetch + op replay before returning content."><rect x="20" y="270" width="240" height="54" rx="9" fill="var(--panel-2)" stroke="var(--survivor)"></rect><text x="140" y="295" text-anchor="middle" fill="var(--survivor)" font-size="13" font-weight="600">DocumentService</text><text x="140" y="312" text-anchor="middle" fill="var(--faint)" font-size="11">create · get · delete</text></g>
+
+          <g data-node style="cursor:pointer" data-title="PermissionService" data-detail="<b>Path:</b> <code>service/PermissionService.java</code>. Access control.<br><b>Storage:</b> <code>Map&lt;docId, Map&lt;userId, Permission&gt;&gt;</code> — nested ConcurrentHashMap, O(1) lookup.<br><b>Methods:</b> <code>grantPermission(docId, userId, role, grantedBy)</code>, <code>revokePermission(docId, userId)</code>, <code>checkPermission(docId, userId)</code> → PermissionRole or null, <code>canEdit(docId, userId)</code> — returns role != null &amp;&amp; role.canEdit(), <code>getCollaborators(docId)</code>.<br><b>Roles:</b> OWNER, EDITOR, COMMENTER, VIEWER — encoded in <code>PermissionRole</code> enum with <code>canEdit()</code> / <code>canView()</code> helpers."><rect x="20" y="350" width="240" height="54" rx="9" fill="var(--panel-2)" stroke="var(--survivor)"></rect><text x="140" y="375" text-anchor="middle" fill="var(--survivor)" font-size="13" font-weight="600">PermissionService</text><text x="140" y="392" text-anchor="middle" fill="var(--faint)" font-size="11">role · canEdit · grant</text></g>
+
+          <g data-node style="cursor:pointer" data-title="Exceptions (4)" data-detail="<b>Path:</b> <code>exception/</code>.<br><b>Base:</b> <code>CollaborationException extends RuntimeException</code>.<br><b>Types:</b><br>• <code>DocumentNotFoundException(docId)</code> → HTTP 404.<br>• <code>PermissionDeniedException(userId, docId, action)</code> → HTTP 403.<br>• <code>ConflictException(msg)</code> → HTTP 409 (e.g. REVISION_MISMATCH too old to transform).<br><b>Every service throws only these</b> — the controller maps to HTTP codes.<br><b>Interview point:</b> a divergence bug is NOT thrown as an exception — it's a silent correctness failure. The OT engine is unit-tested to death instead."><rect x="20" y="430" width="240" height="54" rx="9" fill="var(--panel-2)" stroke="var(--warn)"></rect><text x="140" y="455" text-anchor="middle" fill="var(--warn)" font-size="13" font-weight="600">Exceptions (4)</text><text x="140" y="472" text-anchor="middle" fill="var(--faint)" font-size="11">extend CollabException</text></g>
+
+          <!-- Col 2 — sync strategy + engine + participants -->
+          <g data-node style="cursor:pointer" data-title="OTSyncStrategy (SyncStrategy impl)" data-detail="<b>Path:</b> <code>strategy/sync/OTSyncStrategy.java</code>. Server-centric OT — the Google Docs sync model.<br><b>Interface:</b> <code>List&lt;Operation&gt; applyOperation(Document doc, Operation op, List&lt;Operation&gt; pendingOps)</code>.<br><b>Implementation:</b><br>(1) If <code>op.baseVersion &lt; doc.version</code> and pendingOps non-empty:<br>&nbsp;&nbsp;&nbsp;&nbsp;for each pendingOp: <code>transformedOp = conflictResolver.transform(transformedOp, pendingOp).transformedLocal</code>.<br>(2) applyToDocument(doc, transformedOp) — dispatch on OperationType to doc.applyInsert / applyDelete.<br>(3) doc.incrementVersion().<br>(4) return [transformedOp] — the payload to broadcast.<br><b>Alt impl:</b> <code>CRDTSyncStrategy</code> (see col 3) — no transform, direct apply."><rect x="330" y="30" width="240" height="54" rx="9" fill="var(--panel-2)" stroke="var(--survivor)"></rect><text x="450" y="55" text-anchor="middle" fill="var(--survivor)" font-size="13" font-weight="600">OTSyncStrategy</text><text x="450" y="72" text-anchor="middle" fill="var(--faint)" font-size="11">server-centric OT</text></g>
+
+          <g data-node style="cursor:pointer" data-title="OTResolver (engine · THE STAR)" data-detail="<b>Path:</b> <code>ot/OTResolver.java</code>. THE conflict-resolution core.<br><b>Interface:</b> <code>TransformResult transform(Operation local, Operation remote)</code> — returns (local', remote') satisfying TP1.<br><b>Four cases:</b><br>• INSERT × INSERT — shift by insert length; tie-break by userId lexicographic.<br>• INSERT × DELETE — insert-before-delete shifts delete right; insert-after shifts insert left; insert-inside snaps to delete boundary.<br>• DELETE × INSERT — mirror of above.<br>• DELETE × DELETE — non-overlapping shifts; overlapping shrinks both lengths by <code>overlapLen = max(0, overlapEnd − overlapStart)</code>.<br><b>Full code walk on Section B</b>, per-case tabs on Section C."><rect x="330" y="110" width="240" height="54" rx="9" fill="var(--panel-2)" stroke="var(--warn)" stroke-width="2"></rect><text x="450" y="135" text-anchor="middle" fill="var(--warn)" font-size="14" font-weight="700">OTResolver</text><text x="450" y="152" text-anchor="middle" fill="var(--faint)" font-size="11">transform · 4 cases · TP1</text></g>
+
+          <g data-node style="cursor:pointer" data-title="OperationService (validate · persist)" data-detail="<b>Path:</b> <code>service/OperationService.java</code>. Low-level op engine.<br><b>Methods:</b><br>• <code>applyOperation(doc, op)</code> — validates bounds, dispatches to <code>doc.applyInsert(pos, content)</code> / <code>doc.applyDelete(pos, length)</code>, then <code>doc.incrementVersion()</code>.<br>• <code>validateOperation(doc, op)</code> — INSERT bounds [0, docLen], DELETE bounds [0, docLen), non-empty content for INSERT, positive length for DELETE.<br>• <code>saveOperation(op)</code> — writes to OperationRepository.<br>• <code>getOperationsSince(docId, version)</code> — indexed fetch for OT transform.<br><b>Does not resolve conflicts</b> — that's SyncStrategy + ConflictResolver."><rect x="330" y="190" width="240" height="54" rx="9" fill="var(--panel-2)" stroke="var(--survivor)"></rect><text x="450" y="215" text-anchor="middle" fill="var(--survivor)" font-size="13" font-weight="600">OperationService</text><text x="450" y="232" text-anchor="middle" fill="var(--faint)" font-size="11">validate · applyOp · save</text></g>
+
+          <g data-node style="cursor:pointer" data-title="VersionService (snapshots · history)" data-detail="<b>Path:</b> <code>service/VersionService.java</code>. Event-sourcing companion.<br><b>Methods:</b><br>• <code>createSnapshot(Document doc)</code> — new DocumentVersion(versionId, docId, doc.version, doc.content, opCount) → save.<br>• <code>getHistory(docId)</code> — list snapshots.<br>• <code>rollbackToVersion(docId, targetVersion)</code> — synchronized on doc; deletes all content then inserts snapshot content; bumps version. Preserves history (adds new ops).<br>• <code>getVersionDiff(docId, from, to)</code> — text-diff summary.<br><b>Trigger:</b> Facade calls createSnapshot every SNAPSHOT_INTERVAL ops."><rect x="330" y="270" width="240" height="54" rx="9" fill="var(--panel-2)" stroke="var(--survivor)"></rect><text x="450" y="295" text-anchor="middle" fill="var(--survivor)" font-size="13" font-weight="600">VersionService</text><text x="450" y="312" text-anchor="middle" fill="var(--faint)" font-size="11">snapshot · rollback · diff</text></g>
+
+          <g data-node style="cursor:pointer" data-title="PresenceService (cursor + heartbeat)" data-detail="<b>Path:</b> <code>service/PresenceService.java</code>.<br><b>Storage:</b> <code>Map&lt;docId, Map&lt;userId, UserPresence&gt;&gt;</code> — nested ConcurrentHashMap.<br><b>Methods:</b><br>• <code>joinDocument(userId, name, docId)</code> — assigns cursor colour from rotating pool (8 colours), creates UserPresence.<br>• <code>leaveDocument(userId, docId)</code>.<br>• <code>updateCursor(userId, docId, position)</code>.<br>• <code>adjustCursors(docId, op, excludeUser)</code> — after remote op, shift OTHER users' cursors by the op's insert/delete length (INSERT: shift right if cursor ≥ pos; DELETE: shift left if past range, snap to pos if inside).<br>• <code>cleanupStalePresence(timeoutSec)</code>."><rect x="330" y="350" width="240" height="54" rx="9" fill="var(--panel-2)" stroke="var(--survivor)"></rect><text x="450" y="375" text-anchor="middle" fill="var(--survivor)" font-size="13" font-weight="600">PresenceService</text><text x="450" y="392" text-anchor="middle" fill="var(--faint)" font-size="11">cursor · join · adjust</text></g>
+
+          <g data-node style="cursor:pointer" data-title="BroadcastService (WebSocket fan-out)" data-detail="<b>Path:</b> <code>service/BroadcastService.java</code>. Simulated WebSocket broadcast.<br><b>Storage:</b> <code>Map&lt;docId, Set&lt;userId&gt;&gt; connections</code> — who's connected per doc.<br><b>Methods:</b><br>• <code>registerConnection(userId, docId)</code> — simulate WS connect.<br>• <code>removeConnection(userId, docId)</code> — WS disconnect.<br>• <code>broadcastOperation(docId, op, excludeUserId)</code> — for each connected user ≠ author, push REMOTE_OPERATION.<br>• <code>broadcastCursorUpdate(docId, cursor)</code> — same channel, throttled.<br><b>Prod:</b> replace with Kafka publish to <code>ops.{docId}</code>; all WS Gateway pods consume and push to their local sockets."><rect x="330" y="430" width="240" height="54" rx="9" fill="var(--panel-2)" stroke="var(--survivor)"></rect><text x="450" y="455" text-anchor="middle" fill="var(--survivor)" font-size="13" font-weight="600">BroadcastService</text><text x="450" y="472" text-anchor="middle" fill="var(--faint)" font-size="11">fan-out · per-doc conns</text></g>
+
+          <!-- Col 3 — domain models + alt strategies + repos -->
+          <g data-node style="cursor:pointer" data-title="Document (aggregate · Builder · synchronized StringBuilder)" data-detail="<b>Path:</b> <code>model/Document.java</code>. Aggregate root.<br><b>Fields:</b> <code>docId</code>, <code>title</code>, <code>content</code> (<b>StringBuilder</b>, not String — O(n) mutation not O(n²)), <code>version</code> (monotonic int), <code>ownerId</code>, <code>createdAt</code>, <code>updatedAt</code>.<br><b>Synchronized mutators:</b><br>• <code>applyInsert(position, text)</code> — bounds-check, content.insert.<br>• <code>applyDelete(position, length)</code> — bounds-check, content.delete.<br>• <code>incrementVersion()</code> — atomic bump.<br><b>Builder:</b> <code>new Document.Builder().docId(...).title(...).ownerId(...).build()</code>. Required fields validated in build().<br><b>Also:</b> <code>getContent()</code> synchronizes on the buffer to return a snapshot."><rect x="640" y="30" width="240" height="54" rx="9" fill="var(--panel-2)" stroke="var(--old)"></rect><text x="760" y="55" text-anchor="middle" fill="var(--old)" font-size="13" font-weight="600">Document</text><text x="760" y="72" text-anchor="middle" fill="var(--faint)" font-size="11">Builder · StringBuilder</text></g>
+
+          <g data-node style="cursor:pointer" data-title="Operation + OperationType" data-detail="<b>Path:</b> <code>model/Operation.java</code>, <code>model/OperationType.java</code>. The atomic unit — a Command.<br><b>Fields:</b> <code>opId</code>, <code>docId</code>, <code>userId</code>, <code>type</code> (INSERT / DELETE / RETAIN), <code>position</code> (mutable — OT transform adjusts it), <code>content</code> (for INSERT), <code>length</code> (for DELETE, mutable), <code>baseVersion</code> (doc rev seen by client), <code>timestamp</code>.<br><b>Copy constructor:</b> <code>new Operation(source)</code> — OT builds transformed operations via copies so the original op-log stays immutable.<br><b>Setters:</b> <code>setPosition</code>, <code>setLength</code> — used ONLY by OT.<br><b>Helper:</b> <code>getInsertLength()</code> — content.length() for INSERT, else 0."><rect x="640" y="110" width="240" height="54" rx="9" fill="var(--panel-2)" stroke="var(--old)"></rect><text x="760" y="135" text-anchor="middle" fill="var(--old)" font-size="13" font-weight="600">Operation</text><text x="760" y="152" text-anchor="middle" fill="var(--faint)" font-size="11">INSERT · DELETE · RETAIN</text></g>
+
+          <g data-node style="cursor:pointer" data-title="CRDT alternatives (CRDTResolver + CRDTSyncStrategy)" data-detail="<b>Paths:</b> <code>ot/CRDTResolver.java</code>, <code>strategy/sync/CRDTSyncStrategy.java</code>.<br><b>CRDTResolver.transform(local, remote):</b> a NO-OP — returns copies of both. Because CRDT ops reference unique char IDs (not positions), they commute by design; the transform has no work to do.<br><b>CRDTSyncStrategy.applyOperation:</b> apply directly, no transform pass, no pending-op scan. Return the op unchanged as the broadcast payload.<br><b>Real RGA would:</b> each char = <code>(siteId, counter)</code>; INSERT places between two IDs; DELETE marks tombstone; merge = union of chars sorted by ID.<br><b>Swap-in via AppConfig.createCrdtCollaborationService()</b> — Strategy pattern doing its job."><rect x="640" y="190" width="240" height="54" rx="9" fill="var(--panel-2)" stroke="var(--fig)"></rect><text x="760" y="215" text-anchor="middle" fill="var(--fig)" font-size="13" font-weight="600">CRDT alternatives</text><text x="760" y="232" text-anchor="middle" fill="var(--faint)" font-size="11">Resolver + SyncStrategy</text></g>
+
+          <g data-node style="cursor:pointer" data-title="PersistenceStrategy (Snapshot / EventSourced)" data-detail="<b>Path:</b> <code>strategy/persistence/</code>.<br><b>Interface:</b> <code>saveOperation(op)</code>, <code>createSnapshot(doc)</code>, <code>getHistory(docId, from, to)</code>, <code>getOperations(docId)</code>.<br><b>Two impls:</b><br>• <b>SnapshotPersistence</b> — full snapshot every 100 ops + rolling op log. Fast reads (pre-computed content), moderate storage.<br>• <b>EventSourcedPersistence</b> — every op appended; snapshots as OPTIMIZATION only. Full audit trail; slower reads on cold docs.<br><b>Default in AppConfig:</b> EventSourced — matches the OT invariant that the op log is the source of truth."><rect x="640" y="270" width="240" height="54" rx="9" fill="var(--panel-2)" stroke="var(--fig)"></rect><text x="760" y="295" text-anchor="middle" fill="var(--fig)" font-size="13" font-weight="600">PersistenceStrategy</text><text x="760" y="312" text-anchor="middle" fill="var(--faint)" font-size="11">Snapshot / EventSourced</text></g>
+
+          <g data-node style="cursor:pointer" data-title="Ephemeral / metadata models" data-detail="<b>Path:</b> <code>model/</code>.<br>• <b>UserPresence</b> — userId, name, docId, isActive, lastActiveAt, cursorColour + embedded CursorPosition; <code>touch()</code>, <code>isStale(sec)</code>.<br>• <b>CursorPosition</b> — userId, name, docId, position (mutable — adjusted by PresenceService.adjustCursors), selectionStart / selectionEnd, colour.<br>• <b>DocumentVersion</b> — versionId, docId, versionNumber, contentSnapshot, opsSinceLastSnapshot, timestamp. Memento pattern.<br>• <b>Permission</b> — docId, userId, role (PermissionRole enum: OWNER / EDITOR / COMMENTER / VIEWER), grantedBy, grantedAt.<br>• <b>Comment</b> — commentId, docId, userId, content, position, resolvedAt (nullable)."><rect x="640" y="350" width="240" height="54" rx="9" fill="var(--panel-2)" stroke="var(--old)"></rect><text x="760" y="375" text-anchor="middle" fill="var(--old)" font-size="13" font-weight="600">Metadata models</text><text x="760" y="392" text-anchor="middle" fill="var(--faint)" font-size="11">Presence · Cursor · Comment</text></g>
+
+          <g data-node style="cursor:pointer" data-title="Repositories (3 · InMemory)" data-detail="<b>Path:</b> <code>repository/</code>.<br><b>Interfaces:</b><br>• <code>DocumentRepository</code> — save, findById, existsById, deleteById, findAll.<br>• <code>OperationRepository</code> — save, findByDocId, <code>findByDocIdSinceVersion(docId, version)</code> — THE index that makes OT fast, countByDocId.<br>• <code>VersionRepository</code> — save, findByDocId, findByDocIdAndVersion.<br><b>InMemory impls:</b> each backed by <code>ConcurrentHashMap</code>; operations kept sorted by revision in a list per doc.<br><b>Prod mapping:</b> Documents + Comments + Permissions on Postgres · Operations on sharded Postgres by docId · Versions on Postgres + snapshot blobs on S3."><rect x="640" y="430" width="240" height="54" rx="9" fill="var(--panel-2)" stroke="var(--old)"></rect><text x="760" y="455" text-anchor="middle" fill="var(--old)" font-size="13" font-weight="600">Repositories (3)</text><text x="760" y="472" text-anchor="middle" fill="var(--faint)" font-size="11">in-memory · sinceVersion</text></g>
+
+        </svg>
+      </div>
+      <div class="node-detail"><span class="nd-title">Click any class</span><div class="nd-body">Its file path, method signatures, and how it plugs into the edit pipeline appear here.</div></div>
+    </div>
+  </section>
+
+  <!-- B · FACADE + STRATEGY CODE -->
+  <section>
+    <div class="sec-h"><span class="n">B</span><h2>The edit pipeline — <code>CollaborationService.processOperation</code></h2><span class="tag">verbatim · 8 steps</span></div>
+    <div class="card">
+      <div class="kicker">from <code>service/CollaborationService.java</code></div>
+      <pre class="code">public Document processOperation(String docId, String userId, Operation op) {
+  <span class="cm">// Step 1: Validate permission</span>
+  if (!permissionService.canEdit(docId, userId)) {
+    throw new PermissionDeniedException(userId, docId, "edit");
+  }
+
+  <span class="cm">// Step 2: Retrieve the document</span>
+  Document doc = documentService.getDocument(docId);
+
+  <span class="cm">// Step 3: Get operations since the client's base version (for OT transform)</span>
+  List&lt;Operation&gt; pendingOps = operationService.getOperationsSince(docId, op.getBaseVersion());
+
+  <span class="cm">// Step 4: Apply via sync strategy (OT transforms or CRDT direct-apply)</span>
+  List&lt;Operation&gt; broadcastOps = syncStrategy.applyOperation(doc, op, pendingOps);
+
+  <span class="cm">// Step 5: Persist the operation</span>
+  operationService.saveOperation(op);
+  persistenceStrategy.saveOperation(op);
+
+  <span class="cm">// Step 6: Broadcast to other connected users</span>
+  for (Operation broadcastOp : broadcastOps) {
+    broadcastService.broadcastOperation(docId, broadcastOp, userId);
+  }
+
+  <span class="cm">// Step 7: Update cursor positions</span>
+  <span class="cm">// The editing user's cursor moves to the end of their edit</span>
+  int newCursorPos = op.getPosition() + op.getInsertLength();
+  presenceService.updateCursor(userId, docId, newCursorPos);
+
+  <span class="cm">// Adjust OTHER users' cursors based on the applied operation</span>
+  for (Operation broadcastOp : broadcastOps) {
+    presenceService.adjustCursors(docId, broadcastOp, userId);
+  }
+
+  <span class="cm">// Step 8: Periodic snapshot</span>
+  opsSinceSnapshot++;
+  if (opsSinceSnapshot &gt;= SNAPSHOT_INTERVAL) {
+    versionService.createSnapshot(doc);
+    opsSinceSnapshot = 0;
+  }
+
+  return doc;
+}</pre>
+    </div>
+    <div class="grid g2" style="margin-top:14px">
+      <div class="card">
+        <div class="kicker">from <code>strategy/sync/OTSyncStrategy.java</code></div>
+<pre class="code">public List&lt;Operation&gt; applyOperation(
+    Document doc, Operation op, List&lt;Operation&gt; pendingOps) {
+
+  Operation transformedOp = op;
+
+  <span class="cm">// Step 1: Transform against every pending op (SEQUENTIAL)</span>
+  if (op.getBaseVersion() &lt; doc.getVersion() &amp;&amp; !pendingOps.isEmpty()) {
+    for (Operation pendingOp : pendingOps) {
+      TransformResult result =
+          conflictResolver.transform(transformedOp, pendingOp);
+      transformedOp = result.getTransformedLocal();
+      conflictsResolved++;
+    }
+  }
+
+  <span class="cm">// Step 2: Apply to the document (dispatch on OpType)</span>
+  applyToDocument(doc, transformedOp);
+
+  <span class="cm">// Step 3: Bump revision (atomic in Document)</span>
+  doc.incrementVersion();
+
+  <span class="cm">// Step 4: Return the transformed op — this is the broadcast payload</span>
+  return List.of(transformedOp);
+}</pre>
+      </div>
+      <div class="card">
+        <div class="kicker">from <code>strategy/sync/CRDTSyncStrategy.java</code> (alt)</div>
+<pre class="code">public List&lt;Operation&gt; applyOperation(
+    Document doc, Operation op, List&lt;Operation&gt; pendingOps) {
+
+  <span class="cm">// CRDT: no transform needed. Apply directly.</span>
+  <span class="cm">// In a real CRDT, unique char IDs make ops commute.</span>
+  switch (op.getType()) {
+    case INSERT -&gt; doc.applyInsert(op.getPosition(), op.getContent());
+    case DELETE -&gt; {
+      if (op.getLength() &gt; 0 &amp;&amp;
+          op.getPosition() + op.getLength() &lt;= doc.getLength()) {
+        doc.applyDelete(op.getPosition(), op.getLength());
+      }
+    }
+    case RETAIN -&gt; { <span class="cm">/* no-op */</span> }
+  }
+
+  doc.incrementVersion();
+  return List.of(op);   <span class="cm">// broadcast the op as-is</span>
+}</pre>
+      </div>
+    </div>
+    <div class="callout tip"><b>Why the transform is sequential:</b> each pending op adjusts positions based on the previous transform's result. If Alice's op is base_rev=5 and server is at rev=8 (three pending: op6, op7, op8), we compute <code>t' = transform(alice, op6)</code>, then <code>t'' = transform(t', op7)</code>, then <code>t''' = transform(t'', op8)</code>. Reordering breaks convergence. This is why the doc-level lock exists — no two ops can race the sequence.</div>
+  </section>
+
+  <!-- C · OT TRANSFORM TABS -->
+  <section>
+    <div class="sec-h"><span class="n">C</span><h2>Op transform — 4 cases, click through</h2><span class="tag">from <code>ot/OTResolver.java</code></span></div>
+    <div data-tabscope>
+      <div class="tabs">
+        <div class="tab active" data-tab="ot-ii">INSERT × INSERT</div>
+        <div class="tab" data-tab="ot-id">INSERT × DELETE</div>
+        <div class="tab" data-tab="ot-di">DELETE × INSERT</div>
+        <div class="tab" data-tab="ot-dd">DELETE × DELETE</div>
+        <div class="tab" data-tab="ot-crdt">CRDT merge (alt)</div>
+      </div>
+      <div class="tabpanel active" data-panel="ot-ii">
+        <div class="kicker">both users insert — position + tie-break by userId</div>
+<pre class="code">private void transformInsertInsert(Operation local, Operation remote,
+                                    Operation localPrime, Operation remotePrime) {
+  int localPos  = local.getPosition();
+  int remotePos = remote.getPosition();
+  int localLen  = local.getInsertLength();
+  int remoteLen = remote.getInsertLength();
+
+  if (localPos &lt; remotePos) {
+    <span class="cm">// Local inserts before remote → remote must shift right</span>
+    remotePrime.setPosition(remotePos + localLen);
+  } else if (localPos &gt; remotePos) {
+    <span class="cm">// Remote inserts before local → local must shift right</span>
+    localPrime.setPosition(localPos + remoteLen);
+  } else {
+    <span class="cm">// Same position — tie-break by userId (lexicographic).</span>
+    <span class="cm">// Smaller userId "wins" (gets applied first).</span>
+    if (local.getUserId().compareTo(remote.getUserId()) &lt;= 0) {
+      remotePrime.setPosition(remotePos + localLen);
+    } else {
+      localPrime.setPosition(localPos + remoteLen);
+    }
+  }
+}</pre>
+        <p class="muted"><b>Example:</b> doc = "HELLO", Alice INSERT(pos=2,"X"), Bob INSERT(pos=4,"Y"). Alice's pos (2) &lt; Bob's (4), so Bob's shifts by +1 → Bob'.pos = 5. Applying Alice first: "HE<b>X</b>LLO"; then Bob' at 5: "HE<b>X</b>LL<b>Y</b>O". Applying Bob first would need Alice unchanged (2 &lt; 4 still). Both converge to "HEXLLYO".</p>
+      </div>
+      <div class="tabpanel" data-panel="ot-id">
+        <div class="kicker">local INSERT vs remote DELETE — three sub-cases</div>
+<pre class="code">private void transformInsertDelete(Operation local, Operation remote,
+                                    Operation localPrime, Operation remotePrime) {
+  int insertPos = local.getPosition();
+  int deletePos = remote.getPosition();
+  int deleteLen = remote.getLength();
+  int insertLen = local.getInsertLength();
+
+  if (insertPos &lt;= deletePos) {
+    <span class="cm">// (a) Insert BEFORE delete → delete shifts right by insertLen</span>
+    remotePrime.setPosition(deletePos + insertLen);
+  } else if (insertPos &gt;= deletePos + deleteLen) {
+    <span class="cm">// (b) Insert AFTER delete range → insert shifts left by deleteLen</span>
+    localPrime.setPosition(insertPos - deleteLen);
+  } else {
+    <span class="cm">// (c) Insert INSIDE deleted range → move insert to delete boundary.</span>
+    <span class="cm">// The inserted text will appear at the start of the deletion span.</span>
+    localPrime.setPosition(deletePos);
+  }
+}</pre>
+        <p class="muted"><b>Sub-case (c) is the interesting one:</b> "ABC<b>DEF</b>GHI" — Alice inserts "X" at pos=4 (in the middle of D..F); Bob deletes pos=3..6 ("DEF"). We snap Alice's insert to the delete boundary (pos=3) → "ABC<b>X</b>GHI". Alice's text is preserved even though the surrounding characters are gone.</p>
+      </div>
+      <div class="tabpanel" data-panel="ot-di">
+        <div class="kicker">local DELETE vs remote INSERT — mirror of INSERT × DELETE</div>
+<pre class="code">private void transformDeleteInsert(Operation local, Operation remote,
+                                    Operation localPrime, Operation remotePrime) {
+  int deletePos = local.getPosition();
+  int deleteLen = local.getLength();
+  int insertPos = remote.getPosition();
+  int insertLen = remote.getInsertLength();
+
+  if (insertPos &lt;= deletePos) {
+    <span class="cm">// Remote insert BEFORE local delete → delete shifts right</span>
+    localPrime.setPosition(deletePos + insertLen);
+  } else if (insertPos &gt;= deletePos + deleteLen) {
+    <span class="cm">// Remote insert AFTER delete range → insert shifts left</span>
+    remotePrime.setPosition(insertPos - deleteLen);
+  } else {
+    <span class="cm">// Remote insert INSIDE delete range → insert moves to delete start</span>
+    remotePrime.setPosition(deletePos);
+  }
+}</pre>
+        <p class="muted"><b>Symmetry:</b> INSERT × DELETE and DELETE × INSERT are the same problem viewed from opposite sides. Keeping the code symmetric (rather than "clever") makes bugs easy to spot when they surface — and OT bugs are the worst kind because they manifest as silent divergence.</p>
+      </div>
+      <div class="tabpanel" data-panel="ot-dd">
+        <div class="kicker">both users delete — overlap needs range shrink</div>
+<pre class="code">private void transformDeleteDelete(Operation local, Operation remote,
+                                    Operation localPrime, Operation remotePrime) {
+  int localPos = local.getPosition();  int localLen = local.getLength();
+  int localEnd = localPos + localLen;
+  int remotePos = remote.getPosition();  int remoteLen = remote.getLength();
+  int remoteEnd = remotePos + remoteLen;
+
+  <span class="cm">// Compute overlap [max(starts), min(ends)]</span>
+  int overlapStart = Math.max(localPos, remotePos);
+  int overlapEnd   = Math.min(localEnd, remoteEnd);
+  int overlapLen   = Math.max(0, overlapEnd - overlapStart);
+
+  if (overlapLen == 0) {
+    <span class="cm">// No overlap — shift the later delete left by the earlier length</span>
+    if (localPos &lt;= remotePos) remotePrime.setPosition(remotePos - localLen);
+    else                       localPrime.setPosition(localPos - remoteLen);
+  } else {
+    <span class="cm">// Overlapping deletes — SHRINK both lengths by overlap.</span>
+    <span class="cm">// Reasoning: chars in the overlap are already gone; deleting</span>
+    <span class="cm">// them twice would eat into surviving text.</span>
+    if (remotePos &lt; localPos) {
+      int removedBefore = Math.min(remoteLen, localPos - remotePos);
+      localPrime.setPosition(localPos - removedBefore);
+    }
+    if (localPos &lt; remotePos) {
+      int removedBefore = Math.min(localLen, remotePos - localPos);
+      remotePrime.setPosition(remotePos - removedBefore);
+    }
+    localPrime.setLength(localLen - overlapLen);
+    remotePrime.setLength(remoteLen - overlapLen);
+  }
+}</pre>
+        <p class="muted"><b>The subtle bug this prevents:</b> "ABCDEFGH" — Alice DELETE(2,3) removes "CDE"; Bob DELETE(4,2) removes "EF". Both want char E gone. Overlap = pos 4..5 (len 1). Without shrink: Alice deletes CDE, then Bob deletes 2 chars starting at (4-3)=1 → deletes BC (wrong!). With shrink: Bob's transformed op is DELETE(1, 1) — deletes only "F". Final: "AH". Alice + Bob's intents preserved.</p>
+      </div>
+      <div class="tabpanel" data-panel="ot-crdt">
+        <div class="kicker">from <code>ot/CRDTResolver.java</code> — the transform is a NO-OP</div>
+<pre class="code">public TransformResult transform(Operation local, Operation remote) {
+  operationCounter++;
+
+  <span class="cm">// CRDT ops reference GLOBALLY UNIQUE character IDs, not integer positions.</span>
+  <span class="cm">// Because IDs are immutable, ops commute — no position adjustment needed.</span>
+  <span class="cm">// The underlying RGA / LSEQ / Yjs sequence handles ordering internally.</span>
+  Operation localPrime  = new Operation(local);
+  Operation remotePrime = new Operation(remote);
+
+  <span class="cm">// In a real RGA:</span>
+  <span class="cm">//   localCharId  = local.userId + ":" + operationCounter;</span>
+  <span class="cm">//   remoteCharId = remote.userId + ":" + (operationCounter + 1);</span>
+  <span class="cm">// The linked list of char nodes is ordered by (siteId, counter).</span>
+  <span class="cm">// Both nodes eventually see all char nodes; sort → same content.</span>
+
+  return new TransformResult(localPrime, remotePrime);
+}</pre>
+        <p class="muted"><b>The compression:</b> 200 lines of OT position math ↔ 5 lines of CRDT commutativity. But the cost lives elsewhere: every char carries a unique-ID metadata, deleted chars become tombstones (memory leak until GC'd), and the correctness proof lives in the data-structure invariants rather than in the transform table.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- D · FAN-OUT TABS -->
+  <section>
+    <div class="sec-h"><span class="n">D</span><h2>Broadcast fan-out — per-doc vs region-aware</h2><span class="tag">from <code>service/BroadcastService.java</code></span></div>
+    <div data-tabscope>
+      <div class="tabs">
+        <div class="tab active" data-tab="bc-perdoc">per-doc (in-process, demo)</div>
+        <div class="tab" data-tab="bc-kafka">per-doc topic (Kafka prod)</div>
+        <div class="tab" data-tab="bc-region">region-aware fan-out</div>
+        <div class="tab" data-tab="bc-cmp">comparison</div>
+      </div>
+      <div class="tabpanel active" data-panel="bc-perdoc">
+        <div class="kicker">simulated WebSocket fan-out in the Java demo</div>
+<pre class="code">public void broadcastOperation(String docId, Operation operation,
+                                String excludeUserId) {
+  Set&lt;String&gt; docConnections = connections.get(docId);
+  if (docConnections == null) return;
+
+  for (String userId : docConnections) {
+    if (!userId.equals(excludeUserId)) {
+      <span class="cm">// In prod: JSON-serialise op → push over the WS to this user's socket.</span>
+      System.out.println("   [WebSocket] → Sending to " + userId + ": " + operation);
+    }
+  }
+}</pre>
+        <p class="muted"><b>Works because everything is in-process</b> — one JVM holds every connection. Fine for the demo; fails at 5 M sockets across 100 nodes.</p>
+      </div>
+      <div class="tabpanel" data-panel="bc-kafka">
+        <div class="kicker">production: per-doc Kafka topic + gateway subscriber map</div>
+<pre class="code"><span class="cm">// Producer side — inside Collaboration Service after persist</span>
+kafka.send("ops." + docId, docId /* key */, opJson);
+
+<span class="cm">// Consumer side — inside each WS Gateway pod</span>
+onKafkaMessage(topic, key, opJson) {
+  String docId = key;
+  Set&lt;WsSession&gt; sessions = localSessions.get(docId);   <span class="cm">// docs this pod hosts</span>
+  if (sessions == null) return;                          <span class="cm">// no editors here → discard</span>
+  Operation op = deserialize(opJson);
+  for (WsSession s : sessions) {
+    if (!s.userId.equals(op.getUserId())) {              <span class="cm">// don't echo author</span>
+      s.send(REMOTE_OPERATION(op));
+    }
+  }
+}</pre>
+        <p class="muted"><b>Subscription trick:</b> each gateway subscribes ONLY to Kafka topics matching docs it currently hosts (rebalances on WS connect/disconnect). Prevents every gateway from consuming every op — else we'd move 10 GB/s × 100 nodes = 1 TB/s of gateway ingress. With filtered subscribes, ingress ≈ what leaves the pod's sockets.</p>
+      </div>
+      <div class="tabpanel" data-panel="bc-region">
+        <div class="kicker">multi-region: local-first, cross-region async</div>
+<pre class="code"><span class="cm">// One doc can have editors in us-east + eu-west + ap-south simultaneously.</span>
+<span class="cm">// Strategy: pin the doc's PRIMARY region (author's home region),</span>
+<span class="cm">// mirror ops asynchronously to secondary regions.</span>
+
+Region primary = docLookup.getPrimaryRegion(docId);
+if (currentRegion.equals(primary)) {
+  <span class="cm">// Same-region editors — full OT loop &lt; 50 ms.</span>
+  processOperation(docId, userId, op);
+  crossRegionMirror.publish(docId, op);   <span class="cm">// async, best-effort</span>
+} else {
+  <span class="cm">// Remote-region editor — forward to primary, then apply mirror.</span>
+  primaryProxy.processOperation(docId, userId, op);   <span class="cm">// ~120 ms cross-region</span>
+  <span class="cm">// Client sees local echo (optimistic) + ACK when primary confirms.</span>
+}</pre>
+        <p class="muted"><b>Trade-off:</b> for docs with cross-region editors, one region pays the round-trip cost. Alternative: multi-master OT — needs TP2 (transformation property 2), notoriously hard. CRDT would solve this naturally but at metadata cost. Most tools (Google Docs · Figma) pin one region per doc.</p>
+      </div>
+      <div class="tabpanel" data-panel="bc-cmp">
+        <table>
+          <thead><tr><th>Model</th><th>Editors/doc</th><th>Latency</th><th>Cross-node</th><th>Trade-off</th></tr></thead>
+          <tbody>
+            <tr><td><b>In-process (demo)</b></td><td>≤ ~50</td><td>~1 ms</td><td>no</td><td>single JVM ceiling</td></tr>
+            <tr><td><b>Sticky gateway + local sockets</b></td><td>≤ 50 K per node</td><td>~2 ms</td><td>no</td><td>hot-doc rebalance risk</td></tr>
+            <tr><td><b>Kafka per-doc topic</b> ← ours</td><td>unlimited</td><td>~10 ms</td><td>yes</td><td>consumer rebalance on join/leave</td></tr>
+            <tr><td><b>Redis Pub/Sub</b></td><td>unlimited</td><td>~1–3 ms</td><td>yes</td><td>no durability · lost msg on drop</td></tr>
+            <tr><td><b>Region-aware primary</b></td><td>global</td><td>~120 ms cross</td><td>yes</td><td>one region is closer, others pay RTT</td></tr>
+          </tbody>
+        </table>
+        <p class="muted"><b>Interview mic-drop:</b> "We use Kafka not because we need durability of the broadcast — we don't; the op is already in Postgres. We use Kafka because it gives us <b>ordering per partition</b> (partition = docId), and it lets gateway pods RECOVER on restart by replaying the last 24 h of ops for docs they own. Redis Pub/Sub loses messages when a subscriber blinks; Kafka doesn't."</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- E · CLIENT OT STATE MACHINE -->
+  <section>
+    <div class="sec-h"><span class="n">E</span><h2>Client-side OT state machine</h2><span class="tag">SYNCHRONIZED → AWAITING_ACK → AWAITING_ACK_WITH_BUFFER</span></div>
+    <div class="grid g2">
+      <div class="card">
+        <div class="kicker">the three states + transitions</div>
+        <pre class="code">SYNCHRONIZED
+  no pending op · local state == server state
+  ┌─ local edit ─▶ send to server ─▶ AWAITING_ACK
+  └─ remote op received ─▶ apply, stay SYNCHRONIZED
+
+AWAITING_ACK
+  one op sent, waiting for ACK · local = server + pending
+  ┌─ ACK, no buffer      ─▶ SYNCHRONIZED
+  ├─ ACK, buffer present ─▶ send buffer, stay AWAITING_ACK
+  ├─ local edit          ─▶ enqueue in buffer ─▶ AWAITING_ACK_WITH_BUFFER
+  └─ remote op           ─▶ transform pending against remote, stay
+                              (apply transformed remote locally)
+
+AWAITING_ACK_WITH_BUFFER
+  one op sent + more buffered · local = server + pending + buffer
+  ┌─ ACK ─▶ send buffer as composite op ─▶ AWAITING_ACK
+  ├─ local edit ─▶ merge into buffer, stay
+  └─ remote op  ─▶ transform BOTH pending AND buffer against remote</pre>
+      </div>
+      <div class="card">
+        <div class="kicker">why exactly three states?</div>
+        <ul class="tight">
+          <li><b>Only ONE op in flight at a time.</b> Prevents the server from having to reorder ACKs — it always echoes <code>local_op_id</code> in the ACK; client matches to remove from pending.</li>
+          <li><b>Buffer = merged view of every local edit since we sent the last op.</b> When the ACK arrives, we ship the whole buffer as one composite op (batched — cheaper for the server, less network chatter).</li>
+          <li><b>Remote ops must transform against pending AND buffer.</b> Otherwise our next batch would fight the server's already-applied ops. This is where TP1 shines: <code>apply(remote, pending) = apply(pending', remote')</code> — same final state either way.</li>
+          <li><b>Reconnection:</b> re-enters SYNCHRONIZED after full resync. Buffered ops replay with the new base_revision the server assigns.</li>
+        </ul>
+      </div>
+    </div>
+    <div class="callout tip"><b>Interview point:</b> a client-side state machine like this is why OT feels magic to the user — they type, they see it, they never wait. All the network-round-trip complexity is hidden behind these three states. The trap for interviewers: candidates describe the server-side transform without ever explaining the CLIENT OT machine, so their design "works" only in the perfect-connectivity case.</div>
+  </section>
+
+  <!-- F · SEQUENCE -->
+  <section>
+    <div class="sec-h"><span class="n">F</span><h2>Sequence — Alice + Bob edit "HELLO" concurrently</h2><span class="tag">who calls whom, in order</span></div>
+    <div class="card">
+      <pre class="code">Alice client              WS Gateway            Collab Service        SyncStrategy          OTResolver         OperationSvc      Broadcast     Bob client
+     │                          │                        │                       │                       │                    │                    │            │
+     │ OPERATION INSERT(2,"X") │                        │                       │                       │                    │                    │            │
+     │ baseRev=5                │                        │                       │                       │                    │                    │            │
+     │─────────────────────────▶│                        │                       │                       │                    │                    │            │
+     │                          │  processOperation      │                       │                       │                    │                    │            │
+     │                          │───────────────────────▶│                       │                       │                    │                    │            │
+     │                          │                        │ getOperationsSince(6..7)                      │                    │                    │            │
+     │                          │                        │──────────────────────────────────────────────▶│                    │                    │            │
+     │                          │                        │ pending = [Bob's INSERT(4,"Y") rev=6]         │                    │                    │            │
+     │                          │                        │◀──────────────────────────────────────────────│                    │                    │            │
+     │                          │                        │ syncStrategy.applyOperation(doc, op, pending) │                    │                    │            │
+     │                          │                        │──────────────────────▶│                       │                    │                    │            │
+     │                          │                        │                       │ transform(alice, bob) │                    │                    │            │
+     │                          │                        │                       │──────────────────────▶│                    │                    │            │
+     │                          │                        │                       │ localPos(2) &lt; remotePos(4): alice unchanged│                    │            │
+     │                          │                        │                       │◀──────────────────────│                    │                    │            │
+     │                          │                        │                       │ doc.applyInsert(2, "X") · doc.incrementVersion() → rev=8       │            │
+     │                          │                        │                       │ returns [alice']                                                │            │
+     │                          │                        │◀──────────────────────│                       │                    │                    │            │
+     │                          │                        │ opService.saveOperation(alice')             │                    │                    │            │
+     │                          │                        │──────────────────────────────────────────────────────────────────▶│                    │            │
+     │                          │                        │ broadcastService.broadcastOperation(docId, alice', excludeUser)   │                    │            │
+     │                          │                        │──────────────────────────────────────────────────────────────────────────────────────▶│            │
+     │                          │                        │ presenceService.updateCursor(alice, 3) + adjustCursors(bob's cursor: shift +1)         │            │
+     │ OPERATION_ACK rev=8      │                        │                       │                       │                    │                    │            │
+     │◀─────────────────────────│◀───────────────────────│                       │                       │                    │                    │            │
+     │                          │                        │                       │                       │                    │  REMOTE_OPERATION  │            │
+     │                          │                        │                       │                       │                    │  INSERT(2,"X") ────────────────▶│
+     │                          │                        │                       │                       │                    │                    │            │</pre>
+    </div>
+    <div class="callout tip"><b>Latency budget for this frame:</b> Alice keystroke → local apply (&lt; 1 ms) → WSS send (~10 ms RTT/2) → permission cache (~0.2 ms) → doc fetch (~1 ms) → pending fetch (~1 ms) → OT transform (~0.5 ms) → apply + version bump (~0.5 ms) → persist to op log (~2 ms) → broadcast local + Kafka publish (~2 ms) → REMOTE_OPERATION out to Bob (~10 ms RTT/2). <b>Total ~30 ms server-side + network</b> — well under the 100 ms p99 budget.</div>
+  </section>
+
+  <!-- FILE MAP + GLOSSARY -->
+  <section>
+    <div class="sec-h"><span class="n">§</span><h2>File map + Glossary</h2></div>
+    <div class="grid g2">
+      <div class="card"><div class="kicker">file map</div><table><tbody>
+        <tr><td><code>config/AppConfig.java</code></td><td>Composition root — factory + strategy wiring</td></tr>
+        <tr><td><code>controller/CollaborationController.java</code></td><td>REST + WS handler façade</td></tr>
+        <tr><td><code>service/CollaborationService.java</code></td><td>Facade — <code>processOperation</code></td></tr>
+        <tr><td><code>service/{Operation,Document,Permission,Presence,Version,Broadcast}Service.java</code></td><td>6 services (validate · persist · adjust · fan-out)</td></tr>
+        <tr><td><code>ot/OTResolver.java</code></td><td><b>THE STAR</b> — transform 4 cases</td></tr>
+        <tr><td><code>ot/{ConflictResolver,CRDTResolver,TransformResult}.java</code></td><td>Interface + alt impl + return DTO</td></tr>
+        <tr><td><code>strategy/sync/{Sync,OTSync,CRDTSync}Strategy.java</code></td><td>Sync interface + 2 impls</td></tr>
+        <tr><td><code>strategy/persistence/{Persistence,Snapshot,EventSourced}*.java</code></td><td>Persistence interface + 2 impls</td></tr>
+        <tr><td><code>model/{Document,Operation,DocumentVersion,CursorPosition,UserPresence,Permission,Comment}.java</code></td><td>7 model classes + 2 enums (OpType, PermissionRole)</td></tr>
+        <tr><td><code>repository/*.java · InMemory*.java</code></td><td>3 interfaces + 3 InMemory impls</td></tr>
+        <tr><td><code>exception/*.java</code></td><td>4 exceptions, all extend <code>CollaborationException</code></td></tr>
+      </tbody></table></div>
+      <div class="card"><div class="kicker">glossary</div><table><tbody>
+        <tr><td><b>Facade (CollaborationService)</b></td><td>one door for edits; hides sync + persist + broadcast + presence + version wiring</td></tr>
+        <tr><td><b>Strategy pluggability</b></td><td>swap OT ↔ CRDT sync at composition; swap Snapshot ↔ EventSourced persistence the same way</td></tr>
+        <tr><td><b>Command (Operation)</b></td><td>each edit is a serialisable object — can be replayed, transformed, inverted for undo</td></tr>
+        <tr><td><b>Memento (DocumentVersion)</b></td><td>immutable snapshot of doc state — the "originator" is the Document</td></tr>
+        <tr><td><b>Observer (BroadcastService)</b></td><td>Publisher for op / cursor events; every connected socket is a subscriber</td></tr>
+        <tr><td><b>Builder (Document)</b></td><td>required fields validated at build() — <code>docId</code> and <code>ownerId</code>; StringBuilder content</td></tr>
+        <tr><td><b>Composition root</b></td><td>AppConfig is the ONLY place that news up concretes; every other class depends on interfaces</td></tr>
+        <tr><td><b>TransformResult</b></td><td>value object: (transformedLocal, transformedRemote) — never mutate the original ops</td></tr>
+      </tbody></table></div>
+    </div>
+  </section>
+
+  <footer>
+    <p>Use case 14 · Real-time Collaboration — Canvas 2 of 3 (LLD). All classes verified against real Java under <code>14-realtime-collaboration/src/</code>. No invented method signatures.</p>
+    <p class="run"><a href="hld.html">← Canvas 1 · HLD</a> · Canvas 2 · LLD · <a href="deepdive.html">Canvas 3 · Deep-dive &amp; Trade-offs →</a> &nbsp;|&nbsp; <a href="../index.html">Hub</a></p>
+  </footer>
+
+</div>
+<script src="../assets/canvas.js"></script>
+</body>
+</html>

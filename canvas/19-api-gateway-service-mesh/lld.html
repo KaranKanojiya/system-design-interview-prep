@@ -1,0 +1,537 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>19 · API Gateway &amp; Service Mesh — LLD</title>
+<link rel="stylesheet" href="../assets/canvas.css">
+</head>
+<body>
+<div class="wrap">
+
+  <header class="hero">
+    <h1>API Gateway &amp; Service Mesh — Low-Level Design</h1>
+    <div class="sub">Canvas 2 of 3. Real Java classes under <code>19-api-gateway-service-mesh/src/</code>. Composition root <code>AppConfig</code> → facade <code>GatewayService</code> → 6 orchestrating services → 5 engines → 4 strategy families (Routing, Auth, LoadBalancing, Traffic) — each with pluggable impls. Click any class for its role and method signatures. Includes verbatim <code>allowRequest</code> circuit-breaker code, side-by-side LB strategy tabs, and the full 10-step <code>handleRequest</code> pipeline.</div>
+    <div class="badges">
+      <span class="badge lvl">Use case 19 · LLD</span>
+      <span class="badge">Canvas 2 of 3</span>
+      <span class="badge">grounded in code</span>
+      <span class="badge">Facade · Strategy · State-Machine · Factory · Repository</span>
+    </div>
+    <div class="legend">
+      <span><i class="dot" style="background:var(--eden)"></i> composition root / entry</span>
+      <span><i class="dot" style="background:var(--survivor)"></i> facade &amp; orchestrators</span>
+      <span><i class="dot" style="background:var(--fig)"></i> strategies (swappable)</span>
+      <span><i class="dot" style="background:var(--old)"></i> engines &amp; repos</span>
+    </div>
+  </header>
+
+  <!-- A · CLASS MAP -->
+  <section>
+    <div class="sec-h"><span class="n">A</span><h2>Class map — click any class</h2><span class="tag">from <code>src/main/java/com/systemdesign/gateway/</code></span></div>
+    <div>
+      <div class="arch">
+        <svg viewBox="0 0 900 420" width="100%" style="max-width:900px" role="img" aria-label="Gateway class map">
+          <defs>
+            <marker id="ah4" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" fill="var(--muted)"></path></marker>
+          </defs>
+
+          <!-- ═══════ arrows ═══════ -->
+          <!-- AppConfig → Controller -->
+          <line class="arrow" x1="105" y1="70" x2="105" y2="86" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah4)"></line>
+          <!-- Controller → Facade -->
+          <line class="arrow" x1="105" y1="130" x2="105" y2="150" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah4)"></line>
+          <!-- Facade → Domain models -->
+          <line class="arrow" x1="105" y1="194" x2="105" y2="210" stroke="var(--muted)" stroke-width="1.5" stroke-dasharray="4 3" marker-end="url(#ah4)"></line>
+          <!-- Facade → Exceptions -->
+          <line class="arrow" x1="105" y1="254" x2="105" y2="330" stroke="var(--muted)" stroke-width="1.2" stroke-dasharray="2 3" marker-end="url(#ah4)"></line>
+          <text class="edge-label" x="115" y="300">throws</text>
+
+          <!-- Facade fan-out into services (col2) — 6 lines -->
+          <line class="arrow" x1="190" y1="165" x2="220" y2="48" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah4)"></line>
+          <line class="arrow" x1="190" y1="168" x2="220" y2="108" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah4)"></line>
+          <line class="arrow" x1="190" y1="171" x2="220" y2="172" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah4)"></line>
+          <line class="arrow" x1="190" y1="174" x2="220" y2="232" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah4)"></line>
+          <line class="arrow" x1="190" y1="177" x2="220" y2="292" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah4)"></line>
+          <line class="arrow" x1="190" y1="180" x2="220" y2="352" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah4)"></line>
+
+          <!-- RoutingService → RequestRouter -->
+          <line class="arrow" x1="390" y1="42" x2="420" y2="42" stroke="var(--muted)" stroke-width="1.8" marker-end="url(#ah4)"></line>
+          <!-- RoutingService → RoutingStrategy -->
+          <line class="arrow" x1="390" y1="55" x2="620" y2="42" stroke="var(--muted)" stroke-width="1.5" stroke-dasharray="4 3" marker-end="url(#ah4)"></line>
+          <text class="edge-label" x="595" y="22">route()</text>
+          <!-- RoutingService → Repositories (RouteRepo) -->
+          <line class="arrow" x1="390" y1="60" x2="420" y2="352" stroke="var(--muted)" stroke-width="1.5" stroke-dasharray="4 3" marker-end="url(#ah4)"></line>
+
+          <!-- AuthService → AuthStrategy -->
+          <line class="arrow" x1="390" y1="108" x2="620" y2="108" stroke="var(--muted)" stroke-width="1.8" marker-end="url(#ah4)"></line>
+          <text class="edge-label" x="595" y="82">authenticate · authorize</text>
+
+          <!-- RateLimitService → RateLimiterEngine -->
+          <line class="arrow" x1="390" y1="172" x2="420" y2="172" stroke="var(--muted)" stroke-width="1.8" marker-end="url(#ah4)"></line>
+          <text class="edge-label" x="395" y="146">tokens--</text>
+
+          <!-- CBService → CBEngine -->
+          <line class="arrow" x1="390" y1="232" x2="420" y2="108" stroke="var(--muted)" stroke-width="1.8" marker-end="url(#ah4)"></line>
+          <text class="edge-label" x="395" y="206">allow · recordSuccess/Failure</text>
+
+          <!-- LBService → ServiceRegistry -->
+          <line class="arrow" x1="390" y1="285" x2="420" y2="232" stroke="var(--muted)" stroke-width="1.8" marker-end="url(#ah4)"></line>
+          <!-- LBService → LoadBalancingStrategy -->
+          <line class="arrow" x1="390" y1="292" x2="620" y2="172" stroke="var(--muted)" stroke-width="1.8" marker-end="url(#ah4)"></line>
+          <text class="edge-label" x="595" y="266">selectInstance()</text>
+
+          <!-- MeshService → TlsEngine -->
+          <line class="arrow" x1="390" y1="352" x2="420" y2="292" stroke="var(--muted)" stroke-width="1.8" marker-end="url(#ah4)"></line>
+          <text class="edge-label" x="395" y="326">validateConnection</text>
+          <!-- MeshService → CBService (uses) -->
+          <line class="arrow" x1="305" y1="330" x2="305" y2="254" stroke="var(--muted)" stroke-width="1.2" stroke-dasharray="2 3" marker-end="url(#ah4)"></line>
+          <!-- MeshService → LBService (uses) -->
+          <line class="arrow" x1="315" y1="330" x2="315" y2="314" stroke="var(--muted)" stroke-width="1.2" stroke-dasharray="2 3" marker-end="url(#ah4)"></line>
+
+          <!-- ServiceRegistry → Repositories (ServiceInstanceRepo) -->
+          <line class="arrow" x1="490" y1="254" x2="490" y2="330" stroke="var(--muted)" stroke-width="1.2" stroke-dasharray="2 3" marker-end="url(#ah4)"></line>
+
+          <!-- Controller → TrafficStrategy (canary) -->
+          <line class="arrow" x1="190" y1="108" x2="620" y2="232" stroke="var(--muted)" stroke-width="1.2" stroke-dasharray="2 3" marker-end="url(#ah4)"></line>
+          <text class="edge-label" x="595" y="326">canary · selectVersion</text>
+
+          <!-- ═══════ NODES ═══════ -->
+
+          <!-- Col 1 -->
+          <g data-node style="cursor:pointer" data-title="AppConfig (Factory · composition root)" data-detail="<b>Path:</b> <code>config/AppConfig.java</code>. The ONLY place where <code>new ConcreteClass()</code> appears.<br><b>Layers wired:</b> Repositories → Engines → Strategies → Services → Facade → Controller → Display.<br><b>Lazy init:</b> each getter caches its object. Strategy setters (setRoutingStrategy, setLoadBalancingStrategy, ...) <b>clear dependents</b> — the graph rebuilds on next access, so you can swap a strategy live and everything downstream picks it up.<br><b>Defaults:</b> PathBased routing, RoundRobin LB, JWT auth (empty roleMap), Canary traffic. mTLS on, tracing on, retries on."><rect x="20" y="26" width="170" height="44" rx="9" fill="var(--panel-2)" stroke="var(--eden)"></rect><text x="105" y="46" text-anchor="middle" fill="var(--eden)" font-size="12" font-weight="600">AppConfig</text><text x="105" y="60" text-anchor="middle" fill="var(--faint)" font-size="10">Factory · lazy · clears dependents</text></g>
+
+          <g data-node style="cursor:pointer" data-title="GatewayController" data-detail="<b>Path:</b> <code>controller/GatewayController.java</code>. HTTP adapter — maps requests to Facade calls, adds request logging.<br><b>Depends on:</b> GatewayService (facade), LoadBalancerService (for instance-mgmt endpoints), CircuitBreakerService (for CB-state endpoints). Never contains routing / auth / LB logic itself."><rect x="20" y="86" width="170" height="44" rx="9" fill="var(--panel-2)" stroke="var(--border)"></rect><text x="105" y="106" text-anchor="middle" fill="var(--text)" font-size="12" font-weight="600">GatewayController</text><text x="105" y="120" text-anchor="middle" fill="var(--faint)" font-size="10">HTTP adapter</text></g>
+
+          <g data-node style="cursor:pointer" data-title="GatewayService (Facade)" data-detail="<b>Path:</b> <code>service/GatewayService.java</code>. The one door.<br><b>Method:</b> <code>HttpResponse handleRequest(HttpRequest)</code> — runs the 10-step pipeline: (1) create RequestContext + traceId → (2) routingService.matchRoute → (3) authService.authenticate → (4) authService.authorize → (5) rateLimitService.checkRouteRateLimit → (6) circuitBreakerService.allowRequest → (7) loadBalancerService.selectInstance → (8) forward (simulated) → (9) circuitBreakerService.recordSuccess / recordFailure → (10) build response with X-Trace-Id.<br><b>Also:</b> <code>registerRoute</code>, <code>getAllRoutes</code>, <code>getServiceStatus</code> for admin endpoints."><rect x="20" y="150" width="170" height="44" rx="9" fill="var(--panel-2)" stroke="var(--survivor)"></rect><text x="105" y="170" text-anchor="middle" fill="var(--survivor)" font-size="12" font-weight="600">GatewayService</text><text x="105" y="184" text-anchor="middle" fill="var(--faint)" font-size="10">Facade · handleRequest (10 steps)</text></g>
+
+          <g data-node style="cursor:pointer" data-title="Domain models (Builder for HttpResponse)" data-detail="<b>Path:</b> <code>model/</code>. Plain data.<br><b>Types:</b> <code>HttpRequest</code>, <code>HttpResponse</code> (with Builder), <code>Route</code>, <code>ServiceInstance</code>, <code>RequestContext</code>, <code>AuthToken</code>, <code>AuthResult</code>, <code>RateLimitResult</code>, <code>CircuitBreakerState</code>, <code>CircuitState</code> (enum), <code>HealthStatus</code>, <code>HttpMethod</code>, <code>GatewayFilter</code>, <code>RetryPolicy</code>, <code>ServiceMeshConfig</code> (Builder), <code>TrafficSplit</code>.<br><b>Builder pattern</b> on HttpResponse and ServiceMeshConfig for the many-optional-fields cases."><rect x="20" y="210" width="170" height="44" rx="9" fill="var(--panel-2)" stroke="var(--border)"></rect><text x="105" y="230" text-anchor="middle" fill="var(--text)" font-size="12" font-weight="600">Domain models</text><text x="105" y="244" text-anchor="middle" fill="var(--faint)" font-size="10">Builder for HttpResponse + Mesh</text></g>
+
+          <g data-node style="cursor:pointer" data-title="Exception hierarchy" data-detail="<b>Path:</b> <code>exception/</code>.<br><b>Types:</b> <code>GatewayException</code> (base), <code>RateLimitExceededException</code>, <code>RouteNotFoundException</code>, <code>ServiceUnavailableException</code>.<br>Each maps to a specific HTTP status: 429, 404, 503. Controllers rely on this typing rather than string parsing."><rect x="20" y="330" width="170" height="44" rx="9" fill="var(--panel-2)" stroke="var(--warn)"></rect><text x="105" y="350" text-anchor="middle" fill="var(--warn)" font-size="12" font-weight="600">Exceptions</text><text x="105" y="364" text-anchor="middle" fill="var(--faint)" font-size="10">RateLimitExceeded · RouteNotFound · SvcUnavailable</text></g>
+
+          <!-- Col 2: services -->
+          <g data-node style="cursor:pointer" data-title="RoutingService" data-detail="<b>Path:</b> <code>service/RoutingService.java</code>.<br><b>Wraps:</b> RequestRouter + RoutingStrategy + RouteRepository.<br><b>Methods:</b> <code>matchRoute(HttpRequest) : Optional&lt;Route&gt;</code> — asks RequestRouter for candidates, then delegates to strategy for tie-break; <code>registerRoute(Route)</code> — persists to repo; <code>getAllRoutes()</code>; <code>updateRoute(Route)</code>."><rect x="220" y="26" width="170" height="44" rx="9" fill="var(--panel-2)" stroke="var(--survivor)"></rect><text x="305" y="46" text-anchor="middle" fill="var(--survivor)" font-size="12" font-weight="600">RoutingService</text><text x="305" y="60" text-anchor="middle" fill="var(--faint)" font-size="10">match · register · update</text></g>
+
+          <g data-node style="cursor:pointer" data-title="AuthService" data-detail="<b>Path:</b> <code>service/AuthService.java</code>.<br><b>Wraps:</b> AuthStrategy (JWT or API-Key).<br><b>Methods:</b> <code>AuthResult authenticate(HttpRequest)</code> — delegates to strategy; <code>boolean authorize(AuthResult, Route)</code> — checks Route's <code>required-role</code> metadata against principal's roles.<br>Returns <code>AuthResult(isAuthenticated, principal, roles, errorMessage)</code>."><rect x="220" y="86" width="170" height="44" rx="9" fill="var(--panel-2)" stroke="var(--survivor)"></rect><text x="305" y="106" text-anchor="middle" fill="var(--survivor)" font-size="12" font-weight="600">AuthService</text><text x="305" y="120" text-anchor="middle" fill="var(--faint)" font-size="10">authN + authZ</text></g>
+
+          <g data-node style="cursor:pointer" data-title="RateLimitService" data-detail="<b>Path:</b> <code>service/RateLimitService.java</code>.<br><b>Wraps:</b> RateLimiterEngine.<br><b>Methods:</b> <code>RateLimitResult checkRouteRateLimit(RequestContext)</code> — key = (client, route), returns {allowed, remainingTokens, retryAfterMs}; <code>configureBucket(routeId, rate, burst)</code>.<br>Token bucket refills at configured rate; if empty → deny with 429."><rect x="220" y="150" width="170" height="44" rx="9" fill="var(--panel-2)" stroke="var(--survivor)"></rect><text x="305" y="170" text-anchor="middle" fill="var(--survivor)" font-size="12" font-weight="600">RateLimitService</text><text x="305" y="184" text-anchor="middle" fill="var(--faint)" font-size="10">token bucket check</text></g>
+
+          <g data-node style="cursor:pointer" data-title="CircuitBreakerService" data-detail="<b>Path:</b> <code>service/CircuitBreakerService.java</code>.<br><b>Wraps:</b> CircuitBreakerEngine.<br><b>Methods:</b> <code>boolean allowRequest(String service)</code> — CLOSED = true; OPEN = false (unless cooldown elapsed → HALF_OPEN, allow); HALF_OPEN = true. <code>recordSuccess(service)</code>, <code>recordFailure(service)</code>, <code>getCircuitSummary() : Map&lt;String, CircuitState&gt;</code>."><rect x="220" y="210" width="170" height="44" rx="9" fill="var(--panel-2)" stroke="var(--survivor)"></rect><text x="305" y="230" text-anchor="middle" fill="var(--survivor)" font-size="12" font-weight="600">CircuitBreakerService</text><text x="305" y="244" text-anchor="middle" fill="var(--faint)" font-size="10">allow · record</text></g>
+
+          <g data-node style="cursor:pointer" data-title="LoadBalancerService" data-detail="<b>Path:</b> <code>service/LoadBalancerService.java</code>.<br><b>Wraps:</b> ServiceRegistry + LoadBalancingStrategy.<br><b>Methods:</b> <code>Optional&lt;ServiceInstance&gt; selectInstance(String service, HttpRequest)</code> — filters registry to healthy for the service, then delegates to strategy. <code>registerInstance(ServiceInstance)</code>, <code>deregisterInstance(id)</code>, <code>heartbeat(id)</code>."><rect x="220" y="270" width="170" height="44" rx="9" fill="var(--panel-2)" stroke="var(--survivor)"></rect><text x="305" y="290" text-anchor="middle" fill="var(--survivor)" font-size="12" font-weight="600">LoadBalancerService</text><text x="305" y="304" text-anchor="middle" fill="var(--faint)" font-size="10">registry × strategy</text></g>
+
+          <g data-node style="cursor:pointer" data-title="ServiceMeshService (sidecar simulation)" data-detail="<b>Path:</b> <code>service/ServiceMeshService.java</code>. Simulates Envoy-style sidecar proxy for E-W.<br><b>Method:</b> <code>proxyRequest(callerService, targetService, HttpRequest)</code> — 6-step pipeline: (1) mTLS validate → (2) circuit breaker check → (3) LB select instance → (4) forward → (5) record success/failure → (6) build response with X-Mesh-* headers.<br><b>Config:</b> ServiceMeshConfig (mtlsEnabled, sidecarPort=15001, tracingEnabled, retryPolicy, circuitBreakerEnabled).<br>Same building blocks as N-S — reuses CBService, LBService, TlsEngine."><rect x="220" y="330" width="170" height="44" rx="9" fill="var(--panel-2)" stroke="var(--survivor)"></rect><text x="305" y="350" text-anchor="middle" fill="var(--survivor)" font-size="12" font-weight="600">ServiceMeshService</text><text x="305" y="364" text-anchor="middle" fill="var(--faint)" font-size="10">sidecar · mTLS · proxy</text></g>
+
+          <!-- Col 3: engines + repos -->
+          <g data-node style="cursor:pointer" data-title="RequestRouter (engine)" data-detail="<b>Path:</b> <code>engine/RequestRouter.java</code>. Fast in-memory route lookup.<br><b>Method:</b> <code>List&lt;Route&gt; findMatching(HttpRequest)</code> — scans route table filtered by method, then glob-pattern-matches path.<br><b>Trick:</b> pre-compiles glob patterns once at registration; matches at hot-path with cached regex."><rect x="420" y="26" width="170" height="44" rx="9" fill="var(--panel-2)" stroke="var(--old)"></rect><text x="505" y="46" text-anchor="middle" fill="var(--old)" font-size="12" font-weight="600">RequestRouter</text><text x="505" y="60" text-anchor="middle" fill="var(--faint)" font-size="10">glob match · in-memory</text></g>
+
+          <g data-node style="cursor:pointer" data-title="CircuitBreakerEngine (state machine)" data-detail="<b>Path:</b> <code>engine/CircuitBreakerEngine.java</code>. Per-service state machine.<br><b>Defaults (verbatim from code):</b> FAILURE_THRESHOLD=5, SUCCESS_THRESHOLD=3, OPEN_DURATION=30_000 ms.<br><b>allowRequest state machine:</b><br><pre style='background:var(--panel);padding:6px;border-radius:4px;font-size:11px;overflow-x:auto'>switch (state) {\n  case CLOSED -&gt; return true;\n  case OPEN -&gt; if (shouldAttemptReset()) {\n                halfOpen();  // OPEN → HALF_OPEN\n                return true; }\n              else return false;\n  case HALF_OPEN -&gt; return true;  // test request\n}</pre>Concurrent-safe via <code>ConcurrentHashMap&lt;String, CircuitBreakerState&gt;</code>."><rect x="420" y="86" width="170" height="44" rx="9" fill="var(--panel-2)" stroke="var(--old)"></rect><text x="505" y="106" text-anchor="middle" fill="var(--old)" font-size="12" font-weight="600">CircuitBreakerEngine</text><text x="505" y="120" text-anchor="middle" fill="var(--faint)" font-size="10">state machine · thresholds</text></g>
+
+          <g data-node style="cursor:pointer" data-title="RateLimiterEngine (token bucket)" data-detail="<b>Path:</b> <code>engine/RateLimiterEngine.java</code>. Token-bucket per (key = client × route).<br><b>Algorithm:</b> bucket = {tokens, capacity, refillRate, lastRefill}. On request:<br>1) refill: tokens = min(capacity, tokens + elapsed × rate)<br>2) if tokens ≥ 1 → tokens--, allow. Else → deny with retryAfter = (1 − tokens) / rate.<br><b>Concurrent-safe</b> per-bucket via <code>ConcurrentHashMap</code>; refill uses double CAS or synchronized on bucket object."><rect x="420" y="150" width="170" height="44" rx="9" fill="var(--panel-2)" stroke="var(--old)"></rect><text x="505" y="170" text-anchor="middle" fill="var(--old)" font-size="12" font-weight="600">RateLimiterEngine</text><text x="505" y="184" text-anchor="middle" fill="var(--faint)" font-size="10">token bucket · per key</text></g>
+
+          <g data-node style="cursor:pointer" data-title="ServiceRegistry" data-detail="<b>Path:</b> <code>engine/ServiceRegistry.java</code>.<br><b>State:</b> <code>Map&lt;String, List&lt;ServiceInstance&gt;&gt;</code> keyed by serviceName.<br><b>Methods:</b> <code>register(instance)</code>, <code>deregister(id)</code>, <code>heartbeat(id)</code>, <code>List&lt;ServiceInstance&gt; getInstances(service)</code>, <code>List&lt;ServiceInstance&gt; getHealthyInstances(service)</code>.<br><b>Health:</b> instance UNHEALTHY if <code>now − lastHeartbeat &gt; 10 s</code>. Background sweep evicts UNHEALTHY.<br>Backed by <code>InMemoryServiceInstanceRepository</code>; in prod: etcd / Consul."><rect x="420" y="210" width="170" height="44" rx="9" fill="var(--panel-2)" stroke="var(--old)"></rect><text x="505" y="230" text-anchor="middle" fill="var(--old)" font-size="12" font-weight="600">ServiceRegistry</text><text x="505" y="244" text-anchor="middle" fill="var(--faint)" font-size="10">register · health · evict</text></g>
+
+          <g data-node style="cursor:pointer" data-title="TlsEngine (mTLS)" data-detail="<b>Path:</b> <code>engine/TlsEngine.java</code>.<br><b>Method:</b> <code>boolean validateConnection(caller, target)</code> — validates that both sides have mesh-CA-issued certs still within validity window.<br>In production: caches parsed cert chains; uses SPIFFE IDs for zero-trust identity; auto-rotation via SPIRE.<br><b>Enable/disable:</b> <code>enableMtls()</code>, <code>disableMtls()</code> — for staged rollout."><rect x="420" y="270" width="170" height="44" rx="9" fill="var(--panel-2)" stroke="var(--old)"></rect><text x="505" y="290" text-anchor="middle" fill="var(--old)" font-size="12" font-weight="600">TlsEngine</text><text x="505" y="304" text-anchor="middle" fill="var(--faint)" font-size="10">mTLS validate</text></g>
+
+          <g data-node style="cursor:pointer" data-title="Repositories (in-memory)" data-detail="<b>Path:</b> <code>repository/</code>.<br><b>Interfaces:</b> <code>RouteRepository</code>, <code>ServiceInstanceRepository</code>.<br><b>Impls:</b> <code>InMemoryRouteRepository</code>, <code>InMemoryServiceInstanceRepository</code> — thread-safe ConcurrentHashMap-backed.<br><b>In production:</b> etcd (routes as key-value with watch stream) or Consul (KV + service catalog)."><rect x="420" y="330" width="170" height="44" rx="9" fill="var(--panel-2)" stroke="var(--old)"></rect><text x="505" y="350" text-anchor="middle" fill="var(--old)" font-size="12" font-weight="600">Repositories</text><text x="505" y="364" text-anchor="middle" fill="var(--faint)" font-size="10">Route · ServiceInstance</text></g>
+
+          <!-- Col 4: strategies -->
+          <g data-node style="cursor:pointer" data-title="RoutingStrategy (2 impls)" data-detail="<b>Path:</b> <code>strategy/routing/</code>.<br><b>Interface:</b> <code>Optional&lt;Route&gt; route(HttpRequest, List&lt;Route&gt; matches)</code>.<br><b>Impls:</b><br>• <code>PathBasedRoutingStrategy</code> — specificity score: exact = 100, wildcarded = 50 − wildcardCount, catch-all /** = 0. Sorts by specificity, ties broken by length desc.<br>• <code>HeaderBasedRoutingStrategy</code> — matches routes whose metadata requires a specific header value.<br><b>Section C — tabs.</b>"><rect x="620" y="26" width="170" height="44" rx="9" fill="var(--panel-2)" stroke="var(--fig)"></rect><text x="705" y="46" text-anchor="middle" fill="var(--fig)" font-size="12" font-weight="600">RoutingStrategy</text><text x="705" y="60" text-anchor="middle" fill="var(--faint)" font-size="10">PathBased · HeaderBased</text></g>
+
+          <g data-node style="cursor:pointer" data-title="AuthStrategy (2 impls)" data-detail="<b>Path:</b> <code>strategy/auth/</code>.<br><b>Interface:</b> <code>AuthResult authenticate(HttpRequest)</code>.<br><b>Impls:</b><br>• <code>JwtAuthStrategy(roleMap)</code> — decodes header.payload.signature; verifies signature via JWKS; extracts <code>sub</code> → principal; roleMap maps principal → roles.<br>• <code>ApiKeyAuthStrategy</code> — lookup API key in trusted keystore; each key maps to principal + roles.<br><b>Failure → AuthResult(authenticated=false, errorMessage=&quot;...&quot;)</b> which the pipeline turns into 401."><rect x="620" y="86" width="170" height="44" rx="9" fill="var(--panel-2)" stroke="var(--fig)"></rect><text x="705" y="106" text-anchor="middle" fill="var(--fig)" font-size="12" font-weight="600">AuthStrategy</text><text x="705" y="120" text-anchor="middle" fill="var(--faint)" font-size="10">JWT · ApiKey</text></g>
+
+          <g data-node style="cursor:pointer" data-title="LoadBalancingStrategy (3 impls)" data-detail="<b>Path:</b> <code>strategy/loadbalancing/</code>.<br><b>Interface:</b> <code>Optional&lt;ServiceInstance&gt; selectInstance(List&lt;ServiceInstance&gt;, HttpRequest)</code>.<br><b>Impls:</b><br>• <code>RoundRobinLoadBalancer</code> — atomic counter, <code>index = counter.getAndIncrement() % healthy.size()</code>.<br>• <code>WeightedLoadBalancer</code> — weighted random by instance.weight; for canary.<br>• <code>ConsistentHashLoadBalancer(virtualNodeCount=150)</code> — TreeMap ring; <code>hash(request.path)</code> → <code>ring.ceilingEntry</code>; wrap around if null. FNV-1a hash. Cache-affinity.<br><b>Section D — tabs with real code.</b>"><rect x="620" y="150" width="170" height="44" rx="9" fill="var(--panel-2)" stroke="var(--fig)"></rect><text x="705" y="170" text-anchor="middle" fill="var(--fig)" font-size="12" font-weight="600">LoadBalancingStrategy</text><text x="705" y="184" text-anchor="middle" fill="var(--faint)" font-size="10">RR · Weighted · Consistent-Hash</text></g>
+
+          <g data-node style="cursor:pointer" data-title="TrafficStrategy (2 impls · canary)" data-detail="<b>Path:</b> <code>strategy/traffic/</code>.<br><b>Interface:</b> <code>String selectVersion(HttpRequest, TrafficSplit)</code>.<br><b>Impls:</b><br>• <code>CanaryTrafficStrategy</code> — weighted random over versions. Example: <code>{v1: 95, v2: 5}</code> → v2 gets ~5 % of traffic. Uses ThreadLocalRandom on <code>[0, totalWeight)</code>, iterates accumulating.<br>• <code>HeaderBasedTrafficStrategy</code> — <code>X-Canary: true</code> → force v2. For targeted testing (internal QA, specific customer).<br><b>Section E — tabs.</b>"><rect x="620" y="210" width="170" height="44" rx="9" fill="var(--panel-2)" stroke="var(--fig)"></rect><text x="705" y="230" text-anchor="middle" fill="var(--fig)" font-size="12" font-weight="600">TrafficStrategy</text><text x="705" y="244" text-anchor="middle" fill="var(--faint)" font-size="10">Canary · HeaderBased</text></g>
+
+        </svg>
+      </div>
+      <div class="node-detail"><span class="nd-title">Click any class</span><div class="nd-body">Its file path, method signatures, and how it plugs into the pipeline appear here.</div></div>
+    </div>
+  </section>
+
+  <!-- B · GATEWAY PIPELINE CODE -->
+  <section>
+    <div class="sec-h"><span class="n">B</span><h2>The full 10-step pipeline — <code>GatewayService.handleRequest</code></h2><span class="tag">grounded in real code</span></div>
+    <div class="card">
+      <div class="kicker">from <code>service/GatewayService.java</code></div>
+      <pre class="code">public HttpResponse handleRequest(HttpRequest request) {
+  String traceId = UUID.randomUUID().toString().substring(0, 8);
+
+  <span class="cm">// Step 1: Create request context</span>
+  RequestContext ctx = new RequestContext(request);
+
+  <span class="cm">// Step 2: Route matching</span>
+  Optional&lt;Route&gt; matchedRoute = routingService.matchRoute(request);
+  if (matchedRoute.isEmpty()) return buildErrorResponse(404, "No route", traceId);
+  Route route = matchedRoute.get();
+  ctx.setRoute(route);
+
+  <span class="cm">// Step 3: Authentication</span>
+  AuthResult authResult = authService.authenticate(request);
+  if (!authResult.isAuthenticated()) return buildErrorResponse(401, "...", traceId);
+  ctx.setAuthResult(authResult);
+
+  <span class="cm">// Step 4: Authorization</span>
+  if (!authService.authorize(authResult, route)) return buildErrorResponse(403, "...", traceId);
+
+  <span class="cm">// Step 5: Rate limiting</span>
+  RateLimitResult rl = rateLimitService.checkRouteRateLimit(ctx);
+  if (!rl.isAllowed()) return buildErrorResponse(429, "Rate limit", traceId);
+
+  <span class="cm">// Step 6: Circuit breaker check</span>
+  String targetService = route.getTargetService();
+  if (!circuitBreakerService.allowRequest(targetService))
+      return buildErrorResponse(503, "Circuit OPEN", traceId);
+
+  <span class="cm">// Step 7: Load balancer — select instance</span>
+  Optional&lt;ServiceInstance&gt; instance = loadBalancerService.selectInstance(targetService, request);
+  if (instance.isEmpty()) return buildErrorResponse(503, "No healthy instances", traceId);
+
+  <span class="cm">// Step 8: Forward to upstream (simulated 10–100 ms latency, 5 % failure)</span>
+  long latencyMs = ThreadLocalRandom.current().nextLong(10, 101);
+  boolean requestFailed = ThreadLocalRandom.current().nextDouble() &lt; 0.05;
+
+  <span class="cm">// Step 9: Record success/failure in circuit breaker</span>
+  if (requestFailed) {
+    circuitBreakerService.recordFailure(targetService);
+    return buildErrorResponse(502, "Upstream error", traceId);
+  }
+  circuitBreakerService.recordSuccess(targetService);
+
+  <span class="cm">// Step 10: Build response with traceId header</span>
+  return new HttpResponse.Builder(200)
+      .body("{\"service\":\"" + targetService + "\", ...}")
+      .header("X-Trace-Id", traceId)
+      .header("X-Gateway-Service", targetService)
+      .header("X-Gateway-Instance", instance.get().getAddress())
+      .latencyMs(latencyMs)
+      .build();
+}</pre>
+    </div>
+    <div class="callout tip"><b>Fail-fast ordering matters:</b> route (cheap, in-memory) → auth (JWT verify, ~0.5 ms) → rate-limit (~0.01 ms) → circuit-breaker (~0.001 ms) → LB (~0.01 ms) → forward. Cheapest &amp; most-likely-to-reject filters run first. A rate-limited client never pays the JWT verify cost, and a rate-limited client of an OPEN circuit never even reaches LB.</div>
+  </section>
+
+  <!-- C · ROUTING STRATEGY TABS -->
+  <section>
+    <div class="sec-h"><span class="n">C</span><h2>Routing strategy — how ties are broken</h2><span class="tag">specificity score → longest wins</span></div>
+    <div data-tabscope>
+      <div class="tabs">
+        <div class="tab active" data-tab="path-based">PathBasedRoutingStrategy</div>
+        <div class="tab" data-tab="header-based">HeaderBasedRoutingStrategy</div>
+        <div class="tab" data-tab="routing-cmp">specificity table</div>
+      </div>
+      <div class="tabpanel active" data-panel="path-based">
+        <div class="kicker">from <code>strategy/routing/PathBasedRoutingStrategy.java</code></div>
+        <pre class="code">public Optional&lt;Route&gt; route(HttpRequest request, List&lt;Route&gt; matchingRoutes) {
+  if (matchingRoutes == null || matchingRoutes.isEmpty()) return Optional.empty();
+
+  return matchingRoutes.stream()
+      .sorted(Comparator
+          .comparingInt(this::specificityScore).reversed()
+          .thenComparing(Comparator
+              .comparingInt((Route r) -&gt; r.getPathPattern().length()).reversed()))
+      .findFirst();
+}
+
+private int specificityScore(Route route) {
+  String pattern = route.getPathPattern();
+  if (pattern.equals("/**") || pattern.equals("**")) return 0;    <span class="cm">// catch-all</span>
+  boolean hasWildcard = pattern.contains("*");
+  if (!hasWildcard) return 100;                                    <span class="cm">// exact match</span>
+  long wildcardCount = pattern.chars().filter(ch -&gt; ch == '*').count();
+  return (int) (50 - wildcardCount);
+}</pre>
+      </div>
+      <div class="tabpanel" data-panel="header-based">
+        <div class="kicker">from <code>strategy/routing/HeaderBasedRoutingStrategy.java</code></div>
+        <p>Selects the route whose metadata includes a required header condition matched by the request. Example use: <code>X-API-Version: v2</code> → route to v2-service. Falls back to path-based if no header conditions match.</p>
+        <pre class="code">public Optional&lt;Route&gt; route(HttpRequest request, List&lt;Route&gt; matchingRoutes) {
+  return matchingRoutes.stream()
+      .filter(r -&gt; matchesHeader(request, r))
+      .findFirst();
+}</pre>
+      </div>
+      <div class="tabpanel" data-panel="routing-cmp">
+        <table>
+          <thead><tr><th>Path pattern</th><th>Type</th><th>Specificity score</th><th>Wins tie against</th></tr></thead>
+          <tbody>
+            <tr><td><code>/api/users/123</code></td><td>exact</td><td>100</td><td>anything with wildcards</td></tr>
+            <tr><td><code>/api/users/*/profile</code></td><td>one wildcard</td><td>49</td><td><code>/api/users/**</code></td></tr>
+            <tr><td><code>/api/users/**</code></td><td>catch-all subtree</td><td>48</td><td><code>/api/**</code></td></tr>
+            <tr><td><code>/api/**</code></td><td>broader catch-all</td><td>48 (length wins)</td><td><code>/**</code></td></tr>
+            <tr><td><code>/**</code></td><td>global catch-all</td><td>0</td><td>fallback only</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+
+  <!-- D · LOAD BALANCING STRATEGY TABS -->
+  <section>
+    <div class="sec-h"><span class="n">D</span><h2>Load-balancing strategy — Strategy pattern (3 impls)</h2><span class="tag">swap via <code>AppConfig.setLoadBalancingStrategy()</code></span></div>
+    <div data-tabscope>
+      <div class="tabs">
+        <div class="tab active" data-tab="rr">RoundRobinLoadBalancer</div>
+        <div class="tab" data-tab="weighted">WeightedLoadBalancer</div>
+        <div class="tab" data-tab="chash">ConsistentHashLoadBalancer</div>
+        <div class="tab" data-tab="lb-cmp">when to use which</div>
+      </div>
+      <div class="tabpanel active" data-panel="rr">
+        <div class="kicker">from <code>strategy/loadbalancing/RoundRobinLoadBalancer.java</code></div>
+        <pre class="code">private final AtomicInteger counter = new AtomicInteger(0);
+
+public Optional&lt;ServiceInstance&gt; selectInstance(List&lt;ServiceInstance&gt; instances, HttpRequest req) {
+  if (instances == null || instances.isEmpty()) return Optional.empty();
+
+  <span class="cm">// Step 1: filter to healthy instances</span>
+  List&lt;ServiceInstance&gt; healthy = instances.stream()
+      .filter(ServiceInstance::isHealthy).toList();
+  if (healthy.isEmpty()) return Optional.empty();
+
+  <span class="cm">// Step 2: atomic round-robin selection</span>
+  int index = Math.abs(counter.getAndIncrement() % healthy.size());
+  return Optional.of(healthy.get(index));
+}</pre>
+        <p class="muted"><b>Default choice.</b> Simple, thread-safe via <code>AtomicInteger</code>. Distributes evenly assuming instances are equally powerful and requests are roughly equal cost.</p>
+      </div>
+      <div class="tabpanel" data-panel="weighted">
+        <div class="kicker">from <code>strategy/loadbalancing/WeightedLoadBalancer.java</code></div>
+        <p>Weighted random selection using instance <code>weight</code> field. Instance with weight=3 gets 3× the traffic of weight=1.</p>
+        <pre class="code"><span class="cm">// Simplified logic (real impl uses cumulative distribution)</span>
+int totalWeight = healthy.stream().mapToInt(ServiceInstance::getWeight).sum();
+int r = ThreadLocalRandom.current().nextInt(totalWeight);
+int acc = 0;
+for (ServiceInstance i : healthy) {
+  acc += i.getWeight();
+  if (acc &gt; r) return Optional.of(i);
+}</pre>
+        <p class="muted"><b>When:</b> canary deploys (v1 weight=95, v2 weight=5) — same code path, different weights. Also for heterogeneous instance sizes (large instances get more traffic).</p>
+      </div>
+      <div class="tabpanel" data-panel="chash">
+        <div class="kicker">from <code>strategy/loadbalancing/ConsistentHashLoadBalancer.java</code></div>
+        <pre class="code">private static final int DEFAULT_VIRTUAL_NODE_COUNT = 150;
+
+public Optional&lt;ServiceInstance&gt; selectInstance(List&lt;ServiceInstance&gt; instances, HttpRequest req) {
+  List&lt;ServiceInstance&gt; healthy = instances.stream()
+      .filter(ServiceInstance::isHealthy).toList();
+  if (healthy.isEmpty()) return Optional.empty();
+
+  <span class="cm">// Step 1: build the hash ring with virtual nodes (150 per instance)</span>
+  TreeMap&lt;Integer, ServiceInstance&gt; ring = buildRing(healthy);
+
+  <span class="cm">// Step 2: hash the request path and find ceiling on the ring</span>
+  int requestHash = hash(req.getPath());
+  Map.Entry&lt;Integer, ServiceInstance&gt; entry = ring.ceilingEntry(requestHash);
+
+  <span class="cm">// Step 3: wrap around if past the last node (ring is circular)</span>
+  if (entry == null) entry = ring.firstEntry();
+
+  return Optional.of(entry.getValue());
+}
+
+private int hash(String key) {                <span class="cm">// FNV-1a</span>
+  int h = 0x811c9dc5;
+  for (int i = 0; i &lt; key.length(); i++) { h ^= key.charAt(i); h *= 0x01000193; }
+  return h &amp; 0x7FFFFFFF;
+}</pre>
+        <p class="muted"><b>When:</b> cache-affinity — the same request path always routes to the same instance, so its local cache stays warm. Also for sticky sessions where you want (userId → same instance) without cookies.</p>
+      </div>
+      <div class="tabpanel" data-panel="lb-cmp">
+        <table>
+          <thead><tr><th>Strategy</th><th>Distribution</th><th>Best for</th><th>Cost of add/remove instance</th></tr></thead>
+          <tbody>
+            <tr><td><b>RoundRobin</b></td><td>uniform</td><td>stateless services, equal-cost requests</td><td>immediate — next request rebalances</td></tr>
+            <tr><td><b>Weighted</b></td><td>by weight</td><td>canary deploys, mixed instance sizes</td><td>immediate</td></tr>
+            <tr><td><b>ConsistentHash</b></td><td>by hash(key)</td><td>cache-affinity, sticky sessions</td><td>only ~1/N keys shuffle (150 vnodes smooths distribution)</td></tr>
+          </tbody>
+        </table>
+        <p class="muted"><b>Interview answer:</b> RR default. Switch to Weighted for canary; switch to ConsistentHash if the target service has an expensive local cache (e.g., feature store, per-user model).</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- E · CIRCUIT BREAKER TABS -->
+  <section>
+    <div class="sec-h"><span class="n">E</span><h2>Circuit breaker — 3-state machine</h2><span class="tag">the resilience keystone</span></div>
+    <div data-tabscope>
+      <div class="tabs">
+        <div class="tab active" data-tab="cb-code">allowRequest() code</div>
+        <div class="tab" data-tab="cb-states">state transitions</div>
+        <div class="tab" data-tab="cb-defaults">defaults &amp; tuning</div>
+      </div>
+      <div class="tabpanel active" data-panel="cb-code">
+        <div class="kicker">from <code>engine/CircuitBreakerEngine.java</code></div>
+        <pre class="code">public boolean allowRequest(String serviceName) {
+  CircuitBreakerState breaker = getOrCreate(serviceName);
+  CircuitState state = breaker.getState();
+
+  switch (state) {
+    case CLOSED -&gt; { return true; }
+    case OPEN -&gt; {
+      if (breaker.shouldAttemptReset()) {
+        breaker.halfOpen();
+        System.out.println("[CB] " + serviceName + ": OPEN -&gt; HALF_OPEN (attempting reset)");
+        return true;                       <span class="cm">// allow ONE test request</span>
+      }
+      return false;                        <span class="cm">// still cooling down → deny</span>
+    }
+    case HALF_OPEN -&gt; { return true; }     <span class="cm">// test request in flight</span>
+    default -&gt; { return false; }
+  }
+}
+
+public void recordSuccess(String serviceName) {
+  breaker.recordSuccess();
+  <span class="cm">// If HALF_OPEN and successCount == SUCCESS_THRESHOLD → transition to CLOSED</span>
+}
+
+public void recordFailure(String serviceName) {
+  breaker.recordFailure();
+  <span class="cm">// If CLOSED and failureCount == FAILURE_THRESHOLD → trip to OPEN</span>
+  <span class="cm">// If HALF_OPEN → immediately trip back to OPEN (recovery failed)</span>
+}</pre>
+      </div>
+      <div class="tabpanel" data-panel="cb-states">
+        <table>
+          <thead><tr><th>From</th><th>To</th><th>Trigger</th></tr></thead>
+          <tbody>
+            <tr><td>CLOSED</td><td>OPEN</td><td>failureCount hits FAILURE_THRESHOLD (default 5 consecutive failures)</td></tr>
+            <tr><td>OPEN</td><td>HALF_OPEN</td><td>OPEN_DURATION_MS elapsed (default 30 s) — next request is a probe</td></tr>
+            <tr><td>HALF_OPEN</td><td>CLOSED</td><td>successCount hits SUCCESS_THRESHOLD (default 3 consecutive successes)</td></tr>
+            <tr><td>HALF_OPEN</td><td>OPEN</td><td>ANY failure during probe → back to cooldown</td></tr>
+            <tr><td>CLOSED</td><td>CLOSED</td><td>successCount tracks; failure resets it to 0</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="tabpanel" data-panel="cb-defaults">
+        <table>
+          <thead><tr><th>Constant</th><th>Default</th><th>Trade-off if you change it</th></tr></thead>
+          <tbody>
+            <tr><td><code>DEFAULT_FAILURE_THRESHOLD</code></td><td>5</td><td>Lower → trips faster (may over-react to transient blips). Higher → slower to protect callers.</td></tr>
+            <tr><td><code>DEFAULT_SUCCESS_THRESHOLD</code></td><td>3</td><td>Lower → recovers faster (risk of premature CLOSED). Higher → slower to fully recover.</td></tr>
+            <tr><td><code>DEFAULT_OPEN_DURATION_MS</code></td><td>30_000 (30 s)</td><td>Lower → probes more often (thundering-herd risk). Higher → outages last longer than needed.</td></tr>
+          </tbody>
+        </table>
+        <p class="muted"><b>Advanced:</b> production circuit breakers use <b>error-rate percentage</b> (e.g., open if &gt;50 % of last 100 requests failed) rather than consecutive-count — more robust to sparse-traffic services.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- F · CALL CHAINS -->
+  <section>
+    <div class="sec-h"><span class="n">F</span><h2>Request sequences (call chains)</h2><span class="tag">who calls whom</span></div>
+    <div class="grid g2">
+      <div class="card">
+        <div class="kicker">north-south — <code>handleRequest</code></div>
+        <pre class="code">Controller.handleRequest(HttpRequest)
+  → GatewayService.handleRequest(request)     <span class="cm">// FACADE</span>
+    1. new RequestContext(request) + traceId
+    2. routingService.matchRoute(request)
+         → requestRouter.findMatching(request)
+         → routingStrategy.route(request, matches)
+             → PathBasedRoutingStrategy sorts by specificityScore
+    3. authService.authenticate(request)
+         → authStrategy.authenticate(request)
+             → JwtAuthStrategy: decode + verify signature + extract sub
+    4. authService.authorize(authResult, route)
+         → check route.metadata("required-role") vs authResult.roles
+    5. rateLimitService.checkRouteRateLimit(ctx)
+         → rateLimiterEngine.tryAcquire(clientId, routeId)
+    6. circuitBreakerService.allowRequest(targetService)
+         → circuitBreakerEngine.allowRequest(name)  <span class="cm">// state machine</span>
+    7. loadBalancerService.selectInstance(target, request)
+         → serviceRegistry.getHealthyInstances(target)
+         → loadBalancingStrategy.selectInstance(healthy, request)
+             → RoundRobin: counter.getAndIncrement() % healthy.size()
+    8. (simulated) forward — Thread.sleep(latencyMs)
+    9. circuitBreakerService.recordSuccess/Failure(target)
+    10. new HttpResponse.Builder(200)
+          .header("X-Trace-Id", traceId)
+          .header("X-Gateway-Service", target)
+          .header("X-Gateway-Instance", instance.getAddress())
+          .build()</pre>
+      </div>
+      <div class="card">
+        <div class="kicker">east-west — <code>ServiceMeshService.proxyRequest</code></div>
+        <pre class="code">callerSvc.callHttp(target)
+  → sidecar intercepts (iptables/eBPF)
+    → serviceMeshService.proxyRequest(callerSvc, targetSvc, req)
+      1. if (meshConfig.isMtlsEnabled())
+           tlsEngine.validateConnection(caller, target)
+             → validate certs (SPIFFE ID) → PASSED / FAILED (403)
+      2. circuitBreakerService.allowRequest(target)
+           → CLOSED = true; OPEN = false (503)
+      3. loadBalancerService.selectInstance(target, req)
+           → 503 if no healthy instances
+      4. Thread.sleep(5–50 ms)  <span class="cm">// simulated forward</span>
+         boolean failed = random &lt; 0.05
+      5. circuitBreakerService.recordSuccess/Failure(target)
+      6. new HttpResponse.Builder(200)
+           .header("X-Mesh-Source", callerSvc)
+           .header("X-Mesh-Target", targetSvc)
+           .header("X-Mesh-Instance", instance.getAddress())
+           .build()</pre>
+      </div>
+    </div>
+  </section>
+
+  <!-- GLOSSARY -->
+  <section>
+    <div class="sec-h"><span class="n">§</span><h2>File map + Glossary</h2></div>
+    <div class="grid g2">
+      <div class="card">
+        <div class="kicker">file map — <code>19-api-gateway-service-mesh/src/main/java/com/systemdesign/gateway/</code></div>
+        <pre class="code">config/AppConfig.java              <span class="cm">// composition root</span>
+controller/GatewayController.java  <span class="cm">// HTTP adapter</span>
+service/GatewayService.java        <span class="cm">// FACADE · handleRequest</span>
+service/RoutingService.java
+service/AuthService.java
+service/RateLimitService.java
+service/CircuitBreakerService.java
+service/LoadBalancerService.java
+service/ServiceMeshService.java    <span class="cm">// sidecar simulation</span>
+engine/RequestRouter.java
+engine/CircuitBreakerEngine.java   <span class="cm">// state machine</span>
+engine/RateLimiterEngine.java      <span class="cm">// token bucket</span>
+engine/ServiceRegistry.java        <span class="cm">// instances + health</span>
+engine/TlsEngine.java              <span class="cm">// mTLS validate</span>
+strategy/routing/{RoutingStrategy, PathBased, HeaderBased}
+strategy/auth/{AuthStrategy, JwtAuthStrategy, ApiKeyAuthStrategy}
+strategy/loadbalancing/{LoadBalancingStrategy, RoundRobin,
+                        Weighted, ConsistentHash}
+strategy/traffic/{TrafficStrategy, Canary, HeaderBased}
+repository/{Route,ServiceInstance}Repository + InMemory impls
+model/{HttpRequest, HttpResponse, Route, ServiceInstance,
+       RequestContext, AuthResult, RateLimitResult,
+       CircuitBreakerState, CircuitState, HealthStatus,
+       HttpMethod, GatewayFilter, RetryPolicy,
+       ServiceMeshConfig, TrafficSplit}
+exception/{GatewayException, RateLimitExceededException,
+           RouteNotFoundException, ServiceUnavailableException}</pre>
+      </div>
+      <div class="card">
+        <div class="kicker">glossary</div>
+        <table><tbody>
+          <tr><td><b>Facade</b></td><td>GatewayService — one door for all 10 pipeline steps</td></tr>
+          <tr><td><b>Composition root</b></td><td>AppConfig — the only place with <code>new ConcreteClass()</code></td></tr>
+          <tr><td><b>Strategy pattern</b></td><td>4 families: Routing, Auth, LoadBalancing, Traffic — each pluggable</td></tr>
+          <tr><td><b>State machine</b></td><td>CircuitBreakerEngine — CLOSED / OPEN / HALF_OPEN transitions</td></tr>
+          <tr><td><b>Token bucket</b></td><td>RateLimiterEngine — capacity + refill rate, deny when empty</td></tr>
+          <tr><td><b>Repository</b></td><td>Route + ServiceInstance — interface + in-memory impl, swappable for etcd/Consul</td></tr>
+          <tr><td><b>Sidecar</b></td><td>ServiceMeshService — Envoy-style proxy in the same pod as the service</td></tr>
+          <tr><td><b>TraceId propagation</b></td><td>UUID.substring(0, 8) generated at step 1, added to every response header</td></tr>
+        </tbody></table>
+      </div>
+    </div>
+  </section>
+
+  <footer>
+    <p>Use case 19 · API Gateway &amp; Service Mesh — Canvas 2 of 3 (LLD). All classes verified against real Java under <code>19-api-gateway-service-mesh/src/</code>. No invented method signatures.</p>
+    <p class="run"><a href="hld.html">← Canvas 1 · HLD</a> · Canvas 2 · LLD · <a href="deepdive.html">Canvas 3 · Deep-dive &amp; Trade-offs →</a> &nbsp;|&nbsp; <a href="../index.html">Hub</a></p>
+  </footer>
+
+</div>
+<script src="../assets/canvas.js"></script>
+</body>
+</html>

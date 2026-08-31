@@ -1,0 +1,386 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>10 · E-Commerce — HLD</title>
+<link rel="stylesheet" href="../assets/canvas.css">
+</head>
+<body>
+
+<div class="wrap">
+
+  <header class="hero">
+    <h1>E-Commerce (Amazon-scale) — High-Level Design</h1>
+    <div class="sub">Use case 10 · Canvas 1 of 3. Two planes, one design: the <b>browse plane</b> (AP — cache-heavy, stale OK) and the <b>checkout plane</b> (CP — Saga: reserve inventory → charge payment → create shipment, compensate in reverse on failure). Idempotency keys make payments effectively exactly-once. Redis <code>DECR</code> gates flash-sale traffic before it hits the DB. Click a component, then step both flows.</div>
+    <div class="badges">
+      <span class="badge lvl">Use case 10 · HLD</span>
+      <span class="badge">Canvas 1 of 3</span>
+      <span class="badge">interactive</span>
+      <span class="badge">Saga · CQRS · Idempotency</span>
+      <span class="badge">35 K orders/sec (Black Friday)</span>
+    </div>
+    <div class="legend">
+      <span><i class="dot" style="background:var(--eden)"></i> client / entry</span>
+      <span><i class="dot" style="background:var(--survivor)"></i> facades &amp; services</span>
+      <span><i class="dot" style="background:var(--fig)"></i> saga participants</span>
+      <span><i class="dot" style="background:var(--old)"></i> data stores</span>
+      <span><i class="dot" style="background:var(--warn)"></i> events / async / external</span>
+    </div>
+  </header>
+
+  <!-- A · PROBLEM & REQUIREMENTS -->
+  <section>
+    <div class="sec-h"><span class="n">A</span><h2>Problem &amp; requirements</h2><span class="tag">browse vs checkout — different CAP</span></div>
+    <div class="grid g2">
+      <div class="card">
+        <div class="kicker">functional</div>
+        <ul class="tight">
+          <li><b>Catalog browse / search</b> — 500 M SKUs, keyword + category filters; p99 &lt; 200 ms.</li>
+          <li><b>Cart</b> — add / remove / update; price snapshot at add time; persistent across sessions.</li>
+          <li><b>Checkout</b> — validate stock, compute totals, charge payment, create shipment; <b>saga with compensation</b>.</li>
+          <li><b>Order lifecycle</b> — <code>CREATED → INVENTORY_RESERVED → PAYMENT_CONFIRMED → SHIPPED → DELIVERED</code> state machine; also <code>CANCELLED / REFUNDED</code>.</li>
+          <li><b>Payment</b> — idempotent charge (Stripe/UPI); refunds on cancellation; retry on gateway 5xx.</li>
+          <li><b>Inventory</b> — <b>never oversell</b>. Reserve → confirm (on paid) OR release (on failed / TTL expiry).</li>
+          <li><b>Shipping</b> — create shipment record, hand off to carrier, track status.</li>
+          <li><b>Notification</b> — order confirmed / shipped / delivered / cancelled → email + push (async).</li>
+          <li><b>Graceful degradation</b> — under spike, checkout switches from sync HTTP to queued SQS (return 202 + poll).</li>
+        </ul>
+      </div>
+      <div class="card">
+        <div class="kicker">non-functional</div>
+        <ul class="tight">
+          <li><b>Catalog latency</b> p99 &lt; 200 ms · <b>search throughput</b> 500 K QPS peak (CDN + ES).</li>
+          <li><b>Checkout latency</b> p99 &lt; 2 s (payment is the bottleneck).</li>
+          <li><b>Order throughput</b> 3.5 K/s avg; <b>35 K/s Black Friday</b> (10× spike).</li>
+          <li><b>Availability</b> 99.99 % browse (AP) · 99.9 % checkout (CP — refuse if unsure).</li>
+          <li><b>Inventory</b> strong consistency — a phantom oversell costs money + trust.</li>
+          <li><b>Payment</b> <b>exactly-once effect</b> via idempotency key (never double-charge).</li>
+          <li><b>Read : write ≈ 1 000 : 1</b> for catalog — optimise the read path aggressively.</li>
+          <li><b>Cart</b> AP — stale merge better than empty cart.</li>
+          <li><b>Recovery</b> compensation must be idempotent (release ×2 == release ×1).</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <!-- B · ESTIMATION -->
+  <section>
+    <div class="sec-h"><span class="n">B</span><h2>Capacity estimation</h2><span class="tag">200 M DAU · 100 M orders/day</span></div>
+    <div class="chips">
+      <div class="chip"><span class="k">Catalog size</span><span class="v">500 M SKUs (~2.5 TB metadata)</span></div>
+      <div class="chip"><span class="k">Daily active users</span><span class="v">200 M</span></div>
+      <div class="chip"><span class="k">Daily page views</span><span class="v">1 B</span></div>
+      <div class="chip"><span class="k">Daily orders</span><span class="v">100 M</span></div>
+      <div class="chip"><span class="k">Avg order value</span><span class="v">$50 · 3 items</span></div>
+      <div class="chip"><span class="k">Order QPS (avg → peak)</span><span class="v">~1 200 → ~3 500/s</span></div>
+      <div class="chip"><span class="k">Black Friday peak</span><span class="v">~35 000 orders/s (10×)</span></div>
+      <div class="chip"><span class="k">Cart ops / day</span><span class="v">500 M</span></div>
+      <div class="chip"><span class="k">Search QPS (peak)</span><span class="v">500 K/s</span></div>
+      <div class="chip"><span class="k">Payment records / day</span><span class="v">100 M (~50 GB)</span></div>
+      <div class="chip"><span class="k">Kafka event peak</span><span class="v">~500 K events/s</span></div>
+      <div class="chip"><span class="k">Concurrent users (peak)</span><span class="v">20 M</span></div>
+    </div>
+    <div class="callout tip"><b>Why the checkout number is small but scary:</b> 3.5 K orders/s is trivial in isolation — but each order is a <b>3-service distributed transaction</b> (inventory → payment → shipping) with strong-consistency requirements. If any step hangs at 500 ms you serialize the whole tree; if payment is down you must compensate reversed. That's why the saga (not 2PC) exists.</div>
+    <div class="callout warn"><b>The 35 K/s Black Friday problem:</b> 10× spike + hot SKUs (top 100 products get 80 % of orders) → one Postgres row lock destroys the fleet. Mitigations: <b>Redis <code>DECR</code></b> gate in front of the DB, <b>queue-based checkout</b> (HTTP 202 + SQS FIFO), <b>circuit breaker</b> on the sold-out product returning 503 with a 60 s CDN cache.</div>
+  </section>
+
+  <!-- C · INTERACTIVE ARCHITECTURE -->
+  <section data-flowscope>
+    <div class="sec-h"><span class="n">C</span><h2>Architecture — click components, then step both flows</h2><span class="tag">browse plane (AP) + checkout saga (CP)</span></div>
+    <div>
+      <div class="arch">
+        <svg viewBox="0 0 900 560" width="100%" style="max-width:900px" role="img" aria-label="E-commerce architecture — browse + checkout saga">
+          <defs>
+            <marker id="ah10" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" fill="var(--muted)"></path></marker>
+            <marker id="ah10w" markerWidth="10" markerHeight="10" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" fill="var(--warn)"></path></marker>
+          </defs>
+          <!-- Grid: 3 cols (x=20, x=330, x=640 · w=240 each), 7 rows (y=30, 105, 180, 255, 330, 405, 480 · h=54).
+               Gutters at x=260-330 (70 px) and x=570-640 (70 px). Row-gaps 21 px.
+               Mid-y per row: 57, 132, 207, 282, 357, 432, 507. -->
+
+          <!-- Clients → CDN (image cache, standing edge, dashed) -->
+          <line class="arrow" x1="140" y1="84" x2="140" y2="105" stroke="var(--muted)" stroke-width="1.2" stroke-dasharray="4 3" marker-end="url(#ah10)"></line>
+
+          <!-- ═══════ browse (4 steps) + shared checkout step 1 ═══════ -->
+          <!-- B1 / C1 — Clients → API Gateway (L-path through left gutter, skips CDN) -->
+          <path class="arrow" d="M260,57 L295,57 L295,207 L330,207" fill="none" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah10)"
+                data-flow="browse checkout" data-browse="1" data-checkout="1"
+                data-desc-browse="Client sends GET /api/products?q=... (JWT). CDN handled 80 % of image traffic already; this is the API call."
+                data-desc-checkout="Client sends POST /api/checkout with idempotency key. JWT auth + rate-limit at the gateway."></path>
+
+          <!-- B2 — API Gateway → ProductService (diagonal across col1-2 gutter, row 3 → row 1) -->
+          <line class="arrow" x1="330" y1="200" x2="570" y2="60" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah10)"
+                data-flow="browse" data-browse="2"
+                data-desc-browse="Gateway routes to ProductService (stateless). Auth done, rate limit checked (300 searches/user/min)."></line>
+
+          <!-- B3 — ProductService → Product Store (row 1 horizontal via gutter 2) -->
+          <line class="arrow" x1="570" y1="57" x2="640" y2="57" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah10)"
+                data-flow="browse" data-browse="3"
+                data-desc-browse="ProductService queries Elasticsearch for keyword + facets (5–20 ms). Cache-miss for details → Product DB (PG) via the same node. Redis L2 cache 95 % hit."></line>
+
+          <!-- B4 — Response back (dashed arc above row 1, Product Store → Clients) -->
+          <path class="arrow" d="M760,30 C 500,-5 200,-5 90,25" fill="none" stroke="var(--muted)" stroke-width="1.5" stroke-dasharray="4 3" marker-end="url(#ah10)"
+                data-flow="browse" data-browse="4"
+                data-desc-browse="Response returned to client. Redis cache warmed (5 min TTL). 200 OK in ~50 ms p99. CDN caches the JSON at edge for 30 s."></path>
+
+          <!-- ═══════ checkout (10 steps) ═══════ -->
+          <!-- C2 — API Gateway → OrderService (row 3 horizontal via gutter 1) -->
+          <line class="arrow" x1="260" y1="207" x2="330" y2="207" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah10)"
+                data-flow="checkout" data-checkout="2"
+                data-desc-checkout="Gateway routes POST /checkout to OrderService (the Facade). Idempotency key stored in header — replayed request returns the same result."></line>
+
+          <!-- C3 — OrderService → CartService (col 2 vertical upward, dashed = read cart) -->
+          <line class="arrow" x1="450" y1="180" x2="450" y2="159" stroke="var(--muted)" stroke-width="1.5" stroke-dasharray="4 3" marker-end="url(#ah10)"
+                data-flow="checkout" data-checkout="3"
+                data-desc-checkout="OrderService calls CartService.checkout(userId) — builds Order from cart items with a price snapshot. Read from Redis (~1 ms)."></line>
+
+          <!-- C4 — ★ OrderService → SagaOrchestrator (STAR — warn colour + halo label) -->
+          <line class="arrow" x1="450" y1="234" x2="450" y2="255" stroke="var(--warn)" stroke-width="2.5" marker-end="url(#ah10w)"
+                data-flow="checkout" data-checkout="4"
+                data-desc-checkout="OrderService.placeOrder invokes SagaOrchestrator.execute(order). Entry point into the 3-step distributed transaction."></line>
+          <text class="edge-label" x="500" y="247" text-anchor="start" fill="var(--warn)" font-weight="700" font-size="10">execute(order)</text>
+
+          <!-- C5 — Saga → InventoryService · Step 1 (col 2 vertical down) -->
+          <line class="arrow" x1="450" y1="309" x2="450" y2="330" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah10)"
+                data-flow="checkout" data-checkout="5"
+                data-desc-checkout="Saga Step 1: for each line item → inventoryService.reserve(productId, qty). Increments reservedStock (synchronized in code; DynamoDB conditional write / Redis DECR in prod). Fail here → return 409 (no compensation needed)."></line>
+
+          <!-- C6 — Saga → PaymentService · Step 2 (routed via right gutter at x=595, skips InvSvc) -->
+          <path class="arrow" d="M570,270 L595,270 L595,432 L570,432" fill="none" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah10)"
+                data-flow="checkout" data-checkout="6"
+                data-desc-checkout="Saga Step 2: paymentService.processPayment(order, strategy). Idempotency check on orderId first (skip if COMPLETED). Delegate to PaymentStrategy → Stripe HTTPS call (500–1 500 ms). On FAILED → compensate Step 1 (release inventory) + notify."></path>
+
+          <!-- C7 — PaymentService → External Stripe (row 6 horizontal via gutter 2) -->
+          <line class="arrow" x1="570" y1="432" x2="640" y2="432" stroke="var(--muted)" stroke-width="1.5" stroke-dasharray="4 3" marker-end="url(#ah10)"
+                data-flow="checkout" data-checkout="7"
+                data-desc-checkout="PaymentStrategy calls Stripe / UPI with the Idempotency-Key header. Stripe dedups for 24 h — a retry after network glitch returns the same charge, never a double-charge."></line>
+
+          <!-- C8 — Saga → ShippingService · Step 3 (routed via right gutter at x=615, further out than C6) -->
+          <path class="arrow" d="M570,290 L615,290 L615,507 L570,507" fill="none" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah10)"
+                data-flow="checkout" data-checkout="8"
+                data-desc-checkout="Saga Step 3: shippingService.createShipment(order). Applies ShippingStrategy (Standard $5.99 / Express $14.99). Fail here → compensate Step 2 (refundPayment) AND Step 1 (releaseInventory) in reverse."></path>
+
+          <!-- C9 — OrderService → Order + Payment DB (diagonal via gutter 2 down to row 4) -->
+          <line class="arrow" x1="570" y1="215" x2="640" y2="282" stroke="var(--muted)" stroke-width="1.5" stroke-dasharray="4 3" marker-end="url(#ah10)"
+                data-flow="checkout" data-checkout="9"
+                data-desc-checkout="OrderService persists the final Order (state = SHIPPED) to Order + Payment DB (PostgreSQL Aurora, sharded by userId). Also clears cart on success."></line>
+
+          <!-- C10 — OrderService → Kafka (row 3 horizontal via gutter 2) -->
+          <line class="arrow" x1="570" y1="207" x2="640" y2="207" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah10)"
+                data-flow="checkout" data-checkout="10"
+                data-desc-checkout="OrderService publishes order.confirmed to Kafka (transactional outbox). Downstream: NotificationService, Analytics, SearchIndexer — all consume independently at their own pace."></line>
+
+          <!-- ═══════ non-flow infra edges (dashed) ═══════ -->
+          <!-- CartService → Redis cart (row 2 horizontal, dashed) -->
+          <line class="arrow" x1="570" y1="132" x2="640" y2="132" stroke="var(--muted)" stroke-width="1.2" stroke-dasharray="2 3" marker-end="url(#ah10)"></line>
+          <!-- InventoryService → Inventory Store (row 5 horizontal, dashed) -->
+          <line class="arrow" x1="570" y1="357" x2="640" y2="357" stroke="var(--muted)" stroke-width="1.2" stroke-dasharray="2 3" marker-end="url(#ah10)"></line>
+          <!-- Kafka → Notification (async fan-out, dashed, routed via right gutter at x=625) -->
+          <path class="arrow" d="M640,225 L625,225 L625,490 L640,490" fill="none" stroke="var(--muted)" stroke-width="1.2" stroke-dasharray="2 3" marker-end="url(#ah10)"></path>
+          <text class="edge-label" x="625" y="360" text-anchor="middle" font-size="9">async fan-out</text>
+
+          <!-- ═══════ NODES ═══════ -->
+
+          <!-- Col 1 — ingress lane (Clients · CDN · API Gateway) -->
+          <g data-node style="cursor:pointer" data-title="Clients (Mobile · Web · Third-party)" data-detail="<b>Entry point.</b> iOS/Android apps, browsers, and partner APIs. Sends REST calls with JWT + <b>Idempotency-Key</b> header on writes.<br><b>Payload:</b> ~5 KB per checkout request; ~50 KB per product-page response.<br><b>Retry policy:</b> exponential backoff for 5xx; deduped by idempotency key so a retry is safe."><rect x="20" y="30" width="240" height="54" rx="9" fill="var(--panel-2)" stroke="var(--eden)"></rect><text x="140" y="55" text-anchor="middle" fill="var(--eden)" font-size="13" font-weight="600">Clients</text><text x="140" y="72" text-anchor="middle" fill="var(--faint)" font-size="11">mobile · web · partners</text></g>
+
+          <g data-node style="cursor:pointer" data-title="CDN (CloudFront / Cloud CDN)" data-detail="<b>Role:</b> global edge cache for product images (~200 KB avg), CSS/JS, and cacheable API JSON (GET /products, category listings). Keeps ~80 % of read traffic off origin.<br><b>Tech:</b> CloudFront / Cloud CDN / Azure CDN. Signed URLs for private assets.<br><b>Cache invalidation:</b> on price / stock changes, publish invalidate event → CDN purge (~5 s propagation)."><rect x="20" y="105" width="240" height="54" rx="9" fill="var(--panel-2)" stroke="var(--old)"></rect><text x="140" y="130" text-anchor="middle" fill="var(--old)" font-size="13" font-weight="600">CDN</text><text x="140" y="147" text-anchor="middle" fill="var(--faint)" font-size="11">images · GET cache</text></g>
+
+          <g data-node style="cursor:pointer" data-title="API Gateway" data-detail="<b>Role:</b> single ingress — JWT auth, per-user rate limiting (300 searches/min · 10 checkouts/min), request validation, TLS termination, WAF.<br><b>Tech:</b> AWS API Gateway / Apigee / Azure APIM.<br><b>Idempotency:</b> extracts <code>Idempotency-Key</code> header, passes to Order/Payment services. Duplicate keys within 24 h short-circuit to the stored response.<br><b>HA:</b> multi-AZ active-active, 4× overprovisioned for spikes."><rect x="20" y="180" width="240" height="54" rx="9" fill="var(--panel-2)" stroke="var(--border)"></rect><text x="140" y="205" text-anchor="middle" fill="var(--text)" font-size="13" font-weight="600">API Gateway</text><text x="140" y="222" text-anchor="middle" fill="var(--faint)" font-size="11">auth · rate-limit · WAF</text></g>
+
+          <!-- Col 2 — services + saga engine + participants -->
+          <g data-node style="cursor:pointer" data-title="ProductService (browse / search)" data-detail="<b>Role:</b> stateless read service. Handles GET /products, /products/{id}, /products/search, /products/category/{cat}.<br><b>Wraps:</b> ProductRepository (PG source of truth) + Elasticsearch (search index) + Redis (5-min hot cache).<br><b>Cache order:</b> Redis → ES / PG → warm Redis on write-through.<br><b>Scale:</b> 500 K QPS peak; 200 instances behind ALB; each ~2500 QPS steady, 3× headroom."><rect x="330" y="30" width="240" height="54" rx="9" fill="var(--panel-2)" stroke="var(--survivor)"></rect><text x="450" y="55" text-anchor="middle" fill="var(--survivor)" font-size="13" font-weight="600">ProductService</text><text x="450" y="72" text-anchor="middle" fill="var(--faint)" font-size="11">search · browse (read)</text></g>
+
+          <g data-node style="cursor:pointer" data-title="CartService (session cart)" data-detail="<b>Role:</b> add / remove / update cart items, price snapshot at add time (protects buyer from mid-session price bump).<br><b>Storage:</b> Redis hash <code>cart:{userId}</code> (7-day TTL), write-through to DynamoDB for durable persistence across devices.<br><b>Checkout coupling:</b> exposes <code>checkout(userId, method, address) → Order</code> — CartService builds the Order from current items, then OrderService takes over.<br><b>AP:</b> merge conflicts resolved by union (never lose an item)."><rect x="330" y="105" width="240" height="54" rx="9" fill="var(--panel-2)" stroke="var(--survivor)"></rect><text x="450" y="130" text-anchor="middle" fill="var(--survivor)" font-size="13" font-weight="600">CartService</text><text x="450" y="147" text-anchor="middle" fill="var(--faint)" font-size="11">price snapshot · AP merge</text></g>
+
+          <g data-node style="cursor:pointer" data-title="OrderService (Facade)" data-detail="<b>The one door for writes.</b> Method: <code>placeOrder(userId, paymentStrategy, address, shippingStrategy) → Order</code>.<br><b>Sequence:</b> (1) delegate to CartService.checkout → Order draft. (2) wire strategies onto saga + shipping. (3) invoke SagaOrchestrator.execute(order). (4) persist final Order to OrderRepository. (5) clear cart on success.<br><b>Also:</b> getOrder, getOrdersByUser, cancelOrder (state-machine guarded)."><rect x="330" y="180" width="240" height="54" rx="9" fill="var(--panel-2)" stroke="var(--survivor)"></rect><text x="450" y="205" text-anchor="middle" fill="var(--survivor)" font-size="13" font-weight="600">OrderService (Facade)</text><text x="450" y="222" text-anchor="middle" fill="var(--faint)" font-size="11">the one door · placeOrder</text></g>
+
+          <g data-node style="cursor:pointer" data-title="Saga Orchestrator (the STAR)" data-detail="<b>Role:</b> runs the 3-step distributed transaction. Not 2PC (no distributed locks). Not choreography (central visibility).<br><b>Steps:</b><br>(1) RESERVE_INVENTORY — for each item.<br>(2) PROCESS_PAYMENT — via strategy → Stripe.<br>(3) CREATE_SHIPMENT — with strategy.<br><b>Compensation matrix:</b><br>• Step 1 fail → partial release, no payment.<br>• Step 2 fail → release inventory.<br>• Step 3 fail → refund payment + release inventory.<br><b>Prod:</b> AWS Step Functions or Temporal — same shape, durable state, retries with backoff (3× inventory, 2× payment)."><rect x="330" y="255" width="240" height="54" rx="9" fill="var(--panel-2)" stroke="var(--warn)" stroke-width="2"></rect><text x="450" y="280" text-anchor="middle" fill="var(--warn)" font-size="14" font-weight="700">Saga Orchestrator</text><text x="450" y="297" text-anchor="middle" fill="var(--faint)" font-size="11">3 steps · reverse compensate</text></g>
+
+          <g data-node style="cursor:pointer" data-title="InventoryService · Saga Step 1" data-detail="<b>Role:</b> the anti-oversell gate.<br><b>Ops:</b> <code>reserve(productId, qty)</code> — synchronized check-then-act on <code>Inventory</code> (available = total − reserved). Throws <code>InsufficientStockException</code> on failure.<br><code>confirmReservation(id, qty)</code> — subtract from total AND reserved (permanent deduct).<br><code>releaseReservation(id, qty)</code> — subtract from reserved only (compensation).<br><b>Prod mapping:</b> DynamoDB conditional write <code>availableStock &gt;= :qty</code> OR Postgres <code>SELECT FOR UPDATE</code>. Flash sale: Redis <code>DECR</code> gate BEFORE the DB."><rect x="330" y="330" width="240" height="54" rx="9" fill="var(--panel-2)" stroke="var(--fig)"></rect><text x="450" y="355" text-anchor="middle" fill="var(--fig)" font-size="13" font-weight="600">InventoryService · Step 1</text><text x="450" y="372" text-anchor="middle" fill="var(--faint)" font-size="11">reserve · confirm · release</text></g>
+
+          <g data-node style="cursor:pointer" data-title="PaymentService · Saga Step 2" data-detail="<b>Role:</b> charge + refund via pluggable PaymentStrategy (CreditCard / Wallet / COD).<br><b>Idempotency guard:</b> before calling gateway, <code>paymentRepository.findByOrderId(orderId)</code> — if COMPLETED, return existing Payment (never re-charge).<br><b>External call:</b> HTTPS to Stripe/UPI with Idempotency-Key header (Stripe dedups for 24 h). Retry on 5xx with exponential backoff.<br><b>Refund:</b> <code>refundPayment(paymentId)</code> — inverse call to gateway. Compensation for Steps 2 or 3 failure."><rect x="330" y="405" width="240" height="54" rx="9" fill="var(--panel-2)" stroke="var(--fig)"></rect><text x="450" y="430" text-anchor="middle" fill="var(--fig)" font-size="13" font-weight="600">PaymentService · Step 2</text><text x="450" y="447" text-anchor="middle" fill="var(--faint)" font-size="11">idempotent charge · refund</text></g>
+
+          <g data-node style="cursor:pointer" data-title="ShippingService · Saga Step 3" data-detail="<b>Role:</b> create shipment record, hand off to carrier, update status.<br><b>Method:</b> <code>createShipment(order) → Shipment</code>. Uses ShippingStrategy for cost + ETA (Standard $5.99 / 7 days · Express $14.99 / 2 days).<br><b>Concurrent-safe:</b> uses <code>ConcurrentHashMap&lt;String, Shipment&gt;</code>.<br><b>Compensation:</b> shipment cancel is documented but not coded in Java demo — in prod, calls carrier's cancel API + updates status to CANCELLED."><rect x="330" y="480" width="240" height="54" rx="9" fill="var(--panel-2)" stroke="var(--fig)"></rect><text x="450" y="505" text-anchor="middle" fill="var(--fig)" font-size="13" font-weight="600">ShippingService · Step 3</text><text x="450" y="522" text-anchor="middle" fill="var(--faint)" font-size="11">strategy · carrier hand-off</text></g>
+
+          <!-- Col 3 — data + external + async -->
+          <g data-node style="cursor:pointer" data-title="Product Store (Postgres + Elasticsearch + Redis L2)" data-detail="<b>Product DB:</b> PostgreSQL Aurora — source of truth for 500 M SKUs; sharded by SKU range; ~2.5 TB.<br><b>Elasticsearch:</b> denormalised search index; keyword + facet queries; 5–20 ms p95.<br><b>Redis L2:</b> hot 100 K SKUs cached as JSON (5-min TTL, allkeys-lru).<br><b>Sync:</b> Debezium CDC on PG → Kafka → ES indexer + Redis warmer. Propagation 1–5 s (eventual)."><rect x="640" y="30" width="240" height="54" rx="9" fill="var(--panel-2)" stroke="var(--old)"></rect><text x="760" y="55" text-anchor="middle" fill="var(--old)" font-size="13" font-weight="600">Product Store</text><text x="760" y="72" text-anchor="middle" fill="var(--faint)" font-size="11">PG + ES + Redis L2</text></g>
+
+          <g data-node style="cursor:pointer" data-title="Redis cart (session store)" data-detail="<b>Storage:</b> Redis hash <code>cart:{userId}</code> — fields: productId → JSON <code>{qty, priceSnapshot}</code>.<br><b>TTL:</b> 7 days (enables abandoned-cart recovery).<br><b>Write-through</b> to DynamoDB for durable cross-device sync.<br><b>Cluster mode:</b> hash-slot sharded across 6 primaries; consistent hashing on userId.<br><b>AP semantics:</b> merge conflicts resolved by union (never lose an item)."><rect x="640" y="105" width="240" height="54" rx="9" fill="var(--panel-2)" stroke="var(--old)"></rect><text x="760" y="130" text-anchor="middle" fill="var(--old)" font-size="13" font-weight="600">Redis cart</text><text x="760" y="147" text-anchor="middle" fill="var(--faint)" font-size="11">cart:{userId} · 7-day TTL</text></g>
+
+          <g data-node style="cursor:pointer" data-title="Kafka (event bus + transactional outbox)" data-detail="<b>Role:</b> decouples writers from downstream consumers.<br><b>Topics:</b> order.confirmed · order.cancelled · payment.completed · payment.refunded · inventory.reserved · inventory.released.<br><b>Guarantees:</b> at-least-once, per-partition ordering (key = orderId).<br><b>Transactional outbox:</b> OrderService writes to Postgres + <code>outbox</code> table in the SAME transaction; a poller pushes outbox rows to Kafka. Guarantees no lost events + no dual-write inconsistency.<br><b>Scale:</b> 500 K events/s peak; 72 h retention for replay."><rect x="640" y="180" width="240" height="54" rx="9" fill="var(--panel-2)" stroke="var(--warn)"></rect><text x="760" y="205" text-anchor="middle" fill="var(--warn)" font-size="13" font-weight="600">Kafka (event bus)</text><text x="760" y="222" text-anchor="middle" fill="var(--faint)" font-size="11">outbox · at-least-once</text></g>
+
+          <g data-node style="cursor:pointer" data-title="Order + Payment DB (PostgreSQL Aurora)" data-detail="<b>Storage:</b> PostgreSQL Aurora — sharded by userId (order tables) with dedicated payment table on the same shard for co-location.<br><b>Tables:</b> orders, order_items, payments (with UNIQUE constraint on idempotency_key), saga_step_records (audit trail).<br><b>Write pattern:</b> transactional insert of order + outbox row (see Kafka node).<br><b>Read replicas:</b> for order-history browsing (eventual consistency 100 ms)."><rect x="640" y="255" width="240" height="54" rx="9" fill="var(--panel-2)" stroke="var(--old)"></rect><text x="760" y="280" text-anchor="middle" fill="var(--old)" font-size="13" font-weight="600">Order + Payment DB</text><text x="760" y="297" text-anchor="middle" fill="var(--faint)" font-size="11">Postgres · sharded by userId</text></g>
+
+          <g data-node style="cursor:pointer" data-title="Inventory Store (DynamoDB + Redis DECR)" data-detail="<b>Storage:</b> DynamoDB — key=productId, attrs={totalStock, reservedStock, version}. Conditional writes prevent overselling: <code>UpdateItem ... IF availableStock &gt;= :qty</code>.<br><b>Flash-sale gate:</b> Redis atomic <code>DECR flash:{sku}:stock</code> in front of the DB — turns a 100 K QPS spike into 100 QPS DB writes.<br><b>Reservation TTL:</b> 15 min — if <code>confirmReservation</code> hasn't been called, background job releases automatically (crash safety).<br><b>Java demo:</b> synchronized in-memory <code>Inventory</code> ≈ DDB conditional write."><rect x="640" y="330" width="240" height="54" rx="9" fill="var(--panel-2)" stroke="var(--old)"></rect><text x="760" y="355" text-anchor="middle" fill="var(--old)" font-size="13" font-weight="600">Inventory Store</text><text x="760" y="372" text-anchor="middle" fill="var(--faint)" font-size="11">DynamoDB + Redis DECR</text></g>
+
+          <g data-node style="cursor:pointer" data-title="External Payment Gateway (Stripe / UPI)" data-detail="<b>External CP dependency.</b> Charges card, verifies fraud, returns transactionId.<br><b>Idempotency:</b> Stripe stores the response for 24 h keyed by <code>Idempotency-Key</code>. A retry after network glitch returns the same 200 (never a second charge).<br><b>Latency:</b> p50 500 ms · p99 1 500 ms — this dominates checkout latency.<br><b>Rate limits:</b> account-level (typically ~100 QPS baseline; higher on request). Retry on 429/5xx with backoff."><rect x="640" y="405" width="240" height="54" rx="9" fill="var(--panel-2)" stroke="var(--meta)"></rect><text x="760" y="430" text-anchor="middle" fill="var(--meta)" font-size="13" font-weight="600">External Stripe / UPI</text><text x="760" y="447" text-anchor="middle" fill="var(--faint)" font-size="11">Idem-Key · 24 h dedup</text></g>
+
+          <g data-node style="cursor:pointer" data-title="Notification (SNS + SQS + FCM + email)" data-detail="<b>Role:</b> customer notifications — order confirmed, shipped, delivered, cancelled, refunded.<br><b>Consumer:</b> Kafka consumer group; per event, fan out to (a) email (SES/SendGrid) (b) push (FCM/APNs) (c) SMS (Twilio, critical only).<br><b>Reliability:</b> at-least-once; consumer offset only advances after all sinks ACK. Dedup on messageId at each sink.<br><b>Not on the critical path</b> — a notification that's 30 s late is fine; failed notification never blocks order."><rect x="640" y="480" width="240" height="54" rx="9" fill="var(--panel-2)" stroke="var(--warn)"></rect><text x="760" y="505" text-anchor="middle" fill="var(--warn)" font-size="13" font-weight="600">Notification</text><text x="760" y="522" text-anchor="middle" fill="var(--faint)" font-size="11">email · push · SMS · fan-out</text></g>
+
+        </svg>
+      </div>
+      <div class="node-detail"><span class="nd-title">Click any component</span><div class="nd-body">Its role, storage, and consistency model appear here. Then use the buttons below to walk the <b>browse</b> read-path (CDN → cache → search) and the <b>checkout</b> saga (reserve → pay → ship, compensate reverse).</div></div>
+
+      <div class="flowctl" data-flowctl>
+        <button class="btn" data-flow="browse">Browse — read (4 steps · AP)</button>
+        <button class="btn" data-flow="checkout">Checkout — saga (10 steps · CP)</button>
+        <span style="flex:1"></span>
+        <button class="btn" data-flowstep="prev">◀ Prev</button>
+        <button class="btn" data-flowstep="next">Next ▶</button>
+      </div>
+      <div class="flowlabel" data-flowlabel>Pick <b>Browse</b> or <b>Checkout</b>, then press "Next ▶" to walk the numbered request flow one hop at a time.</div>
+
+      <div class="cloudmap">
+        <div class="kicker" style="margin-top:4px">Managed-service mapping — the same design on each cloud</div>
+        <table class="cloudtable">
+          <thead><tr>
+            <th>Component</th>
+            <th><span class="hdrlogo"><span class="logochip"><img src="../assets/logos/aws.svg" alt="AWS"></span>AWS</span></th>
+            <th><span class="hdrlogo"><span class="logochip"><img src="../assets/logos/gcp.svg" alt="GCP"></span>GCP</span></th>
+            <th><span class="hdrlogo"><span class="logochip"><img src="../assets/logos/azure.svg" alt="Azure"></span>Azure</span></th>
+          </tr></thead>
+          <tbody>
+            <tr><td><b>API Gateway</b></td><td><img class="svcicon" src="../assets/logos/services/aws-apigw.svg" alt="">API Gateway + CloudFront</td><td><img class="svcicon" src="../assets/logos/services/gcp-apigw.svg" alt="">API Gateway / Apigee</td><td><img class="svcicon" src="../assets/logos/services/azure-apim.svg" alt="">API Management</td></tr>
+            <tr><td>Compute (stateless services)</td><td><img class="svcicon" src="../assets/logos/services/aws-ecs.svg" alt="">ECS Fargate / EKS</td><td><img class="svcicon" src="../assets/logos/services/gcp-run.svg" alt="">Cloud Run / GKE</td><td><img class="svcicon" src="../assets/logos/services/azure-aks.svg" alt="">AKS / Container Apps</td></tr>
+            <tr><td><b>Saga Orchestrator</b></td><td>Step Functions</td><td>Workflows</td><td>Durable Functions</td></tr>
+            <tr><td>Order / Payment DB</td><td><img class="svcicon" src="../assets/logos/services/aws-rds.svg" alt="">Aurora PostgreSQL</td><td><img class="svcicon" src="../assets/logos/services/gcp-cloudsql.svg" alt="">Cloud SQL PostgreSQL</td><td><img class="svcicon" src="../assets/logos/services/azure-sql.svg" alt="">Azure Database for PG</td></tr>
+            <tr><td>Inventory (conditional writes)</td><td><img class="svcicon" src="../assets/logos/services/aws-dynamodb.svg" alt="">DynamoDB (conditional)</td><td><img class="svcicon" src="../assets/logos/services/gcp-bigtable.svg" alt="">Bigtable / Firestore</td><td><img class="svcicon" src="../assets/logos/services/azure-cosmos.svg" alt="">Cosmos DB</td></tr>
+            <tr><td>Cart + Redis flash gate</td><td><img class="svcicon" src="../assets/logos/services/aws-elasticache.svg" alt="">ElastiCache Redis</td><td><img class="svcicon" src="../assets/logos/services/gcp-memorystore.svg" alt="">Memorystore Redis</td><td><img class="svcicon" src="../assets/logos/services/azure-redis.svg" alt="">Azure Cache for Redis</td></tr>
+            <tr><td>Search (catalog)</td><td><img class="svcicon" src="../assets/logos/services/aws-opensearch.svg" alt="">OpenSearch</td><td>Elastic Cloud on GCP</td><td><img class="svcicon" src="../assets/logos/services/azure-search.svg" alt="">Azure AI Search</td></tr>
+            <tr><td>Event bus (outbox)</td><td><img class="svcicon" src="../assets/logos/services/aws-msk.svg" alt="">MSK / Kinesis</td><td><img class="svcicon" src="../assets/logos/services/gcp-pubsub.svg" alt="">Pub/Sub</td><td><img class="svcicon" src="../assets/logos/services/azure-eventhubs.svg" alt="">Event Hubs</td></tr>
+            <tr><td>CDN (images + API cache)</td><td><img class="svcicon" src="../assets/logos/services/aws-cloudfront.svg" alt="">CloudFront</td><td><img class="svcicon" src="../assets/logos/services/gcp-cloudcdn.svg" alt="">Cloud CDN</td><td><img class="svcicon" src="../assets/logos/services/azure-cdn.svg" alt="">Azure CDN</td></tr>
+            <tr><td>Queue-based checkout</td><td><img class="svcicon" src="../assets/logos/services/aws-sqs.svg" alt="">SQS FIFO</td><td><img class="svcicon" src="../assets/logos/services/gcp-pubsub.svg" alt="">Pub/Sub (ordered)</td><td><img class="svcicon" src="../assets/logos/services/azure-servicebus.svg" alt="">Service Bus (FIFO)</td></tr>
+            <tr><td>Notifications</td><td><img class="svcicon" src="../assets/logos/services/aws-sns.svg" alt="">SNS + SES</td><td><img class="svcicon" src="../assets/logos/services/gcp-pubsub.svg" alt="">Pub/Sub + Cloud Functions</td><td><img class="svcicon" src="../assets/logos/services/azure-notifhub.svg" alt="">Notification Hubs</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+
+  <!-- D · API -->
+  <section>
+    <div class="sec-h"><span class="n">D</span><h2>API design</h2><span class="tag">idempotent writes · cacheable reads</span></div>
+    <table>
+      <thead><tr><th>Endpoint</th><th>Purpose</th><th>Response</th></tr></thead>
+      <tbody>
+        <tr><td><code>GET /products?q=&amp;category=</code></td><td>Search / browse (cacheable, CDN 30 s)</td><td>200 + <code>{items[], nextCursor}</code></td></tr>
+        <tr><td><code>GET /products/{id}</code></td><td>Product detail (Redis 5 min)</td><td>200 + product JSON</td></tr>
+        <tr><td><code>POST /cart</code></td><td>Add item (with price snapshot)</td><td>200 + cart JSON</td></tr>
+        <tr><td><code>POST /checkout</code></td><td><b>Saga trigger.</b> Header: <code>Idempotency-Key</code>. Body: <code>{cartId, paymentMethod, shippingAddress}</code></td><td>201 + Order (sync) OR 202 + <code>pollUrl</code> (queue mode)</td></tr>
+        <tr><td><code>GET /orders/{id}</code></td><td>Order status (state machine)</td><td>200 + <code>{status, items, payment, shipment}</code></td></tr>
+        <tr><td><code>POST /orders/{id}/cancel</code></td><td>Cancel (state-machine guarded)</td><td>200 or 409 (invalid state)</td></tr>
+        <tr><td><code>POST /webhooks/payment</code></td><td>Stripe webhook — payment confirmed / failed</td><td>200 (idempotent by event.id)</td></tr>
+        <tr><td><code>POST /admin/inventory/reserve</code></td><td>Direct reserve (admin / internal)</td><td>200 or 409 (InsufficientStock)</td></tr>
+      </tbody>
+    </table>
+    <p class="muted"><b>Idempotency contract:</b> every write endpoint accepts <code>Idempotency-Key</code>. Duplicate keys within 24 h return the original response (never re-execute). Payment endpoint additionally uses <code>orderId</code> as a natural key — <code>paymentRepository.findByOrderId</code> short-circuits if COMPLETED.</p>
+  </section>
+
+  <!-- E · DATA MODEL -->
+  <section>
+    <div class="sec-h"><span class="n">E</span><h2>Data model — writes (CP) vs reads (AP)</h2><span class="tag">right store per access pattern</span></div>
+    <div class="grid g2">
+      <div class="card">
+        <div class="kicker">write path (Postgres · DynamoDB)</div>
+<pre class="code">Order                       <span class="cm">// Postgres (Aurora, sharded userId)</span>
+  order_id (PK, snowflake)
+  user_id
+  status                    <span class="cm">// state machine enum</span>
+  total_amount, currency
+  idempotency_key (UNIQUE)  <span class="cm">// dedup writes</span>
+  created_at, updated_at
+
+OrderItem                   <span class="cm">// PG, FK order_id</span>
+  order_id, product_id, quantity
+  price_snapshot            <span class="cm">// at add-to-cart time</span>
+
+Payment                     <span class="cm">// PG, same shard as Order</span>
+  payment_id, order_id (INDEX)
+  amount, method, status
+  transaction_id            <span class="cm">// Stripe charge_id</span>
+  idempotency_key (UNIQUE)
+
+Inventory                   <span class="cm">// DynamoDB</span>
+  product_id (PK)
+  total_stock, reserved_stock
+  version                   <span class="cm">// optimistic lock</span>
+
+SagaStepRecord              <span class="cm">// PG audit trail</span>
+  order_id, step_name
+  status                    <span class="cm">// PENDING/COMPLETED/FAILED/COMPENSATED</span>
+  attempted_at, completed_at</pre>
+      </div>
+      <div class="card">
+        <div class="kicker">read path (Redis · ES · CDN)</div>
+<pre class="code">Redis cart:{userId}         <span class="cm">// hash</span>
+  product_id → {qty, price_snapshot}
+  TTL 7 days                <span class="cm">// abandoned-cart recovery</span>
+
+Redis product:{sku}         <span class="cm">// JSON blob</span>
+  TTL 5 min                 <span class="cm">// invalidate on price change</span>
+  jitter ±20 %              <span class="cm">// avoid stampede</span>
+
+Elasticsearch products      <span class="cm">// denorm search index</span>
+  keyword, category[], price
+  attributes (color/size/brand)
+  is_prime, avg_rating
+
+Redis flash:{sku}:stock     <span class="cm">// atomic DECR gate</span>
+  int counter               <span class="cm">// pre-warmed at sale start</span>
+  DECR returns -1 → 503
+
+CDN cache                   <span class="cm">// CloudFront/Fastly</span>
+  images: 30 d              <span class="cm">// content-hashed URLs</span>
+  API JSON: 30 s            <span class="cm">// GET /products/{id}</span></pre>
+      </div>
+    </div>
+    <div class="callout tip"><b>The golden rule:</b> <b>cache for display, read DB for decisions</b>. A stale product price shown to a browser is fine (they'll see the real price at checkout); a stale inventory count that lets you oversell is a nightmare. Checkout ALWAYS reads inventory + price from the DB, never the cache.</div>
+  </section>
+
+  <!-- F · KEY CHOICES -->
+  <section>
+    <div class="sec-h"><span class="n">F</span><h2>Key design choices (deep-dived on canvas 3)</h2><span class="tag">defend these</span></div>
+    <div class="grid g3">
+      <div class="card"><div class="kicker">consistency</div><h3>Saga (orchestration)</h3><p class="muted">3 steps · compensate reverse. Beats 2PC (no distributed lock) and choreography (central visibility). Central log = one place to debug a stuck order. <span class="run">→ canvas 3 · Saga vs 2PC</span></p></div>
+      <div class="card"><div class="kicker">correctness</div><h3>Idempotency at every write</h3><p class="muted">Client sends <code>Idempotency-Key</code>. Stripe dedups for 24 h. Retry on network glitch is safe — never a double-charge. <span class="run">→ canvas 3 · idempotency</span></p></div>
+      <div class="card"><div class="kicker">CAP split</div><h3>AP browse · CP checkout</h3><p class="muted">Catalog / cart / search are AP (stale OK). Inventory / payment / orders are CP (refuse if unsure). Boundary crossed at the checkout button. <span class="run">→ canvas 3 · CAP</span></p></div>
+      <div class="card"><div class="kicker">hot-key</div><h3>Redis DECR for flash sales</h3><p class="muted">100 K QPS burst on 1 SKU → Redis <code>DECR flash:{sku}</code> gate turns it into 100 QPS at the DB. Losers get 503 &amp; a "sold out" CDN cache. <span class="run">→ canvas 3 · flash sale</span></p></div>
+      <div class="card"><div class="kicker">spike</div><h3>Queue-based checkout mode</h3><p class="muted">When QPS &gt; 3 000/instance, gateway switches from sync HTTP to <b>SQS FIFO</b> + return 202 + <code>pollUrl</code>. Saga workers drain at controlled rate. <span class="run">→ canvas 3 · queue mode</span></p></div>
+      <div class="card"><div class="kicker">state</div><h3>Order state machine</h3><p class="muted"><code>CREATED → INVENTORY_RESERVED → PAYMENT_CONFIRMED → SHIPPED → DELIVERED</code>. Every transition guarded — cancel/refund fails cleanly on wrong state. <span class="run">→ canvas 2 · Order LLD</span></p></div>
+    </div>
+  </section>
+
+  <!-- GLOSSARY -->
+  <section>
+    <div class="sec-h"><span class="n">§</span><h2>Glossary — one-liners</h2></div>
+    <div class="grid g2">
+      <div class="card"><table><tbody>
+        <tr><td><b>Saga (orchestration)</b></td><td>central orchestrator runs local transactions with matching compensations; no distributed lock</td></tr>
+        <tr><td><b>Compensation</b></td><td>the "undo" for a completed step — must be idempotent (release ×2 == release ×1)</td></tr>
+        <tr><td><b>Idempotency key</b></td><td>client-generated UUID; server stores response for 24 h and returns it on retry</td></tr>
+        <tr><td><b>Exactly-once effect</b></td><td>at-least-once delivery + idempotent handler = user perceives exactly-once</td></tr>
+        <tr><td><b>CQRS</b></td><td>separate write model (Postgres · CP) from read model (ES + Redis · AP)</td></tr>
+        <tr><td><b>Transactional outbox</b></td><td>write DB row + <code>outbox</code> row in one TX; poller pushes to Kafka — no dual-write inconsistency</td></tr>
+      </tbody></table></div>
+      <div class="card"><table><tbody>
+        <tr><td><b>Reserve / confirm / release</b></td><td>3-phase stock protocol — reserve at cart-add / confirm at paid / release on failure or TTL</td></tr>
+        <tr><td><b>Flash sale (Redis DECR)</b></td><td>atomic pre-DB gate — turns hot-SKU QPS from millions to hundreds</td></tr>
+        <tr><td><b>Queue-based checkout</b></td><td>under spike, HTTP 202 + SQS FIFO — saga workers drain at DB-safe rate</td></tr>
+        <tr><td><b>Circuit breaker (sold-out)</b></td><td>when stock = 0, return 503 immediately + CDN cache "sold out" 60 s → offload from origin</td></tr>
+        <tr><td><b>Debezium CDC</b></td><td>reads Postgres WAL → publishes row changes to Kafka → ES / Redis updaters</td></tr>
+        <tr><td><b>State machine</b></td><td>Order transitions are guarded; illegal transition throws <code>InvalidOrderStateException</code></td></tr>
+      </tbody></table></div>
+    </div>
+  </section>
+
+  <footer>
+    <p>Use case 10 · E-Commerce (Amazon) — Canvas 1 of 3 (HLD). Grounded in <code>10-ecommerce/docs/hld/HIGH_LEVEL_DESIGN.md</code> and the real Java under <code>10-ecommerce/src/</code>.</p>
+    <p class="run">This use case: HLD · <a href="lld.html">Canvas 2 · LLD</a> · <a href="deepdive.html">Canvas 3 · Deep-dive &amp; Trade-offs</a> &nbsp;|&nbsp; <a href="../index.html">Hub</a></p>
+  </footer>
+
+</div>
+<script src="../assets/canvas.js"></script>
+</body>
+</html>

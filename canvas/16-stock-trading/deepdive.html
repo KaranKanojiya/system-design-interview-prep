@@ -1,0 +1,492 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>16 · Stock Trading — Deep-dive &amp; Trade-offs</title>
+<link rel="stylesheet" href="../assets/canvas.css">
+</head>
+<body>
+
+<div class="wrap">
+
+  <header class="hero">
+    <h1>Stock Trading — Deep-dive &amp; Trade-offs</h1>
+    <div class="sub">Canvas 3 of 3. Staff-engineer defensible answers for a full interview. <b>Single-writer matching engine</b> per symbol (LMAX Disruptor) · sharding by symbol across cores · leader-follower failover from Kafka replay · <b>price-time priority correctness</b> · self-trade prevention · wash-trade detection · <b>CAP split (orders CP · market data AP)</b> · red-black-tree order book · 5 pre-trade risk checks · kill-switch · <b>8 bottlenecks with mitigations</b> · 10-row trade-off table · 35-minute interview walkthrough with phase timings.</div>
+    <div class="badges">
+      <span class="badge lvl">Use case 16 · Deep-dive</span>
+      <span class="badge">Canvas 3 of 3</span>
+      <span class="badge">interview-defensible</span>
+      <span class="badge">NASDAQ · NYSE · IEX · LSE · Robinhood · Zerodha</span>
+    </div>
+    <div class="legend">
+      <span><i class="dot" style="background:var(--eden)"></i> preferred / winner</span>
+      <span><i class="dot" style="background:var(--survivor)"></i> conditional / hybrid</span>
+      <span><i class="dot" style="background:var(--warn)"></i> avoid / red flag</span>
+      <span><i class="dot" style="background:var(--fig)"></i> deep-dive detail</span>
+    </div>
+  </header>
+
+  <!-- A · MATCHING ENGINE ARCHITECTURE TABS -->
+  <section>
+    <div class="sec-h"><span class="n">A</span><h2>Matching engine architecture — how to run it fast &amp; correct</h2><span class="tag">the concurrency question</span></div>
+    <div data-tabscope>
+      <div class="tabs">
+        <div class="tab active" data-tab="ma-single">Single-writer per symbol</div>
+        <div class="tab" data-tab="ma-shard">Sharding by symbol</div>
+        <div class="tab" data-tab="ma-leader">Leader-follower failover</div>
+        <div class="tab" data-tab="ma-lmax">LMAX Disruptor</div>
+        <div class="tab" data-tab="ma-decide">decision matrix</div>
+      </div>
+      <div class="tabpanel active" data-panel="ma-single">
+        <div class="kicker">one thread per symbol · zero locks · deterministic</div>
+        <p><b>Why single-threaded?</b> A matching engine must process orders in strict arrival order — Order A before Order B at the same price ⇒ A fills first (time priority). Multi-threaded matching on the same order book needs locks; locks are:</p>
+        <ul class="tight">
+          <li><b>Slow.</b> 50–200 ns per acquire — dominates the 1 μs match budget.</li>
+          <li><b>Non-deterministic.</b> Thread scheduling varies across restarts. Replay from Kafka can't produce the same trades.</li>
+          <li><b>Bug-prone.</b> A partial fill across two price levels must be atomic → nested locks → deadlock risk.</li>
+        </ul>
+        <p><b>Single-threaded is FASTER than multi-threaded here:</b> zero lock contention, zero cache-line bouncing (shared mutable state kills L1), predictable p99, easier correctness. <b>LMAX Exchange processes 6 M orders/sec on ONE thread.</b> CPU is never the bottleneck; network I/O is (handled separately).</p>
+        <pre class="code"><span class="cm">// Zone 1: Ingress ring (multi-producer, one consumer per shard)
+Kafka orders.RELIANCE ──► RingBuffer ──► RELIANCE-thread
+Kafka orders.TCS      ──► RingBuffer ──► TCS-thread
+Kafka orders.INFY     ──► RingBuffer ──► INFY-thread
+
+// Zone 2: Match (single-threaded — 100 ns loop)
+while (true) {
+  Order o = ringBuffer.take();       // lock-free — no mutex
+  OrderBook book = orderBooks.get(o.symbol);
+  List&lt;Trade&gt; trades = strategy.execute(o, book);
+  publishTrades(trades);              // async, batched
+}
+
+// Zone 3: Publish (separate thread — never blocks match loop)</span></pre>
+      </div>
+      <div class="tabpanel" data-panel="ma-shard">
+        <div class="kicker">horizontal scale via symbol partitioning</div>
+        <p>One thread per symbol is fine for 5 K symbols on a beefy 96-core box — but for 50 K symbols, or for redundancy, you shard <b>symbols across engine instances</b>:</p>
+        <pre class="code"><span class="cm">// Kafka topic: orders.{symbol} — partitionKey = symbol
+// One partition per hot symbol, many symbols per partition for cold tail.
+
+Engine Instance 1: consumes partition for {AAPL, MSFT, ...}
+Engine Instance 2: consumes partition for {GOOG, AMZN, ...}
+Engine Instance 3: consumes partition for {small-caps ...}</span>
+
+Consistent hashing on symbol → engine. Add capacity = add engines.
+Rebalance = drain partition, transfer order book snapshot, reassign.</pre>
+        <p><b>Hot-symbol problem:</b> if RELIANCE takes 80 % of the day's volume, one engine gets hammered. Mitigation: <b>dedicated engine for top-N hot symbols</b>, shared engine for the tail. Rebalance based on daily observed volume, not name-hash.</p>
+        <p><b>Why NOT shard by user:</b> the same order book has BOTH a user's buy and someone else's sell — they must meet in the same engine. Partitioning by user would split the book across engines, requiring cross-partition matching (⇒ locks ⇒ we're back to square one). <b>Symbol is the natural sharding axis</b> for order books.</p>
+      </div>
+      <div class="tabpanel" data-panel="ma-leader">
+        <div class="kicker">how the exchange survives a crash</div>
+        <p>Each engine instance is a leader for its symbol shard, with 2 follower replicas. Followers consume the same Kafka partition + tail the leader's trade output — they hold a warm order book.</p>
+        <pre class="code"><span class="cm">// Normal operation:
+Leader RELIANCE:      consumes orders.RELIANCE @ offset 1_234_567 → matches
+Follower A RELIANCE:  consumes orders.RELIANCE @ offset 1_234_567 (silent tail)
+Follower B RELIANCE:  consumes orders.RELIANCE @ offset 1_234_567 (silent tail)
+
+// Leader crashes:
+1. Kafka consumer-group heartbeat timeout (2 s) → rebalance triggers.
+2. Follower A promoted to leader (ZooKeeper / Raft election).
+3. New leader continues from its last committed offset — same input → same output.
+4. Optional: reject in-flight order acks for 5 s, ask clients to re-submit with same idempotency-key.
+
+RTO ≈ 5 s · RPO = 0 (Kafka is the source of truth).</span></pre>
+        <p><b>The genius of Kafka-as-WAL:</b> the engine's in-memory order book is <b>derived state</b>. The <b>orders topic</b> is the write-ahead log. Replay it end-to-end and you get bit-identical trades. No snapshotting needed for correctness (snapshots are just a speed optimisation).</p>
+        <div class="callout tip"><b>Interview point:</b> "Why isn't this a Paxos / Raft consensus problem?" — because there's ONE writer (the leader), not a multi-leader system. The 2 followers are silent — they only speak up if the leader dies. This is <b>primary-backup replication</b>, simpler and faster than consensus.</div>
+      </div>
+      <div class="tabpanel" data-panel="ma-lmax">
+        <div class="kicker">the LMAX Disruptor pattern (mechanical sympathy)</div>
+        <p>LMAX Exchange (UK) published the <b>Disruptor</b> pattern in 2011 — a lock-free ring buffer designed for the JVM. The design lessons:</p>
+        <ul class="tight">
+          <li><b>Sequential memory access.</b> Ring buffer entries live in a contiguous array — CPU prefetcher works perfectly.</li>
+          <li><b>Cache-line padding.</b> Producer sequence + consumer sequence padded to 64 B so they don't share a cache line (false sharing kills performance).</li>
+          <li><b>Single writer.</b> Only ONE thread writes to the ring at each stage — no CAS retry loops.</li>
+          <li><b>Batching consumers.</b> A consumer takes N items at once (up to available), amortising per-item overhead.</li>
+          <li><b>Bounded ring.</b> Fixed-size (power of 2) → cheap modulo via bit-and.</li>
+        </ul>
+        <p><b>Result:</b> 6 M orders/sec on a single JVM, p99 &lt; 100 μs. Same design used by <b>Coinbase, Chronicle, Aeron, Kaltura</b>. In our code, the <code>MatchingEngine</code> is the sequential consumer — in prod, the ring buffer sits in front of it as the input queue.</p>
+        <div class="callout warn"><b>What NOT to say:</b> "We'd use <code>ConcurrentHashMap</code> for the order book." That's what <b>we</b> did in the JVM demo — because it's small, single-JVM, and needs no concurrency. In prod, the order book is inside the single-writer thread — <b>plain HashMap is faster</b> because no lock overhead. Concurrency primitives are a code smell in the hot path.</div>
+      </div>
+      <div class="tabpanel" data-panel="ma-decide">
+        <table>
+          <thead><tr><th>Design</th><th>Throughput</th><th>Latency p99</th><th>Complexity</th><th>Use case</th></tr></thead>
+          <tbody>
+            <tr><td><b>Multi-threaded, locked book</b></td><td>~10 K/s per engine</td><td>~5 ms (lock waits)</td><td>high (deadlock risk)</td><td>avoid — anti-pattern</td></tr>
+            <tr><td><b>Single-thread per symbol</b> <span style="color:var(--eden)">← ours</span></td><td>~1 M/s per engine</td><td>&lt; 1 ms</td><td>low</td><td>most exchanges</td></tr>
+            <tr><td><b>Single-thread + LMAX Disruptor</b></td><td>~6 M/s per JVM</td><td>&lt; 100 μs</td><td>medium</td><td>LMAX, Coinbase, HFT platforms</td></tr>
+            <tr><td><b>FPGA-based matching</b></td><td>~50 M/s</td><td>&lt; 5 μs</td><td>very high</td><td>Nasdaq InfiniBand, HFT co-location</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+
+  <!-- B · CORRECTNESS TABS -->
+  <section>
+    <div class="sec-h"><span class="n">B</span><h2>Correctness — the invariants regulators check</h2><span class="tag">match at the right price, in the right order</span></div>
+    <div data-tabscope>
+      <div class="tabs">
+        <div class="tab active" data-tab="cor-priority">Price-time priority</div>
+        <div class="tab" data-tab="cor-wash">Wash-trade prevention</div>
+        <div class="tab" data-tab="cor-stp">Self-trade prevention</div>
+        <div class="tab" data-tab="cor-audit">Audit determinism</div>
+      </div>
+      <div class="tabpanel active" data-panel="cor-priority">
+        <div class="kicker">the universal rule: best price first, then earliest order</div>
+        <p><b>Two invariants</b> the engine must maintain across every match:</p>
+        <ul class="tight">
+          <li><b>Price priority.</b> Buy Limit $105 → matches ask $103 BEFORE ask $105 (better price for buyer). Sell Limit $95 → matches bid $97 BEFORE bid $95.</li>
+          <li><b>Time priority.</b> At the same price, the earliest resting order fills first. FIFO queue at each PriceLevel.</li>
+        </ul>
+        <p><b>How we enforce:</b></p>
+        <pre class="code"><span class="cm">// bids: highest price first (Comparator.reverseOrder)
+// asks: lowest price first (natural order)
+// getBestBid()/getBestAsk() = TreeMap.firstEntry() — O(log N) but usually O(1)-ish (cached root)
+
+PriceLevel bestAsk = book.getBestAsk();
+if (bestAsk.getPrice() &gt; buyOrder.getPrice()) break;   // price priority
+
+Order sellOrder = bestAsk.peekFirst();   // time priority — FIFO head</span></pre>
+        <p><b>What could break priority:</b> a modify operation that keeps the same order_id. Solution: <b>modify = cancel + re-place</b> — always assign a new timestamp. Every major exchange does this.</p>
+      </div>
+      <div class="tabpanel" data-panel="cor-wash">
+        <div class="kicker">preventing manipulation trades that inflate volume</div>
+        <p><b>Wash trading:</b> the same trader buys and sells the same security at the same time, creating fake volume to attract other traders. Illegal under SEC Rule 15c3-5, punishable by fines &amp; delisting.</p>
+        <pre class="code"><span class="cm">// Pre-trade check in the engine — right before creating a Trade:
+if (buyOrder.getUserId().equals(sellOrder.getUserId())) {
+  // OPTIONS:
+  //  a) REJECT_INCOMING: cancel the incoming order, keep the resting one.
+  //  b) REJECT_RESTING: cancel the resting order, incoming rests instead.
+  //  c) CANCEL_BOTH: both orders cancelled.
+  //  d) CANCEL_SMALLER_QTY: cancel the smaller of the two.
+  // NASDAQ default: CANCEL_NEWEST (option a).
+  return skipMatch(sellOrder);   // continue with next resting order
+}</span></pre>
+        <p><b>Beyond same-user:</b> also flag trades between <b>related accounts</b> (family, algorithmic bot cluster, subsidiary firm). This is done in post-trade surveillance, not in the engine — false positives are common and blocking real trades is worse than a delayed flag.</p>
+        <p class="muted"><b>Regulator context:</b> FINRA's OATS + CAT + SEBI's SMART surveillance systems consume the trade feed and flag suspicious patterns (wash + spoofing + layering). Exchanges are required to prevent obvious wash trades in the engine.</p>
+      </div>
+      <div class="tabpanel" data-panel="cor-stp">
+        <div class="kicker">STP — same-firm self-trade prevention</div>
+        <p><b>Self-Trade Prevention (STP)</b> is a specific NASDAQ / CBOE / EEX rule that goes beyond wash. Traders can opt-in to have <b>the exchange</b> cancel one side automatically when their firm's orders would cross.</p>
+        <pre class="code"><span class="cm">STP tag values (NASDAQ):
+  N = None (no STP)
+  B = Cancel both orders
+  O = Cancel resting (Older)
+  N = Cancel newest (incoming)
+  D = Decrement — reduce both by min(qty) instead of canceling
+
+Example:
+  User X has resting sell at $100 for 500 shares (STP=D).
+  User X submits buy at $100 for 200 shares.
+  Engine sees same firm ID + same STP tag → decrement:
+    resting sell: 500 - 200 = 300 shares remains
+    incoming buy: 200 - 200 = 0 → cancelled
+  No trade created, no wash issue.</span></pre>
+        <p><b>Why the exchange, not the client, enforces STP:</b> a fast algo might place orders faster than it can reason about its own book. The exchange has the atomic view. STP is a <b>value-add feature</b> the venue offers to algo shops.</p>
+      </div>
+      <div class="tabpanel" data-panel="cor-audit">
+        <div class="kicker">every trade must be reproducible from the log</div>
+        <p><b>SEC Rule 613 (CAT — Consolidated Audit Trail)</b> requires every order event (place / modify / cancel / route / execute) to be logged with microsecond timestamps and reported daily to FINRA. Similar rules: SEBI (India), FCA (UK), ESMA (EU MiFID II).</p>
+        <p><b>How we support this without slowing the match:</b></p>
+        <ol class="tight">
+          <li><b>Kafka topic <code>orders.{symbol}</code></b> is the primary audit trail — every order write is recorded with acks=all.</li>
+          <li><b>Trade events</b> published to <code>trades.{symbol}</code> with buyer/seller order_ids, price, qty, μs timestamp.</li>
+          <li><b>S3 Object-Lock (WORM)</b> — 7-year immutable archive, Athena SQL for surveillance.</li>
+          <li><b>Deterministic engine</b> — replay of the orders topic produces identical trades → any auditor can independently reconstruct.</li>
+        </ol>
+        <div class="callout tip"><b>Interview mic-drop:</b> "The engine is a pure function of the orders log. Given the same partition and same code version, you can crash it, replay from offset 0, and get bit-identical trades. That's <b>audit determinism</b> — the strongest possible correctness guarantee. It's also how we hot-swap engine versions without downtime."</div>
+      </div>
+    </div>
+  </section>
+
+  <!-- C · CAP SPLIT -->
+  <section>
+    <div class="sec-h"><span class="n">C</span><h2>CAP split — different consistency per subsystem</h2><span class="tag">not one CAP for the whole exchange</span></div>
+    <table>
+      <thead><tr><th>Subsystem</th><th>Choice</th><th>PACELC</th><th>Why</th></tr></thead>
+      <tbody>
+        <tr><td><b>Order placement</b></td><td><b>CP</b></td><td>PC / EC</td><td>Lost order = customer financial loss. Kafka acks=all + Aurora sync replication before ACK.</td></tr>
+        <tr><td><b>Matching engine</b></td><td><b>CP</b></td><td>PC / EC</td><td>Single-writer per symbol = strict serial. Zero double-fills. Kafka replay for recovery.</td></tr>
+        <tr><td><b>Trade / settlement</b></td><td><b>CP</b></td><td>PC / EC</td><td>Aurora ACID + UNIQUE constraint on trade_id. Money movement must balance.</td></tr>
+        <tr><td><b>Positions store</b></td><td><b>CP</b></td><td>PC / EC</td><td>DynamoDB conditional write (CAS on version). Wrong qty → user over-trades → broker eats it.</td></tr>
+        <tr><td><b>Margin / balance</b></td><td><b>CP</b></td><td>PC / EC</td><td>Stale margin = user trades beyond means = broker's risk. Read-through from Redis to DDB on doubt.</td></tr>
+        <tr><td><b>Order book (in-memory)</b></td><td><b>CP</b></td><td>PC / EC</td><td>Single JVM thread → linearizable by construction. Kafka partition ordering guarantees inputs.</td></tr>
+        <tr><td><b>Market data (LTP)</b></td><td>AP</td><td>PA / EL</td><td>50 ms stale price on display = fine. Matching still uses live book. Redis TTL 500 ms.</td></tr>
+        <tr><td><b>Market data (depth L2)</b></td><td>AP</td><td>PA / EL</td><td>Displayed bid/ask can lag 100 ms; the engine's book is authoritative. Refresh every 100 ms.</td></tr>
+        <tr><td><b>OHLCV candles</b></td><td>AP</td><td>PA / EL</td><td>1 s lag invisible to human charting UI. Timestream memory + magnetic tiers.</td></tr>
+        <tr><td><b>Watchlist / user prefs</b></td><td>AP</td><td>PA / EL</td><td>Merge conflict = union. Never lose an entry.</td></tr>
+        <tr><td><b>Audit trail (S3)</b></td><td><b>CP</b></td><td>PC / EC</td><td>Regulatory requirement — every event, immutable, 7 years. Write-through from Kafka.</td></tr>
+        <tr><td><b>Notifications</b></td><td>AP</td><td>—</td><td>Late fill email is fine. Blocking a match on push notification is not.</td></tr>
+      </tbody>
+    </table>
+    <div class="callout tip"><b>The boundary is the trader's screen:</b> everything shown for reference / display is AP (fast, cache-friendly, stale OK). Everything that affects money is CP (durable, ordered, refuse-if-unsure). <b>Never let a matching decision read from Redis</b> — the engine uses its own in-memory book, populated only from Kafka.</div>
+  </section>
+
+  <!-- D · ORDER BOOK DATA STRUCTURE -->
+  <section>
+    <div class="sec-h"><span class="n">D</span><h2>Order book data structure — the choice under the hood</h2><span class="tag">TreeMap · red-black tree · why not others</span></div>
+    <div class="grid g2">
+      <div class="card">
+        <div class="kicker">what we chose</div>
+        <pre class="code">TreeMap&lt;Double, PriceLevel&gt; bids;
+  <span class="cm">// Comparator.reverseOrder() → highest first</span>
+TreeMap&lt;Double, PriceLevel&gt; asks;
+  <span class="cm">// natural order → lowest first</span>
+
+<span class="cm">// TreeMap = red-black tree (self-balancing BST):
+//   put/get/remove   → O(log N)
+//   firstEntry (best) → O(log N), often cached
+//   headMap/tailMap  → O(log N) — for range queries</span>
+
+PriceLevel {
+  double price;
+  LinkedList&lt;Order&gt; orders;   <span class="cm">// FIFO</span>
+  int totalQuantity;          <span class="cm">// O(1) depth</span>
+}</pre>
+        <p class="muted">In prod (LMAX / Nasdaq), a <b>hand-rolled red-black tree</b> or a <b>skip list</b> with cache-friendly memory layout — 2–3× faster than the JVM's boxed <code>TreeMap&lt;Double, ...&gt;</code>.</p>
+      </div>
+      <div class="card">
+        <div class="kicker">why not others</div>
+        <table>
+          <thead><tr><th>Structure</th><th>Ops complexity</th><th>Why not</th></tr></thead>
+          <tbody>
+            <tr><td><b>HashMap</b></td><td>put/get O(1)</td><td>NO ordering — best-bid query is O(N) scan</td></tr>
+            <tr><td><b>PriorityQueue (heap)</b></td><td>peek O(1) · remove-arb O(N)</td><td>can't remove arbitrary order for <b>cancel</b> without O(N) scan</td></tr>
+            <tr><td><b>Sorted array</b></td><td>get O(1) · insert O(N)</td><td>N is 100–500 price levels — insert cost is real; shift-heavy</td></tr>
+            <tr><td><b>Skip list</b></td><td>O(log N) all ops</td><td>Great alt; simpler than RB-tree; used by some HFT firms</td></tr>
+            <tr><td><b>B-tree</b></td><td>O(log N) with high fanout</td><td>Cache-friendly for larger N; over-engineered for ~500 price levels</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+    <div class="callout tip"><b>Why LinkedList (not ArrayList) inside PriceLevel:</b> orders are added at the tail and matched from the head — pure queue semantics. LinkedList: O(1) addLast + O(1) removeFirst. ArrayList: O(1) add but O(N) removeFirst (shifts every element). N per level is small (~10) but this happens on every match — savings compound.</div>
+    <div class="grid g2" style="margin-top:14px">
+      <div class="card"><div class="kicker">cancel-order optimisation</div><pre class="code">Map&lt;String, OrderLocationIndex&gt; orderIndex;
+  <span class="cm">// orderId → (side, price) </span>
+
+<span class="cm">// Without this: cancel scans ALL PriceLevels on both sides → O(P × K)
+// With this: O(log N) TreeMap lookup + O(K) PriceLevel scan
+//   where P = # price levels (100s), K = orders at that price (10s)</span>
+
+public boolean removeOrder(String orderId) {
+  OrderLocationIndex loc = orderIndex.get(orderId);
+  if (loc == null) return false;
+  PriceLevel level = (loc.side == BUY ? bids : asks).get(loc.price);
+  boolean removed = level.removeOrder(orderId);
+  if (level.isEmpty()) side.remove(loc.price);
+  return removed;
+}</pre></div>
+      <div class="card"><div class="kicker">memory footprint</div><pre class="code"><span class="cm">Per resting order  : ~200 B  (Order object + LinkedList node)
+Per PriceLevel     : ~64 B   (header + LinkedList) + orders
+Per hot symbol     : ~2 MB   (~10 K resting orders across ~500 levels)
+All 5 000 symbols  : ~10 GB  → fits in a beefy box's RAM easily
+
+L1 cache line      : 64 B — critical to align PriceLevel + Order structs
+                       so a match doesn't miss cache. LMAX pads everything.</span></pre></div>
+    </div>
+  </section>
+
+  <!-- E · RISK CHECKS -->
+  <section>
+    <div class="sec-h"><span class="n">E</span><h2>Pre-trade risk — 5 checks before the engine</h2><span class="tag">fail-fast · chain-of-responsibility · Redis reads</span></div>
+    <table>
+      <thead><tr><th>Check</th><th>Class</th><th>What it computes</th><th>Reject reason</th></tr></thead>
+      <tbody>
+        <tr><td>1 · <b>Symbol validation</b></td><td>OrderService validation</td><td>symbol exists, is not delisted, is in the segment user is authorised for</td><td><code>UNKNOWN_SYMBOL</code> or <code>NOT_AUTHORISED</code></td></tr>
+        <tr><td>2 · <b>Circuit breaker</b></td><td><code>CircuitBreakerStrategy</code></td><td>trading not halted; price within [lower, upper] band (~±20 % of prev close)</td><td><code>CIRCUIT_BREAKER</code> · <code>TRADING_HALTED</code></td></tr>
+        <tr><td>3 · <b>Margin / buying power</b></td><td><code>MarginCheckStrategy</code></td><td><code>availableMargin ≥ price × qty × marginPercent</code> (CNC 1.0 · MIS 0.20)</td><td><code>INSUFFICIENT_MARGIN</code></td></tr>
+        <tr><td>4 · <b>Position limit</b></td><td><code>PositionLimitStrategy</code></td><td><code>currentQty + orderQty ≤ maxLimit</code> (10 % of free float — regulatory or internal)</td><td><code>POSITION_LIMIT_EXCEEDED</code></td></tr>
+        <tr><td>5 · <b>Wash-sale &amp; STP</b></td><td>engine-side (not chain)</td><td>trade would be same firm on both sides → cancel / decrement per STP tag</td><td>silent cancel (not rejected)</td></tr>
+        <tr><td>+ · <b>Rate limit</b></td><td>API Gateway</td><td>100 orders/sec per user, 20 per second per algo</td><td>HTTP 429</td></tr>
+        <tr><td>+ · <b>Kill switch</b></td><td>ops flag</td><td>manual halt for a symbol, user, or entire venue during an incident</td><td><code>SERVICE_UNAVAILABLE</code></td></tr>
+      </tbody>
+    </table>
+    <div class="grid g2" style="margin-top:14px">
+      <div class="card">
+        <div class="kicker">execution order matters</div>
+        <p>The <code>RiskService</code> runs checks in order and <b>fails fast</b>:</p>
+        <ol class="tight">
+          <li><b>Circuit breaker</b> — pure comparison, ~50 ns, cheapest.</li>
+          <li><b>Margin</b> — 1 Redis read, ~1 ms.</li>
+          <li><b>Position limit</b> — 1 Redis read + aggregation, ~2 ms.</li>
+        </ol>
+        <p class="muted">If margin fails, position-limit isn't checked → saves work. In prod, some checks call the clearing house — expensive; do them LAST.</p>
+      </div>
+      <div class="card">
+        <div class="kicker">the kill-switch (regulatory must-have)</div>
+        <p>Under SEC Rule 15c3-5, every broker-dealer must have a "kill switch" — a manual override to halt all activity when things go wrong. Ours:</p>
+        <ul class="tight">
+          <li><b>Per-symbol halt:</b> Redis flag <code>halt:{symbol}</code> — Circuit-breaker check sees it → reject.</li>
+          <li><b>Per-user halt:</b> for suspicious activity — flip flag, existing orders can cancel but new ones reject.</li>
+          <li><b>Global kill:</b> Kafka consumer groups paused, all new orders → HTTP 503 "market halted".</li>
+        </ul>
+        <p class="muted"><b>Knight Capital, 2012:</b> lost $460 M in 45 minutes because a buggy algo placed millions of orders and there was no kill switch. Result: <b>SEC Rule 15c3-5</b>. Every design must have this.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- F · BOTTLENECKS -->
+  <section>
+    <div class="sec-h"><span class="n">F</span><h2>Bottlenecks &amp; mitigations</h2><span class="tag">the 8 things that will kill you at scale</span></div>
+    <table>
+      <thead><tr><th>#</th><th>Bottleneck</th><th>Symptom</th><th>Mitigation</th></tr></thead>
+      <tbody>
+        <tr><td>1</td><td><b>Hot-symbol engine saturation</b></td><td>1 ticker takes 80 % of the day → its engine thread is CPU-bound</td><td>Dedicate a beefy engine node for top-N hot symbols · rebalance daily by observed volume · LMAX Disruptor for max throughput per thread</td></tr>
+        <tr><td>2</td><td><b>Market-open (9:30) burst</b></td><td>50× traffic spike; risk checks overwhelmed; Redis latency spikes</td><td>Redis Cluster with N shards · pre-warm the JIT (synthetic load 30 min before) · queue-mode risk checks (return 202 + poll) if p99 &gt; 20 ms</td></tr>
+        <tr><td>3</td><td><b>Order book memory blow-up</b></td><td>Attacker or bug places 1 M resting orders → order book bloats · GC pauses</td><td>Per-user resting-order limit (200 default) · per-symbol total resting cap · off-heap allocation (Chronicle Map) · G1GC tuned for low pause</td></tr>
+        <tr><td>4</td><td><b>Kafka partition hot-spotting</b></td><td>All AAPL orders one partition → single broker CPU pegged</td><td>Split hot symbols across sub-partitions (AAPL-1, AAPL-2, ...) with hash routing · scale MSK brokers · reserved MSK IOPS</td></tr>
+        <tr><td>5</td><td><b>Market data fan-out</b></td><td>500 K WebSockets, 1 M ticks/s → 500 GB/s raw fan-out</td><td>100 ms batch windows (drop duplicate LTPs) · per-user subscription pruning (only symbols in watchlist) · WebSocket tier with UDP multicast on backbone</td></tr>
+        <tr><td>6</td><td><b>Trade-persistence lag</b></td><td>Engine produces 100 K trades/s; Aurora writer at 20 K/s → Kafka consumer lag</td><td>Bucket-batch inserts (1 K trades/statement) · shard Trades DB by symbol · use S3 audit as primary durability, Aurora as query index</td></tr>
+        <tr><td>7</td><td><b>Position update races</b></td><td>Same user 10 fills/sec → CAS retry storm on DDB Position row</td><td>Trade Service serialises updates per user_id (single-thread partition consumer) · DDB adaptive capacity · move avg_cost aggregation off critical path</td></tr>
+        <tr><td>8</td><td><b>Failover cold cache</b></td><td>Engine leader dies; follower's book is stale by 500 ms of orders</td><td>Followers actively consume same Kafka partition (silent tail — book is warm) · Kafka offset checkpoint every 100 orders · RTO 5 s target</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <!-- G · CLOUD MAPPING -->
+  <section>
+    <div class="sec-h"><span class="n">G</span><h2>Cloud service mapping (concise)</h2><span class="tag">retail broker stack · HFT runs on-prem / co-located</span></div>
+    <table class="cloudtable">
+      <thead><tr>
+        <th>Component</th>
+        <th><span class="hdrlogo"><span class="logochip"><img src="../assets/logos/aws.svg" alt="AWS"></span>AWS</span></th>
+        <th><span class="hdrlogo"><span class="logochip"><img src="../assets/logos/gcp.svg" alt="GCP"></span>GCP</span></th>
+        <th><span class="hdrlogo"><span class="logochip"><img src="../assets/logos/azure.svg" alt="Azure"></span>Azure</span></th>
+      </tr></thead>
+      <tbody>
+        <tr><td><b>Matching engine (low-latency compute)</b></td><td>EC2 bare metal <b>i3en / c6i.metal</b> · Nitro SR-IOV · cluster placement · <b>FPGA F1</b> for ultra</td><td>Sole-tenant nodes · <b>C3 CPU</b> · compact placement</td><td>Dedicated Host <b>HB120rs_v3</b> · HPC / InfiniBand</td></tr>
+        <tr><td>Ingress · order service</td><td><img class="svcicon" src="../assets/logos/services/aws-ecs.svg" alt="">ECS Fargate + <img class="svcicon" src="../assets/logos/services/aws-apigw.svg" alt="">API Gateway + WAF</td><td><img class="svcicon" src="../assets/logos/services/gcp-run.svg" alt="">GKE + <img class="svcicon" src="../assets/logos/services/gcp-apigw.svg" alt="">Apigee + Armor</td><td><img class="svcicon" src="../assets/logos/services/azure-aks.svg" alt="">AKS + <img class="svcicon" src="../assets/logos/services/azure-apim.svg" alt="">APIM + WAF</td></tr>
+        <tr><td>Orders / Trades DB</td><td><img class="svcicon" src="../assets/logos/services/aws-rds.svg" alt="">Aurora PostgreSQL (Global)</td><td><img class="svcicon" src="../assets/logos/services/gcp-cloudsql.svg" alt="">Cloud SQL / AlloyDB</td><td><img class="svcicon" src="../assets/logos/services/azure-sql.svg" alt="">Azure SQL</td></tr>
+        <tr><td>Positions · account CAS</td><td><img class="svcicon" src="../assets/logos/services/aws-dynamodb.svg" alt="">DynamoDB (Global Tables)</td><td><img class="svcicon" src="../assets/logos/services/gcp-bigtable.svg" alt="">Bigtable / Firestore</td><td><img class="svcicon" src="../assets/logos/services/azure-cosmos.svg" alt="">Cosmos DB</td></tr>
+        <tr><td>Market data cache</td><td><img class="svcicon" src="../assets/logos/services/aws-elasticache.svg" alt="">ElastiCache Redis Cluster</td><td><img class="svcicon" src="../assets/logos/services/gcp-memorystore.svg" alt="">Memorystore Redis</td><td><img class="svcicon" src="../assets/logos/services/azure-redis.svg" alt="">Azure Cache for Redis</td></tr>
+        <tr><td>Event bus (orders · trades)</td><td><img class="svcicon" src="../assets/logos/services/aws-msk.svg" alt="">MSK (Kafka)</td><td><img class="svcicon" src="../assets/logos/services/gcp-pubsub.svg" alt="">Pub/Sub (ordered)</td><td><img class="svcicon" src="../assets/logos/services/azure-eventhubs.svg" alt="">Event Hubs (Kafka)</td></tr>
+        <tr><td>OHLCV time-series</td><td><img class="svcicon" src="../assets/logos/services/aws-redshift.svg" alt="">Timestream / Redshift</td><td><img class="svcicon" src="../assets/logos/services/gcp-bigquery.svg" alt="">BigQuery + Bigtable</td><td><img class="svcicon" src="../assets/logos/services/azure-synapse.svg" alt="">Data Explorer / Synapse</td></tr>
+        <tr><td>WebSocket fan-out</td><td><img class="svcicon" src="../assets/logos/services/aws-apigw.svg" alt="">API GW WebSocket + Lambda</td><td><img class="svcicon" src="../assets/logos/services/gcp-run.svg" alt="">Cloud Run / Firebase RTDB</td><td><img class="svcicon" src="../assets/logos/services/azure-notifhub.svg" alt="">SignalR</td></tr>
+        <tr><td>Audit (WORM, 7 yr)</td><td><img class="svcicon" src="../assets/logos/services/aws-s3.svg" alt="">S3 + Object Lock + Athena</td><td><img class="svcicon" src="../assets/logos/services/gcp-cloudstorage.svg" alt="">Cloud Storage + BigQuery</td><td><img class="svcicon" src="../assets/logos/services/azure-blob.svg" alt="">Blob + Immutable Policy</td></tr>
+        <tr><td>Notifications</td><td><img class="svcicon" src="../assets/logos/services/aws-sns.svg" alt="">SNS + SES</td><td><img class="svcicon" src="../assets/logos/services/gcp-pubsub.svg" alt="">Pub/Sub + Functions</td><td><img class="svcicon" src="../assets/logos/services/azure-notifhub.svg" alt="">Notification Hubs</td></tr>
+      </tbody>
+    </table>
+    <div class="callout warn"><b>The co-location reality:</b> the cloud stack above is for <b>retail brokers</b> (Robinhood, Zerodha) and <b>small exchanges</b>. Real HFT / market-maker firms (Citadel Securities, Jump, Virtu) run <b>bare-metal in the exchange's own data centre</b> (NY4, LD4, TY3), with <b>FPGA NICs</b> (Solarflare / Xilinx), <b>kernel-bypass networking</b> (DPDK / Onload), and <b>Direct Connect / Interconnect</b> only for post-trade / research. Tick-to-trade &lt; 5 μs is not a cloud problem — it's a physics problem (speed of light in fibre). The cloud table is for the 95 % of trading systems that don't need &lt; 100 μs tick-to-trade.</div>
+  </section>
+
+  <!-- H · TRADE-OFFS -->
+  <section>
+    <div class="sec-h"><span class="n">H</span><h2>Trade-offs — 10 decisions you defend at whiteboard</h2><span class="tag">picks + why</span></div>
+    <table>
+      <thead><tr><th>Decision</th><th>Choice</th><th>Alternative rejected</th><th>Why</th></tr></thead>
+      <tbody>
+        <tr><td>Matching concurrency</td><td><b>Single-thread per symbol</b></td><td>multi-threaded locked book</td><td>Locks kill p99 · non-deterministic replay · deadlock risk. Single-thread beats parallel here.</td></tr>
+        <tr><td>Sharding axis</td><td><b>By symbol (via Kafka partition)</b></td><td>by user · by region · by order_id</td><td>The order book has both sides of the market — they must meet in ONE engine. Symbol is the only axis that keeps the book together.</td></tr>
+        <tr><td>Order book DS</td><td><b>TreeMap × 2 + LinkedList queue</b></td><td>HashMap · PriorityQueue · sorted array</td><td>Need O(log N) ordered access + O(1) cancel. HashMap has no order, PQ can't cancel arbitrary orders.</td></tr>
+        <tr><td>Event log</td><td><b>Kafka partition = symbol · acks=all</b></td><td>SQS · plain HTTP · in-process queue</td><td>Ordered delivery per partition · replay for engine recovery · fan-out to 5+ consumers.</td></tr>
+        <tr><td>Orders DB</td><td><b>Aurora PostgreSQL sharded by symbol</b></td><td>DynamoDB · Cassandra</td><td>ACID needed for order state transitions · UNIQUE constraint on idempotency_key · complex history queries.</td></tr>
+        <tr><td>Positions DB</td><td><b>DynamoDB conditional writes</b></td><td>Postgres row lock · Cassandra LWT</td><td>22 K OPS on a single (user, symbol) key — PG row-lock chokes. DDB CAS scales linearly.</td></tr>
+        <tr><td>Market data path</td><td><b>Redis TTL 500 ms + WebSocket batch 100 ms</b></td><td>direct engine → WebSocket · SNS</td><td>Engine must not do fan-out (single-thread hot path). Market Data Service is the buffer + batcher.</td></tr>
+        <tr><td>Consistency at match</td><td><b>Read the engine's in-memory book, never Redis</b></td><td>Redis L2 as source of truth</td><td>Redis lag = display OK, matching NOT OK. Engine owns its own state.</td></tr>
+        <tr><td>Risk check placement</td><td><b>Before Kafka publish, in Order Service</b></td><td>inside the engine</td><td>Engine must be pure matching — any rejectable path is I/O and would break the hot path budget.</td></tr>
+        <tr><td>Failover mode</td><td><b>Primary-backup + Kafka replay</b></td><td>multi-leader · Paxos consensus</td><td>ONE writer per shard — no consensus needed. Kafka log is the WAL. RTO ≈ 5 s.</td></tr>
+        <tr><td>Notifications</td><td><b>Kafka consumer group (async)</b></td><td>inline in order flow</td><td>Adding 100 ms email to placeOrder = 100 ms added to p99. Off critical path.</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <!-- I · INTERVIEW WALKTHROUGH -->
+  <section>
+    <div class="sec-h"><span class="n">I</span><h2>35-minute interview walkthrough</h2><span class="tag">the answer, timed</span></div>
+    <div class="grid g2">
+      <div class="card">
+        <div class="kicker">phase 1 · clarify (2–3 min)</div>
+        <ul class="tight">
+          <li>"Retail broker (routes to exchange) or full exchange (runs matching engine)? I'll design as an <b>exchange</b> to show the full engine."</li>
+          <li>"Order types — market, limit, stop-loss, stop-limit, iceberg? I'll cover the first four."</li>
+          <li>"Latency target — HFT (sub-μs) or retail (sub-10 ms)? Retail — I'll use JVM with LMAX Disruptor, not FPGA."</li>
+          <li>"Regulator — SEC (US) or SEBI (India)? I'll cover Reg NMS + Rule 613 (CAT) + SEBI SMART."</li>
+          <li>"Settlement — T+0 (instant) or T+1? T+1 batch (US &amp; India 2023 standard)."</li>
+        </ul>
+      </div>
+      <div class="card">
+        <div class="kicker">phase 2 · draw architecture (5–7 min)</div>
+        <ul class="tight">
+          <li>Three latency zones: ingress (&lt; 10 ms) · matching (&lt; 1 ms) · post-trade (async).</li>
+          <li>Client → API Gateway → Order Service → Risk chain → Kafka <code>orders.{symbol}</code>.</li>
+          <li>Matching engine (single-thread per symbol) → in-memory order book → <code>trades.{symbol}</code>.</li>
+          <li>Post-trade: Trade Service → Aurora + DDB · Market Data Service → Redis + Timestream · WebSocket Hub.</li>
+          <li>Call out the CAP split — orders CP, market data AP.</li>
+        </ul>
+      </div>
+      <div class="card">
+        <div class="kicker">phase 3 · matching engine deep dive (8–10 min · the STAR)</div>
+        <ul class="tight">
+          <li>Draw the order book: bids desc + asks asc, FIFO at each price level.</li>
+          <li>Walk through <code>matchAgainstAsks</code> — while remaining &gt; 0 and price ≤ limit, fill.</li>
+          <li>Explain <b>single-thread per symbol</b> — no locks, deterministic, LMAX 6 M/s single thread.</li>
+          <li>Sharding by symbol via Kafka partition — one thread per partition.</li>
+          <li>Recovery = Kafka replay → same input, same output.</li>
+        </ul>
+      </div>
+      <div class="card">
+        <div class="kicker">phase 4 · correctness (5–7 min)</div>
+        <ul class="tight">
+          <li>Price-time priority invariant — how TreeMap + LinkedList enforce.</li>
+          <li>Modify = cancel + re-place (loses time priority).</li>
+          <li>Self-trade prevention (STP tag) — engine cancels rather than creates wash trade.</li>
+          <li>Reg NMS + NBBO — Reg NMS Rule 611 requires best-execution across venues.</li>
+          <li>Audit determinism — replay produces bit-identical trades.</li>
+        </ul>
+      </div>
+      <div class="card">
+        <div class="kicker">phase 5 · scale &amp; failure (5–7 min)</div>
+        <ul class="tight">
+          <li>Market-open burst → Redis Cluster + pre-warmed JIT + queue-mode risk.</li>
+          <li>Hot-symbol engine → dedicated node for top-N tickers.</li>
+          <li>Leader crash → follower promoted, replays from Kafka offset (5 s RTO).</li>
+          <li>Kill switch (SEC Rule 15c3-5) — per-symbol · per-user · global.</li>
+          <li>Circuit breakers on price bands · trading halts published to Redis flag.</li>
+        </ul>
+      </div>
+      <div class="card">
+        <div class="kicker">phase 6 · what would you do differently (2–3 min)</div>
+        <ul class="tight">
+          <li>"At 10× scale I'd move the engine to a custom lock-free ring (LMAX / Aeron) — the JVM Disruptor pattern."</li>
+          <li>"For HFT-adjacent tenants I'd add FPGA-accelerated NICs and colocate near the primary matching venue."</li>
+          <li>"I'd add IEX-style speed-bump (350 μs delay) if I want to attract retail flow against latency arbitrage."</li>
+        </ul>
+      </div>
+    </div>
+    <div class="callout tip"><b>30-second pitch:</b> "Microservices behind API Gateway. Split into <b>CP order plane</b> (Order Service → Risk chain → Kafka → matching engine → Trade Service → Aurora / DDB) and <b>AP market-data plane</b> (Market Data Service → Redis + WebSocket Hub → 500 K clients). The matching engine is <b>single-threaded per symbol</b> — Kafka partition = symbol = engine thread. In-memory <b>TreeMap order book</b> matches with <b>price-time priority</b>. Recovery = Kafka replay. 22 K OPS peak, 110 K burst, p99 &lt; 10 ms end-to-end, &lt; 1 ms engine match."</div>
+    <div class="callout warn"><b>Interview red flags to avoid:</b><br>• "Multi-threaded matching with locks." (contention · non-determinism · deadlock risk — LMAX proved single-thread wins)<br>• "Match against Redis LTP." (Redis lags — engine must own its in-memory book)<br>• "Shard by user." (both sides of the trade would sit on different engines — impossible)<br>• "Return the ACK before persisting the order." (durability violation — an ACK'd order that vanishes is a lawsuit)<br>• "Use SQS." (no ordered delivery per symbol · no replay · fan-out is manual)<br>• "Skip pre-trade risk to save latency." (Knight Capital lost $460 M in 45 min this way)</div>
+  </section>
+
+  <!-- GLOSSARY -->
+  <section>
+    <div class="sec-h"><span class="n">§</span><h2>Glossary — one-liners</h2></div>
+    <div class="grid g2">
+      <div class="card"><table><tbody>
+        <tr><td><b>Maker / Taker</b></td><td>maker = resting order (adds liquidity); taker = crosses the spread (removes liquidity). Fee model: maker rebate, taker fee</td></tr>
+        <tr><td><b>NBBO</b></td><td>National Best Bid &amp; Offer — highest bid + lowest ask across all US venues (SIP consolidation)</td></tr>
+        <tr><td><b>Reg NMS Rule 611</b></td><td>protects displayed quotes — venue must not trade through a better price on another venue</td></tr>
+        <tr><td><b>Speed bump</b></td><td>IEX-style 350 μs delay to defeat latency-arbitrage HFT</td></tr>
+        <tr><td><b>Kill switch (Rule 15c3-5)</b></td><td>manual halt — per-symbol · per-user · global; regulatory requirement post-Knight Capital</td></tr>
+        <tr><td><b>LMAX Disruptor</b></td><td>lock-free ring-buffer pattern; single writer + batched consumers; 6 M/s single JVM thread</td></tr>
+      </tbody></table></div>
+      <div class="card"><table><tbody>
+        <tr><td><b>STP (self-trade prevention)</b></td><td>engine cancels one side when same firm's orders would cross — anti-wash</td></tr>
+        <tr><td><b>T+1 settlement</b></td><td>cash + shares change hands 1 business day after trade (US &amp; India 2023 standard)</td></tr>
+        <tr><td><b>SEC Rule 613 (CAT)</b></td><td>every order event reported to Consolidated Audit Trail, 7-year retention</td></tr>
+        <tr><td><b>Consolidated tape</b></td><td>real-time public feed of all trades — SIPs (CTA, UTP, OPRA) run this</td></tr>
+        <tr><td><b>Dark pool</b></td><td>venue where orders are non-displayed pre-trade — matches at midpoint of NBBO</td></tr>
+        <tr><td><b>Circuit breaker</b></td><td>price band or index halt — LULD (Limit-Up Limit-Down) in US, ±20 % in India</td></tr>
+      </tbody></table></div>
+    </div>
+  </section>
+
+  <footer>
+    <p>Use case 16 · Stock Trading — Canvas 3 of 3 (Deep-dive &amp; Trade-offs). Grounded in <code>16-stock-trading/docs/</code> and the real Java under <code>16-stock-trading/src/</code>.</p>
+    <p class="run"><a href="hld.html">← Canvas 1 · HLD</a> · <a href="lld.html">Canvas 2 · LLD</a> · Canvas 3 · Deep-dive &amp; Trade-offs &nbsp;|&nbsp; <a href="../index.html">Hub</a></p>
+  </footer>
+
+</div>
+<script src="../assets/canvas.js"></script>
+</body>
+</html>

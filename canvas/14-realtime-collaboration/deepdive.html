@@ -1,0 +1,528 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>14 · Real-time Collaboration — Deep-dive &amp; Trade-offs</title>
+<link rel="stylesheet" href="../assets/canvas.css">
+</head>
+<body>
+
+<div class="wrap">
+
+  <header class="hero">
+    <h1>Real-time Collaboration — Deep-dive &amp; Trade-offs</h1>
+    <div class="sub">Canvas 3 of 3. Staff-engineer defensible answers. OT (Google Docs) vs CRDT (Figma / Yjs) — correctness proofs, causal order, tombstones · CP edits vs AP presence · Redis heartbeat + cursor throttle · snapshot cadence trade-off · 8 bottlenecks with mitigations · 11-row trade-off table · 35-minute interview walkthrough with phase timing.</div>
+    <div class="badges">
+      <span class="badge lvl">Use case 14 · Deep-dive</span>
+      <span class="badge">Canvas 3 of 3</span>
+      <span class="badge">interview-defensible</span>
+      <span class="badge">Google Docs · Figma · Notion · Atlassian</span>
+    </div>
+    <div class="legend">
+      <span><i class="dot" style="background:var(--eden)"></i> preferred / winner</span>
+      <span><i class="dot" style="background:var(--survivor)"></i> conditional / hybrid</span>
+      <span><i class="dot" style="background:var(--warn)"></i> avoid / red flag</span>
+      <span><i class="dot" style="background:var(--fig)"></i> deep-dive detail</span>
+    </div>
+  </header>
+
+  <!-- A · OT vs CRDT -->
+  <section>
+    <div class="sec-h"><span class="n">A</span><h2>OT vs CRDT — pick your poison</h2><span class="tag">the core algorithmic choice</span></div>
+    <div data-tabscope>
+      <div class="tabs">
+        <div class="tab active" data-tab="a-side">side by side</div>
+        <div class="tab" data-tab="a-ot">OT — how it converges (TP1 proof)</div>
+        <div class="tab" data-tab="a-crdt">CRDT — how it converges (commutativity)</div>
+        <div class="tab" data-tab="a-causal">causal order (both)</div>
+        <div class="tab" data-tab="a-tomb">tombstones + GC</div>
+        <div class="tab" data-tab="a-decide">decision tree</div>
+      </div>
+      <div class="tabpanel active" data-panel="a-side">
+        <table>
+          <thead><tr><th>Aspect</th><th>OT (Google Docs) <span style="color:var(--eden)">← ours</span></th><th>CRDT (Figma / Yjs)</th></tr></thead>
+          <tbody>
+            <tr><td>Central server</td><td>required — server orders + transforms</td><td>optional — peers converge without coordinator</td></tr>
+            <tr><td>Offline</td><td>hard — queue ops, transform against ~N pending on reconnect</td><td>natural — merge by ID ordering on reconnect</td></tr>
+            <tr><td>Correctness proof</td><td>fragile — TP1 by construction, TP2 for &gt; 2 users is famously hard</td><td>mathematical — SEC by data-structure invariant</td></tr>
+            <tr><td>Metadata / char</td><td>none — ops carry (type, pos, content, len)</td><td>every char has (siteId, counter) + tombstone flag</td></tr>
+            <tr><td>Doc size on wire</td><td>~1× content</td><td>~5–10× content (until GC)</td></tr>
+            <tr><td>Server complexity</td><td>high — transform table, doc lock, pending fetch</td><td>low — just relay, merge lives in the data structure</td></tr>
+            <tr><td>Client complexity</td><td>medium — 3-state OT machine + local transform</td><td>high — full CRDT state + tombstone accounting</td></tr>
+            <tr><td>Undo/redo</td><td>straightforward — invert op, transform, submit</td><td>complex — inverse must also commute with concurrent ops</td></tr>
+            <tr><td>Add new op type</td><td>O(n²) — new transform rules against every existing op</td><td>O(1) — define how the type merges with itself</td></tr>
+            <tr><td>Who uses it</td><td>Google Docs · Microsoft 365 · Apache Wave</td><td>Figma · Notion (Yjs) · Automerge · Apple Notes</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="tabpanel" data-panel="a-ot">
+        <p><b>TP1 (Transformation Property 1):</b> <code>apply(A, B') = apply(B, A')</code>. The correctness guarantee for OT with 2 concurrent ops.</p>
+<pre class="code">Doc: "HELLO"
+Alice: INSERT(pos=2, "X")   Bob: INSERT(pos=4, "Y")
+
+Server receives Alice first.
+  1) apply(HELLO, alice) = "HE<b>X</b>LLO"
+  2) transform(bob, alice) → bob':
+       localPos(4) &gt; remotePos(2) → shift bob by +1 = INSERT(pos=5, "Y")
+  3) apply("HEXLLO", bob') = "HEXLL<b>Y</b>O"
+
+Server receives Bob first (parallel universe).
+  1) apply(HELLO, bob) = "HELL<b>Y</b>O"
+  2) transform(alice, bob) → alice':
+       localPos(2) &lt; remotePos(4) → alice unchanged = INSERT(pos=2, "X")
+  3) apply("HELLYO", alice') = "HE<b>X</b>LLYO"
+
+Both universes converge to "HEXLLYO" — TP1 holds.</pre>
+        <div class="callout warn"><b>TP2 is the trap:</b> with 3+ concurrent editors, transforms must ALSO satisfy <code>transform(transform(A, B), C') = transform(transform(A, C), B')</code>. Google Docs has hit divergence bugs here for 15 years — the workaround is <b>centralised OT</b> (server is always the linear authority; TP2 never needs to hold because ops are always applied in a fixed order). This is why our design refuses to do decentralised OT.</div>
+      </div>
+      <div class="tabpanel" data-panel="a-crdt">
+        <p><b>CRDT convergence proof:</b> operations are functions that <b>commute</b>, are <b>associative</b>, and are <b>idempotent</b> (an "ACI"-style structure). Given two nodes with the same set of ops (in ANY order), state is identical. This is <b>Strong Eventual Consistency (SEC)</b> — proved mathematically, not by unit-test.</p>
+<pre class="code">RGA (Replicated Growable Array) — the CRDT for text:
+
+Char node: { id: (siteId, counter), value: "X", parent: (siteId, counter), tombstone: bool }
+
+INSERT "X" between (A,1) and (A,2):
+  new char: { id: (B,1), value: "X", parent: (A,1) }
+
+Order: sort chars by DFS traversal from ROOT.
+  Siblings under same parent → tie-break by id lex order.
+
+Concurrent inserts under same parent (both siteId=A(1) parent):
+  Site B inserts (B,1) → linked after (A,1)
+  Site C inserts (C,1) → linked after (A,1)
+  Merge: both nodes see both children.
+    Sort children by id: (B,1) then (C,1). Both nodes converge.
+
+DELETE "X" (say char (B,1)):
+  Set (B,1).tombstone = true.
+  DO NOT remove the node — others may reference it as parent.
+  Rendering skips tombstoned chars.</pre>
+        <p class="muted"><b>Why "conflict-free":</b> operations reference immutable IDs, not positions. There is nothing to conflict on. The trade-off: every char is now a node in a linked list with (siteId, counter) — that's ~30 bytes of metadata per char.</p>
+      </div>
+      <div class="tabpanel" data-panel="a-causal">
+        <p><b>Causal consistency:</b> if op B was created after seeing op A, every client must apply A before B.</p>
+        <div class="grid g2">
+          <div class="card">
+            <div class="kicker">OT — server total order</div>
+<pre class="code">Server maintains monotonic version.
+Each op carries base_revision.
+
+Server rule (in doc-level critical section):
+  if op.baseRev &lt; server.rev:
+    for pending in ops(baseRev, serverRev]:
+      op' = transform(op', pending)
+  apply(op'); assign server.rev++
+  broadcast op' with new revision.
+
+Client applies incoming ops in strict revision order.
+If rev=8 arrives before rev=7, buffer 8 until 7 lands.</pre>
+          </div>
+          <div class="card">
+            <div class="kicker">CRDT — vector clocks</div>
+<pre class="code">Each op carries a vector clock:
+  { alice: 5, bob: 3 }  means
+  "I've seen alice's first 5, bob's first 3."
+
+Delivery rule:
+  Deliver Alice's op with { alice: 6, bob: 3 } only if:
+    - I've seen alice: 1..5
+    - I've seen bob:   1..3
+
+If either dependency is missing → buffer.
+
+This is Lamport / Fidge–Mattern causality —
+same shape as OT's baseRevision, just per-site.</pre>
+          </div>
+        </div>
+        <p class="muted">Both algorithms enforce causal order. OT uses a <b>single global counter</b> (the server rev). CRDT uses <b>per-site counters</b> (vector clock). Same semantics, different data plane.</p>
+      </div>
+      <div class="tabpanel" data-panel="a-tomb">
+        <p><b>The tombstone tax:</b> in a CRDT, deleted chars are kept as markers so future ops can still resolve their parent references. Long-lived docs accumulate thousands of tombstones.</p>
+<pre class="code">Delete "B" from "ABC":
+  Mark (siteA, 2) as tombstone. Rendering: "AC".
+  Internal: 3 nodes still linked.
+
+Multiply by 100 K deletions over a doc's life → 100 K tombstoned nodes.
+Memory: 100 K × ~30 B = 3 MB of metadata for a 10 KB doc.
+Wire: sending the initial state to a new joiner now includes the tombstones.</pre>
+        <p><b>Garbage collection:</b> a tombstone can be physically removed once <b>all sites have acknowledged</b> the delete op. Ack-tracking is via vector clock — every site periodically publishes its clock; the GC picks tombstones whose "delete op" version is ≤ the min of all published clocks.</p>
+        <div class="callout tip"><b>Yjs mitigation:</b> uses a <b>Doubly Linked List with Structs</b> (DLLS) + delta encoding — tombstones for consecutive deletes coalesce into a single "range tombstone." Cuts memory by 10–100× vs naïve RGA. This is the sort of engineering CRDT libraries do that hand-rolled implementations skip.</div>
+      </div>
+      <div class="tabpanel" data-panel="a-decide">
+<pre class="code">Does the product NEED offline editing (hours, not minutes)?
+├─ YES → CRDT. Metadata overhead + tombstone GC is worth it.
+└─ NO  → next question ─▶
+   Do we have a reliable central authority (single doc = single region)?
+   ├─ YES → <span style="color:var(--eden)">Centralised OT</span>. Simple, fast, well-understood. ← <b>ours</b>
+   └─ NO  → next question ─▶
+       Multi-master requirement? (rare — most collab tools pin a doc to one region)
+       ├─ YES → CRDT. Peer-to-peer merge without coordinator.
+       └─ NO  → OT (with a primary + async region mirrors).</pre>
+        <p class="muted"><b>Practical guidance:</b> if you're building a text editor in 2026 with a small team, use <b>Yjs</b> (a CRDT library). If you're at Google-scale and already have OT running, don't rewrite for CRDT — the engineering cost isn't recouped. Notion migrated to Yjs from a custom OT engine and reported that <b>offline sync</b> was the main win.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- B · CONSISTENCY -->
+  <section>
+    <div class="sec-h"><span class="n">B</span><h2>Consistency — split by subsystem</h2><span class="tag">not one CAP for the whole system</span></div>
+    <div data-tabscope>
+      <div class="tabs">
+        <div class="tab active" data-tab="b-doc">document state (strong)</div>
+        <div class="tab" data-tab="b-pres">presence + cursors (eventual)</div>
+        <div class="tab" data-tab="b-perm">permissions (bounded)</div>
+        <div class="tab" data-tab="b-comm">comments (eventual)</div>
+        <div class="tab" data-tab="b-part">during network partition</div>
+      </div>
+      <div class="tabpanel active" data-panel="b-doc">
+        <p><b>Document state (ops + revisions):</b> strongly consistent, causally ordered.</p>
+        <ul class="tight">
+          <li>Server is the single total-order authority (revision counter is monotonic).</li>
+          <li>Doc-level lock via Redis SETNX ensures serial op application per doc.</li>
+          <li>Op-persist + revision-bump is a single Postgres transaction.</li>
+          <li>Read replicas (used only for doc load) may lag ~100 ms — clients tolerate via WS resync on <code>REVISION_MISMATCH</code>.</li>
+          <li>Under partition (rare in-cloud): <b>refuse ops</b>. Better a "reconnecting…" spinner than a divergent doc.</li>
+        </ul>
+      </div>
+      <div class="tabpanel" data-panel="b-pres">
+        <p><b>Presence + cursors:</b> eventually consistent, best-effort.</p>
+        <ul class="tight">
+          <li>Redis sorted-set <code>presence:{docId}</code> — heartbeat-scored, 60 s IDLE, 120 s LEFT.</li>
+          <li>Cursor updates throttled to 50 ms client-side → 20 updates/sec cap per user.</li>
+          <li>Broadcast via same Kafka path as ops (topic <code>presence.{docId}</code>) — at-least-once, dedup by (userId, timestamp).</li>
+          <li>Stale by 1–2 s → invisible to users. Stale by 30 s → cursor looks "ghosted"; UX still fine.</li>
+          <li>Under partition: <b>continue serving</b>. Show last-known cursor + a "reconnecting…" hint on the affected avatar.</li>
+        </ul>
+      </div>
+      <div class="tabpanel" data-panel="b-perm">
+        <p><b>Permissions:</b> read-side eventually consistent (60 s cache TTL); write-side strongly consistent.</p>
+        <ul class="tight">
+          <li>Permission cache: Redis <code>perm:{doc}:{user} → role</code> with 60 s TTL.</li>
+          <li>Grant / revoke writes go to Postgres <b>and</b> invalidate the cache immediately (best-effort — TTL bounds the risk).</li>
+          <li>Revoked user could theoretically keep editing for up to 60 s. In practice: (a) most collab attacks aren't over seconds; (b) revoke also disconnects any active WebSocket from that user.</li>
+          <li>Strong consistency required for OWNERSHIP transfer — cache-bypass path used.</li>
+        </ul>
+      </div>
+      <div class="tabpanel" data-panel="b-comm">
+        <p><b>Comments:</b> eventually consistent — anchored to a text range at a specific revision.</p>
+        <ul class="tight">
+          <li>Anchor = <code>(anchor_start, anchor_end, anchor_revision)</code>.</li>
+          <li>When later ops shift text, the comment stays anchored to its <b>original revision</b>; UI re-projects the anchor by transforming through the intervening ops.</li>
+          <li>New comment writes are Postgres single-row inserts — safe under load.</li>
+          <li>Comment visibility can lag doc state by ~1 s (Kafka fan-out latency) — acceptable UX.</li>
+        </ul>
+      </div>
+      <div class="tabpanel" data-panel="b-part">
+        <table>
+          <thead><tr><th>Subsystem</th><th>Under partition</th><th>Why</th></tr></thead>
+          <tbody>
+            <tr><td><b>Document ops</b></td><td><b>REFUSE</b> — return <code>ERROR REVISION_MISMATCH</code></td><td>Convergence is non-negotiable. A divergent doc is corruption.</td></tr>
+            <tr><td>Presence / cursors</td><td>Serve stale from local Redis replica</td><td>Stale cursor = UX nit, not correctness bug.</td></tr>
+            <tr><td>Permissions</td><td>Cache serves for TTL (60 s); after that, fail-closed (deny)</td><td>Fail-safe. A revoked user must not edit; a live user tolerates a 60 s outage.</td></tr>
+            <tr><td>Comments</td><td>Queue write locally, replay after heal</td><td>Comments aren't real-time critical.</td></tr>
+            <tr><td>WebSocket</td><td>Broken connections retry with exp backoff</td><td>Client-side OT buffer keeps user typing; sync when line restores.</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+
+  <!-- C · CAP SPLIT TABLE -->
+  <section>
+    <div class="sec-h"><span class="n">C</span><h2>CAP split — one system, five different choices</h2><span class="tag">not one CAP fits all</span></div>
+    <table>
+      <thead><tr><th>Subsystem</th><th>Choice</th><th>PACELC</th><th>Why</th></tr></thead>
+      <tbody>
+        <tr><td><b>Document ops (OT log)</b></td><td><b>CP</b></td><td>PC / EC</td><td>Convergence is the entire product. Divergence = silent data corruption. Refuse ops under partition.</td></tr>
+        <tr><td><b>Document metadata (docs table)</b></td><td><b>CP</b></td><td>PC / EC</td><td>current_revision must be linearisable with the op persist. ACID Postgres transaction.</td></tr>
+        <tr><td><b>Presence / cursors</b></td><td>AP</td><td>PA / EL</td><td>Stale by seconds = fine. Blocking cursor updates on partition = broken UI.</td></tr>
+        <tr><td><b>Permissions (write)</b></td><td><b>CP</b></td><td>PC / EC</td><td>Grant / revoke is a security boundary. Strongly consistent Postgres write; cache invalidate.</td></tr>
+        <tr><td>Permissions (read)</td><td>AP (bounded)</td><td>PA / EL</td><td>60 s Redis cache. Revoked user grace period is a documented trade-off.</td></tr>
+        <tr><td>Comments</td><td>AP</td><td>PA / EL</td><td>Not real-time; anchor tolerates re-projection.</td></tr>
+        <tr><td>Version history / snapshots</td><td>AP</td><td>PA / EL</td><td>Immutable blobs in S3 — eventually visible; browsing tolerates staleness.</td></tr>
+        <tr><td>Kafka op bus</td><td>AP (with ordering per partition)</td><td>—</td><td>At-least-once fan-out; consumers idempotent via <code>local_op_id</code>.</td></tr>
+        <tr><td>Notifications (shares · mentions)</td><td>AP</td><td>PA / EL</td><td>Late email is fine. Blocking edits on email delivery = wrong.</td></tr>
+      </tbody>
+    </table>
+    <div class="callout tip"><b>Interview mic-drop:</b> "The right CAP question isn't 'is this system CP or AP' — it's 'which parts of the system deserve which choice.' For collab, the document is CP because divergence corrupts data; presence is AP because a stale cursor is just cosmetic. If someone tells you the whole system is CP, ask them what happens to cursor updates during a partition — the answer 'we block them' is the wrong answer."</div>
+  </section>
+
+  <!-- D · PRESENCE + CURSOR -->
+  <section>
+    <div class="sec-h"><span class="n">D</span><h2>Presence &amp; cursor sync — Redis heartbeat + throttle</h2><span class="tag">the AP plane</span></div>
+    <div class="grid g2">
+      <div class="card">
+        <div class="kicker">the data flow</div>
+<pre class="code">Client ─── PRESENCE(status=ACTIVE) every 30 s ───▶ WS Gateway
+                                                     │
+                                                     ▼
+Gateway updates Redis (atomic pipeline):
+  ZADD presence:{docId} {epochMs} {userId}
+  HSET user_presence:{userId} last_heartbeat {epochMs}
+  EXPIRE user_presence:{userId} 120
+
+Background sweeper every 10 s:
+  ZRANGEBYSCORE presence:{docId} -inf {now - 60_000}
+    → mark IDLE  (client hasn't pinged in 60 s)
+  ZRANGEBYSCORE presence:{docId} -inf {now - 120_000}
+    → mark LEFT  (client hasn't pinged in 120 s)
+  On state change, publish to Kafka
+    presence.{docId}: PRESENCE_UPDATE
+
+Every WS Gateway consumes presence.{docId}
+  → for local sockets on this doc, push PRESENCE_UPDATE.</pre>
+      </div>
+      <div class="card">
+        <div class="kicker">cursor throttling</div>
+<pre class="code">Client-side (browser JS):
+
+let lastSentAt = 0;
+onCursorMove(pos, selection) {
+  const now = Date.now();
+  if (now - lastSentAt &lt; 50) {
+    <span class="cm">// Coalesce: overwrite pending, don't send yet</span>
+    pendingCursor = { pos, selection };
+    scheduleFlush(50 - (now - lastSentAt));
+    return;
+  }
+  send(CURSOR({ pos, selection }));
+  lastSentAt = now;
+}
+
+Result:
+  Without throttle: cursor events every ~30 ms (arrow-key drag)
+    = 33 messages/sec × 5 M clients = 165 M msgs/sec of cursor spam
+  With 50 ms throttle: 20 msgs/sec cap
+    = 100 M msgs/sec ceiling — same order as ops
+  Human perception: 50 ms is imperceptible.</pre>
+      </div>
+    </div>
+    <div class="grid g2" style="margin-top:14px">
+      <div class="card">
+        <div class="kicker">cursor transform (rare, forgotten in interviews)</div>
+        <ul class="tight">
+          <li>Remote INSERT at pos P, len L:  if cursor ≥ P → cursor += L; else no change.</li>
+          <li>Remote DELETE at pos P, len L:  if cursor ≥ P + L → cursor −= L; else if cursor is inside [P, P+L) → cursor = P (collapse); else no change.</li>
+          <li>Implemented server-side in <code>PresenceService.adjustCursors</code> — called by Facade after each broadcast op with <code>excludeUser = author</code>.</li>
+          <li>Client-side ALSO applies the same transform to its own cursor when it receives a REMOTE_OPERATION — server + client agree because the transform rules are deterministic.</li>
+        </ul>
+      </div>
+      <div class="card">
+        <div class="kicker">hot-doc mitigations (500-user town hall doc)</div>
+        <ul class="tight">
+          <li><b>Cursor sampling</b> — show only the 10 most-recently-active cursors, or the "viewport-nearby" ones. 500 cursors = visual noise anyway.</li>
+          <li><b>Broadcast batching</b> — batch cursor events per 50 ms window into one composite CURSOR_UPDATE frame.</li>
+          <li><b>Presence coarsening</b> — cap presence list to "n other viewers" once above 20 shown. Reduces WS message size linearly.</li>
+          <li><b>Read-replica presence</b> — non-editors can subscribe to a read replica of the Kafka topic; only editors go through the primary path.</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <!-- E · SNAPSHOT + COMPACTION -->
+  <section>
+    <div class="sec-h"><span class="n">E</span><h2>Snapshots + compaction — the storage discipline</h2><span class="tag">event sourcing done right</span></div>
+    <div class="grid g2">
+      <div class="card">
+        <div class="kicker">snapshot cadence — the trade-off</div>
+        <table>
+          <thead><tr><th>Cadence</th><th>Load time</th><th>Storage</th><th>Best for</th></tr></thead>
+          <tbody>
+            <tr><td>Every 10 ops</td><td>~1 ms (replay ≤ 10)</td><td>10× doc size overhead</td><td>demo · tiny docs</td></tr>
+            <tr><td><b>Every 100 ops</b> ← ours</td><td>~10 ms (replay ≤ 100)</td><td>1× doc size overhead</td><td>Google Docs default</td></tr>
+            <tr><td>Every 1 000 ops</td><td>~100 ms (replay ≤ 1 000)</td><td>0.1× overhead</td><td>archives · read-cold docs</td></tr>
+            <tr><td>Every 5 min (time-based)</td><td>variable</td><td>bounded by edit rate</td><td>quiet docs that rarely need loading</td></tr>
+            <tr><td>On last editor leaves</td><td>next load is O(1)</td><td>one extra blob</td><td>opportunistic — pairs with any cadence</td></tr>
+          </tbody>
+        </table>
+        <p class="muted">We combine <b>every 100 ops OR every 5 min OR on last-editor-leaves</b> — whichever fires first. Ensures new joiners always load in &lt; 100 ms even for hot docs; cold docs still snapshot on idle.</p>
+      </div>
+      <div class="card">
+        <div class="kicker">compaction schedule</div>
+<pre class="code">Active period    (0–7 days):
+  Keep ALL individual ops (per-keystroke granularity)
+  Snapshots every 100 ops
+  → enables fine-grained undo, per-keystroke history
+
+Recent period    (7–30 days):
+  Snapshots every 100 ops (kept)
+  Coalesce individual char INSERTs into paragraph-level ops
+  → ~60–70% reduction
+
+Archive period   (30–365 days):
+  Daily snapshots only
+  Individual ops deleted
+  → users see day-granular history, not keystroke
+
+Purge period    (&gt; 365 days):
+  Weekly snapshots for 1 more year
+  Then monthly indefinitely (retention policy)</pre>
+      </div>
+    </div>
+    <div class="callout tip"><b>The math that justifies cadence:</b> at 50 ops/s × 100 B/op × 100 M active docs × 86400 s/day = <b>~500 GB/day</b> of op log. A snapshot every 100 ops = 1 snapshot per 2 seconds per doc; at ~5 KB per snapshot × 2 M active docs × 30 snaps/min = <b>~50 GB/min</b> of snapshot writes at peak. Snapshots go to S3 Standard-IA (~$0.0125/GB/mo). Storage cost of aggressive snapshotting is negligible vs the load-time win.</div>
+  </section>
+
+  <!-- F · BOTTLENECKS -->
+  <section>
+    <div class="sec-h"><span class="n">F</span><h2>Bottlenecks &amp; mitigations</h2><span class="tag">the 8 things that will kill you at scale</span></div>
+    <table>
+      <thead><tr><th>#</th><th>Bottleneck</th><th>Symptom</th><th>Mitigation</th></tr></thead>
+      <tbody>
+        <tr><td>1</td><td><b>Hot doc — town-hall meeting</b></td><td>500 editors on one doc → doc-level lock queue backs up</td><td>Op batching (10 ms windows) · broadcast throttling (50 ms) · cursor sampling · doc splitting (Notion-style blocks)</td></tr>
+        <tr><td>2</td><td><b>WebSocket sticky imbalance</b></td><td>hash(docId) collides — one gateway node hits 80 % of connections</td><td>Consistent-hash with virtual nodes · warm-standby pods · connection-count-based rebalance signal</td></tr>
+        <tr><td>3</td><td><b>Kafka partition hotspot</b></td><td>a viral doc's partition serialises all its ops</td><td>Sub-partition by <code>docId + shard</code> for &gt; N-editor docs · dedicated broker allocation for top-1 % docs</td></tr>
+        <tr><td>4</td><td><b>Long offline reconnect</b></td><td>user offline 6 h → 5 K queued ops must transform against 20 K server ops</td><td>Client resync on huge lag (return DOCUMENT_STATE) · reject ops with base_rev outside retention (client resync)</td></tr>
+        <tr><td>5</td><td><b>Presence storm</b></td><td>network hiccup → 100 K clients reconnect in the same second → Redis ZADD flood</td><td>Reconnect jitter (0–5 s) · presence-write coalescing at gateway · rate-limit ZADD/user/sec</td></tr>
+        <tr><td>6</td><td><b>Cursor spam</b></td><td>unthrottled cursor events at 33 msg/s × 5 M sockets</td><td>Client-side 50 ms throttle · server-side batch every 50 ms · viewport-based sampling</td></tr>
+        <tr><td>7</td><td><b>Op-log fan-out amplification</b></td><td>every gateway consuming every op = 100 GB/s ingress</td><td>Per-doc-subscribe Kafka consumers (subscribe on WS connect, unsubscribe on last-disconnect) · consumer-group rebalance</td></tr>
+        <tr><td>8</td><td><b>Snapshot job stalls</b></td><td>doc load slow because snapshot is 50 K ops behind</td><td>Fallback: replay from older snapshot with reduced tail · alert on <code>ops_since_snapshot &gt; 500</code> · async worker scaling on lag metric</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <!-- G · CLOUD MAPPING -->
+  <section>
+    <div class="sec-h"><span class="n">G</span><h2>Cloud service mapping (concise)</h2><span class="tag">the same design on each cloud</span></div>
+    <table class="cloudtable">
+      <thead><tr>
+        <th>Component</th>
+        <th><span class="hdrlogo"><span class="logochip"><img src="../assets/logos/aws.svg" alt="AWS"></span>AWS</span></th>
+        <th><span class="hdrlogo"><span class="logochip"><img src="../assets/logos/gcp.svg" alt="GCP"></span>GCP</span></th>
+        <th><span class="hdrlogo"><span class="logochip"><img src="../assets/logos/azure.svg" alt="Azure"></span>Azure</span></th>
+      </tr></thead>
+      <tbody>
+        <tr><td><b>Managed real-time (alt)</b></td><td>AppSync + subscriptions</td><td>Firebase Realtime DB / Firestore</td><td>Azure SignalR Service</td></tr>
+        <tr><td><b>WS Gateway (self-managed)</b></td><td><img class="svcicon" src="../assets/logos/services/aws-apigw.svg" alt="">API Gateway (WS) + ECS/EKS</td><td><img class="svcicon" src="../assets/logos/services/gcp-run.svg" alt="">Cloud Run / GKE</td><td><img class="svcicon" src="../assets/logos/services/azure-aks.svg" alt="">AKS + SignalR Service</td></tr>
+        <tr><td>Compute (Collab / Presence / Doc)</td><td><img class="svcicon" src="../assets/logos/services/aws-ecs.svg" alt="">ECS Fargate / EKS</td><td><img class="svcicon" src="../assets/logos/services/gcp-run.svg" alt="">Cloud Run / GKE</td><td><img class="svcicon" src="../assets/logos/services/azure-aks.svg" alt="">AKS / Container Apps</td></tr>
+        <tr><td>Docs · perms · comments</td><td><img class="svcicon" src="../assets/logos/services/aws-rds.svg" alt="">Aurora PostgreSQL</td><td><img class="svcicon" src="../assets/logos/services/gcp-cloudsql.svg" alt="">Cloud SQL / AlloyDB</td><td><img class="svcicon" src="../assets/logos/services/azure-sql.svg" alt="">Azure Database for PG</td></tr>
+        <tr><td>Op log (sharded, indexed)</td><td><img class="svcicon" src="../assets/logos/services/aws-rds.svg" alt="">Aurora PG (sharded)</td><td><img class="svcicon" src="../assets/logos/services/gcp-cloudsql.svg" alt="">Cloud SQL PG</td><td><img class="svcicon" src="../assets/logos/services/azure-sql.svg" alt="">Azure DB for PG</td></tr>
+        <tr><td>Cursor · presence · locks</td><td><img class="svcicon" src="../assets/logos/services/aws-elasticache.svg" alt="">ElastiCache Redis</td><td><img class="svcicon" src="../assets/logos/services/gcp-memorystore.svg" alt="">Memorystore Redis</td><td><img class="svcicon" src="../assets/logos/services/azure-redis.svg" alt="">Azure Cache for Redis</td></tr>
+        <tr><td>Op fan-out</td><td><img class="svcicon" src="../assets/logos/services/aws-msk.svg" alt="">MSK Kafka</td><td><img class="svcicon" src="../assets/logos/services/gcp-pubsub.svg" alt="">Pub/Sub</td><td><img class="svcicon" src="../assets/logos/services/azure-eventhubs.svg" alt="">Event Hubs</td></tr>
+        <tr><td>Snapshot blobs</td><td><img class="svcicon" src="../assets/logos/services/aws-s3.svg" alt="">S3 Standard-IA</td><td><img class="svcicon" src="../assets/logos/services/gcp-cloudstorage.svg" alt="">Cloud Storage Nearline</td><td><img class="svcicon" src="../assets/logos/services/azure-blob.svg" alt="">Blob Storage Cool</td></tr>
+        <tr><td>WS load balancer</td><td><img class="svcicon" src="../assets/logos/services/aws-elb.svg" alt="">ALB (WS sticky)</td><td><img class="svcicon" src="../assets/logos/services/gcp-elb.svg" alt="">Cloud Load Balancing</td><td><img class="svcicon" src="../assets/logos/services/azure-appgw.svg" alt="">Application Gateway</td></tr>
+        <tr><td>Avatars · client-side CDN</td><td><img class="svcicon" src="../assets/logos/services/aws-cloudfront.svg" alt="">CloudFront</td><td><img class="svcicon" src="../assets/logos/services/gcp-cloudcdn.svg" alt="">Cloud CDN</td><td><img class="svcicon" src="../assets/logos/services/azure-cdn.svg" alt="">Azure CDN</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <!-- H · TRADE-OFFS -->
+  <section>
+    <div class="sec-h"><span class="n">H</span><h2>Trade-offs — 11 decisions you defend at whiteboard</h2><span class="tag">picks + why</span></div>
+    <table>
+      <thead><tr><th>Decision</th><th>Choice</th><th>Alternative rejected</th><th>Why</th></tr></thead>
+      <tbody>
+        <tr><td>Conflict resolution</td><td><b>OT (centralised)</b></td><td>CRDT · last-writer-wins</td><td>Simpler payload · lower latency · well-understood. Server is total-order authority. CRDT swap-in via strategy for offline-heavy clients.</td></tr>
+        <tr><td>Op-lock granularity</td><td><b>Per-document (Redis SETNX)</b></td><td>global · per-user · lock-free CAS</td><td>Per-doc = independent parallelism; ~1 ms hold, 20× headroom over peak edit rate. Per-user allows racing; global is a fleet-wide throttle.</td></tr>
+        <tr><td>Transport</td><td><b>WebSocket sticky by docId</b></td><td>SSE · long-polling · Server-Sent Events</td><td>Bidirectional, &lt; 100 ms, native browser. SSE is one-way. Long-polling latency is too high.</td></tr>
+        <tr><td>Fan-out bus</td><td><b>Kafka per-doc topic</b></td><td>Redis Pub/Sub · direct WS mesh</td><td>Ordering per partition = ordering per doc. Durable → gateway restart replay. Redis Pub/Sub loses messages during subscriber blips.</td></tr>
+        <tr><td>Op log storage</td><td><b>Postgres sharded by docId</b></td><td>DynamoDB · Cassandra</td><td>ACID on op-persist + rev-bump. UNIQUE (docId, revision) enforces total order at DB level. Sharding by docId is trivial.</td></tr>
+        <tr><td>Ephemeral state</td><td><b>Redis (TTL-backed)</b></td><td>Postgres · in-process</td><td>Sub-ms latency for cursor + heartbeat. Auto-expire on disconnect. Fits in memory (~10 GB).</td></tr>
+        <tr><td>Snapshot cadence</td><td><b>Every 100 ops + 5 min + last-editor-leaves</b></td><td>full state on every op · no snapshots</td><td>Every-op = 2.5 MB/s per doc write bandwidth. No snapshots = O(N) load. Middle ground amortises both.</td></tr>
+        <tr><td>Undo/redo</td><td><b>Client-side inverse op through OT</b></td><td>server-side undo · rewinding revisions</td><td>Inverse (INSERT ↔ DELETE) transforms cleanly through OT; concurrent edits since undo point re-integrate.</td></tr>
+        <tr><td>Cursor updates</td><td><b>50 ms client-side throttle</b></td><td>every event · 200 ms throttle</td><td>50 ms is imperceptible; cuts traffic ~40 %. 200 ms feels laggy on drag-selection.</td></tr>
+        <tr><td>Presence timeout</td><td><b>60 s IDLE · 120 s LEFT</b></td><td>5 s · 300 s</td><td>5 s = flapping on flaky networks. 300 s = "ghost users" persist too long. 60 / 120 = human-comfortable.</td></tr>
+        <tr><td>Consistency split</td><td><b>CP edits · AP presence</b></td><td>everything CP · everything AP</td><td>Convergence non-negotiable for content; stale cursor is fine. Wrong choice on either side ships a broken product.</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <!-- I · INTERVIEW WALKTHROUGH -->
+  <section>
+    <div class="sec-h"><span class="n">I</span><h2>35-minute interview walkthrough</h2><span class="tag">the answer, timed</span></div>
+    <div class="grid g2">
+      <div class="card">
+        <div class="kicker">phase 1 · clarify (2–3 min)</div>
+        <ul class="tight">
+          <li>"How big — mid-scale (Notion) or Google-scale? I'll assume 100 M docs · 10 M DAU · 5 M concurrent WS."</li>
+          <li>"Do we need offline? A little — buffer &amp; reconcile is fine. Not Figma-level."</li>
+          <li>"Real-time cursors + selections? Yes."</li>
+          <li>"Latency budget? Edit p99 &lt; 100 ms, cursor &lt; 150 ms, doc load &lt; 500 ms."</li>
+          <li>"Rich text? Same OT with FORMAT ops on top — I'll gloss over rich-text specifics."</li>
+        </ul>
+      </div>
+      <div class="card">
+        <div class="kicker">phase 2 · draw architecture (5–7 min)</div>
+        <ul class="tight">
+          <li>Client → LB (sticky by docId) → WS Gateway → Collaboration Service → OT engine → Op log (Postgres).</li>
+          <li>Kafka fan-out to other WS Gateways → REMOTE_OPERATION to other clients.</li>
+          <li>Redis for presence, cursors, doc lock, permission cache.</li>
+          <li>Snapshot job → S3. Version Service uses snapshots for history.</li>
+        </ul>
+      </div>
+      <div class="card">
+        <div class="kicker">phase 3 · OT deep dive (8–10 min)</div>
+        <ul class="tight">
+          <li>Whiteboard: "HELLO" + Alice INSERT(2,"X") + Bob INSERT(4,"Y") → walk through transform.</li>
+          <li>Server assigns revision; late op transforms against pending ops sequentially.</li>
+          <li>TP1: <code>apply(A, B') = apply(B, A')</code>. TP2 for &gt; 2 users → why centralised OT avoids it.</li>
+          <li>Doc-level lock (Redis SETNX) → single writer per doc → total order.</li>
+          <li>Mention CRDT as alternative (Figma / Yjs); tombstones + commutativity.</li>
+        </ul>
+      </div>
+      <div class="card">
+        <div class="kicker">phase 4 · scale &amp; failure (5–7 min)</div>
+        <ul class="tight">
+          <li>5 M WS ÷ 50 K/node = 100 gateway nodes. Sticky by docId → local broadcast.</li>
+          <li>Kafka per-doc topic; gateways subscribe only to docs they host.</li>
+          <li>Snapshot every 100 ops → doc load O(≤ 100).</li>
+          <li>Hot-doc mitigations: op batching, cursor sampling, broadcast throttle.</li>
+          <li>Failure: gateway crash → clients reconnect via LB draining; new gateway replays recent ops from Kafka.</li>
+        </ul>
+      </div>
+      <div class="card">
+        <div class="kicker">phase 5 · trade-offs defended (5–8 min)</div>
+        <ul class="tight">
+          <li>Why OT not CRDT (centralised, simpler payload, dominant in prod; CRDT plugged in for offline).</li>
+          <li>Why doc-level lock not lock-free (correctness + audit; 1000 ops/s/doc ceiling is 20× peak).</li>
+          <li>Why Kafka not Redis Pub/Sub (durability for gateway replay; ordering per partition).</li>
+          <li>Why CP for edits, AP for presence (convergence vs cosmetic).</li>
+          <li>Why sticky sessions (co-locate editors → local broadcast; mitigate imbalance with virtual nodes).</li>
+        </ul>
+      </div>
+      <div class="card">
+        <div class="kicker">phase 6 · what would you do differently (2–3 min)</div>
+        <ul class="tight">
+          <li>"At Figma-scale offline needs, I'd migrate to Yjs — CRDT with delta encoding."</li>
+          <li>"I'd add a block-level model (Notion-style) so hot docs partition naturally into sub-doc streams."</li>
+          <li>"I'd move the doc-level lock from Redis to a Rust in-process actor per doc — sub-100 µs hold."</li>
+          <li>"I'd add per-user ML-based conflict prediction — pre-transform on the client to avoid round-trip on obvious cases."</li>
+        </ul>
+      </div>
+    </div>
+    <div class="callout tip"><b>30-second pitch:</b> "Real-time collab is fundamentally a <b>conflict-resolution</b> problem. I use <b>centralised OT</b> — server is total-order authority; late ops transform against ops that already committed; per-doc Redis lock serialises. WebSocket fan-out via Kafka per-doc topic; Redis for cursors + presence (AP). Snapshot every 100 ops + op replay for O(≤ 100) doc load. <b>CP for content</b> (divergence = data loss), <b>AP for presence</b> (stale cursor = UX nit). CRDT (Figma / Yjs) is the alternative — natural offline, mathematically proven convergence, but higher metadata cost. Swap in via the SyncStrategy interface for offline-heavy clients."</div>
+    <div class="callout warn"><b>Interview red flags to avoid:</b><br>• "I'd replace the whole document on each edit." (fatal — last-writer-wins loses concurrent edits silently)<br>• "I'd use HTTP polling." (latency &gt; 1 s; can't achieve &lt; 100 ms)<br>• "The whole system is CP." (breaks presence during partitions unnecessarily)<br>• "Peer-to-peer OT." (TP2 is famously unimplemented; decentralised OT = divergence bugs)<br>• "One server per document." (single point of failure; no scale plan)<br>• "Delete tombstones as soon as ops apply." (CRDT correctness bug — future ops need the parent reference)<br>• "Skip the doc-level lock." (races → divergence → silent corruption; a divergence bug takes weeks to find)</div>
+  </section>
+
+  <!-- GLOSSARY -->
+  <section>
+    <div class="sec-h"><span class="n">§</span><h2>Glossary — one-liners</h2></div>
+    <div class="grid g2">
+      <div class="card"><table><tbody>
+        <tr><td><b>OT</b></td><td>Operational Transform — server rewrites late ops so both orders converge</td></tr>
+        <tr><td><b>TP1</b></td><td>Transformation Property 1: <code>apply(A, B') = apply(B, A')</code> — the pairwise correctness</td></tr>
+        <tr><td><b>TP2</b></td><td>Extra property for &gt; 2 users; needed only in decentralised OT; famously hard</td></tr>
+        <tr><td><b>CRDT · RGA</b></td><td>Conflict-free Replicated Data Type · Replicated Growable Array (char has unique ID)</td></tr>
+        <tr><td><b>SEC</b></td><td>Strong Eventual Consistency — same set of ops (in any order) → identical state</td></tr>
+        <tr><td><b>Tombstone</b></td><td>soft-deleted CRDT char; kept so future ops can still resolve parent refs</td></tr>
+      </tbody></table></div>
+      <div class="card"><table><tbody>
+        <tr><td><b>Vector clock</b></td><td>per-site counter map used to enforce causal delivery in CRDT</td></tr>
+        <tr><td><b>base_revision</b></td><td>server rev the client had seen when it created the op — used for pending-op fetch</td></tr>
+        <tr><td><b>Sticky session</b></td><td>hash(docId) routing → editors of one doc co-locate on one gateway node</td></tr>
+        <tr><td><b>Snapshot cadence</b></td><td>every 100 ops OR 5 min OR last-editor-leaves — bounds load-time replay cost</td></tr>
+        <tr><td><b>PACELC</b></td><td>if Partition then Availability vs Consistency; else Latency vs Consistency</td></tr>
+        <tr><td><b>Cursor transform</b></td><td>after remote INSERT/DELETE, shift other users' cursors by the same rules as text</td></tr>
+      </tbody></table></div>
+    </div>
+  </section>
+
+  <footer>
+    <p>Use case 14 · Real-time Collaboration — Canvas 3 of 3 (Deep-dive &amp; Trade-offs). Grounded in <code>14-realtime-collaboration/docs/</code> and the real Java under <code>14-realtime-collaboration/src/</code>.</p>
+    <p class="run"><a href="hld.html">← Canvas 1 · HLD</a> · <a href="lld.html">Canvas 2 · LLD</a> · Canvas 3 · Deep-dive &amp; Trade-offs &nbsp;|&nbsp; <a href="../index.html">Hub</a></p>
+  </footer>
+
+</div>
+<script src="../assets/canvas.js"></script>
+</body>
+</html>

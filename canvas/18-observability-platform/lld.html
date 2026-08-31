@@ -1,0 +1,517 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>18 · Observability Platform — LLD</title>
+<link rel="stylesheet" href="../assets/canvas.css">
+</head>
+<body>
+
+<div class="wrap">
+
+  <header class="hero">
+    <h1>Observability Platform — Low-Level Design</h1>
+    <div class="sub">Canvas 2 of 3. Real Java classes under <code>18-observability-platform/src/main/java/com/systemdesign/observability/</code>. Composition root <code>AppConfig</code> → controller → <b>Facade <code>ObservabilityService</code></b> → 3 pillar services (<code>MetricService</code> · <code>TracingService</code> · <code>LogService</code>) → engines (<code>MetricAggregator</code> · <code>TraceAssembler</code> · <code>LogProcessor</code>) → <b>the STAR: <code>TimeSeriesStore</code></b> (bucketed <code>TreeMap&lt;Long, List&lt;MetricPoint&gt;&gt;</code>, O(log n + k) range queries) → 3 Strategy families (Sampling · Aggregation · Alerting) → 4 repositories.</div>
+    <div class="badges">
+      <span class="badge lvl">Use case 18 · LLD</span>
+      <span class="badge">Canvas 2 of 3</span>
+      <span class="badge">grounded in code</span>
+      <span class="badge">Strategy · Builder · Factory · Repository · Facade · Chain</span>
+    </div>
+    <div class="legend">
+      <span><i class="dot" style="background:var(--eden)"></i> composition root</span>
+      <span><i class="dot" style="background:var(--survivor)"></i> facade &amp; services · engines</span>
+      <span><i class="dot" style="background:var(--warn)"></i> storage engine (STAR) · alert</span>
+      <span><i class="dot" style="background:var(--fig)"></i> strategies (swappable)</span>
+      <span><i class="dot" style="background:var(--old)"></i> domain models · repos</span>
+    </div>
+  </header>
+
+  <!-- A · CLASS MAP -->
+  <section>
+    <div class="sec-h"><span class="n">A</span><h2>Class map — click any class</h2><span class="tag">from <code>src/main/java/com/systemdesign/observability/</code></span></div>
+    <div>
+      <div class="arch">
+        <svg viewBox="0 0 900 520" width="100%" style="max-width:900px" role="img" aria-label="Observability class map">
+          <defs>
+            <marker id="ah18l" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" fill="var(--muted)"></path></marker>
+            <marker id="ah18lw" markerWidth="10" markerHeight="10" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" fill="var(--warn)"></path></marker>
+          </defs>
+          <!-- Grid: 3 cols (x=20 w=240, x=330 w=240, x=640 w=240), 6 rows (y=30,110,190,270,350,430, h=54).
+               Gutters at x=260-330 (70px) and x=570-640 (70px). Row-gaps ~26px.
+               Mid-y per row: 57, 137, 217, 297, 377, 457. -->
+
+          <!-- ═══════ arrows ═══════ -->
+
+          <!-- Col 1 verticals (composition lane) -->
+          <line class="arrow" x1="140" y1="84" x2="140" y2="110" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah18l)"></line>
+          <line class="arrow" x1="140" y1="164" x2="140" y2="190" stroke="var(--muted)" stroke-width="1.5" stroke-dasharray="4 3" marker-end="url(#ah18l)"></line>
+
+          <!-- Controller → Facade — diagonal up-right through col1-2 gutter -->
+          <line class="arrow" x1="260" y1="137" x2="330" y2="57" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah18l)"></line>
+
+          <!-- Facade → MetricService — L-path through left gutter at x=295 -->
+          <path class="arrow" d="M330,57 L295,57 L295,217 L260,217" fill="none" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah18l)"></path>
+
+          <!-- Facade → TracingService · x=310 -->
+          <path class="arrow" d="M330,57 L310,57 L310,297 L260,297" fill="none" stroke="var(--muted)" stroke-width="1.5" stroke-dasharray="4 3" marker-end="url(#ah18l)"></path>
+          <!-- Facade → LogService · x=320 -->
+          <path class="arrow" d="M330,57 L320,57 L320,377 L260,377" fill="none" stroke="var(--muted)" stroke-width="1.5" stroke-dasharray="4 3" marker-end="url(#ah18l)"></path>
+
+          <!-- ★ MetricService → TimeSeriesStore (STAR) — L-path via left gutter at x=300 -->
+          <path class="arrow" d="M260,217 L300,217 L300,377 L330,377" fill="none" stroke="var(--warn)" stroke-width="2.5" marker-end="url(#ah18lw)"></path>
+          <text class="edge-label" x="300" y="337" text-anchor="middle" fill="var(--warn)" font-weight="700">store(point)</text>
+
+          <!-- MetricService → MetricAggregator (col1 r3 → col2 r2) — diagonal up-right, dashed uses -->
+          <line class="arrow" x1="260" y1="217" x2="330" y2="137" stroke="var(--muted)" stroke-width="1.5" stroke-dasharray="4 3" marker-end="url(#ah18l)"></line>
+
+          <!-- TracingService → TraceAssembler (col1 r4 → col2 r3) — diagonal up-right -->
+          <line class="arrow" x1="260" y1="297" x2="330" y2="217" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah18l)"></line>
+
+          <!-- LogService → LogProcessor (col1 r5 → col2 r4) — diagonal up-right -->
+          <line class="arrow" x1="260" y1="377" x2="330" y2="297" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah18l)"></line>
+
+          <!-- AlertService → MetricService (col2 r6 → col1 r3) — L-path via left gutter x=280, dashed = queries -->
+          <path class="arrow" d="M330,457 L280,457 L280,217 L260,217" fill="none" stroke="var(--muted)" stroke-width="1.5" stroke-dasharray="4 3" marker-end="url(#ah18l)"></path>
+
+          <!-- Facade → AlertService — route via right gutter x=605 -->
+          <path class="arrow" d="M570,57 L605,57 L605,457 L570,457" fill="none" stroke="var(--muted)" stroke-width="1.2" stroke-dasharray="4 3" marker-end="url(#ah18l)"></path>
+
+          <!-- Col 2 → Col 3 (engines use strategies) -->
+          <!-- TracingService uses SamplingStrategy — arrow from TracingService directly across via TraceAssembler? Use MetricAggregator → AggregationStrategy: (570,137) → (640,137) -->
+          <line class="arrow" x1="570" y1="137" x2="640" y2="137" stroke="var(--muted)" stroke-width="1.2" stroke-dasharray="4 3" marker-end="url(#ah18l)"></line>
+          <!-- TraceAssembler + Sampling — from col1 TracingService using SamplingStrategy in col3 r1: L-path -->
+          <path class="arrow" d="M260,297 L615,297 L615,57 L640,57" fill="none" stroke="var(--muted)" stroke-width="1" stroke-dasharray="2 3" marker-end="url(#ah18l)"></path>
+          <!-- AlertService → AlertingStrategy col3 r5 — horizontal at r5 -->
+          <line class="arrow" x1="570" y1="457" x2="640" y2="457" stroke="var(--muted)" stroke-width="1.5" stroke-dasharray="4 3" marker-end="url(#ah18l)"></line>
+
+          <!-- TimeSeriesStore → Domain Models (col3 r3) — horizontal at y ≈ mid -->
+          <line class="arrow" x1="570" y1="377" x2="640" y2="297" stroke="var(--muted)" stroke-width="1" stroke-dasharray="2 3" marker-end="url(#ah18l)"></line>
+          <!-- TraceAssembler → Domain Models -->
+          <line class="arrow" x1="570" y1="217" x2="640" y2="297" stroke="var(--muted)" stroke-width="1" stroke-dasharray="2 3" marker-end="url(#ah18l)"></line>
+          <!-- AlertService → Alert Models (col3 r4) — diagonal via right gutter -->
+          <path class="arrow" d="M570,457 L595,457 L595,377 L640,377" fill="none" stroke="var(--muted)" stroke-width="1" stroke-dasharray="2 3" marker-end="url(#ah18l)"></path>
+
+          <!-- Services → Repositories (col3 r6) — dashed uses -->
+          <line class="arrow" x1="260" y1="217" x2="640" y2="457" stroke="var(--muted)" stroke-width="0.8" stroke-dasharray="2 3" marker-end="url(#ah18l)"></line>
+
+          <!-- ═══════ NODES (17 total) ═══════ -->
+
+          <!-- Col 1 — services lane -->
+          <g data-node style="cursor:pointer" data-title="AppConfig (Factory · Composition Root · Singleton)" data-detail="<b>Path:</b> <code>config/AppConfig.java</code>. The ONLY place with <code>new ConcreteClass()</code>.<br><b>Lazy init:</b> every getter is <code>if (field == null) field = new …; return field;</code> — no eager wiring, no unused objects.<br><b>Wires:</b> 4 Repositories (InMemory*) → 5 Engines (TimeSeriesStore · TraceAssembler · MetricAggregator · SamplingEngine · LogProcessor) → 3 Strategies (default Head 100 % · Percentile 99 · Threshold) → 7 Services → Facade → Controller → StatsDisplay.<br><b>Strategy swap:</b> <code>setSamplingStrategy(...)</code> nulls out downstream deps (samplingEngine, tracingService, observabilityService, controller) so they re-create with the new strategy on next getter call — cascade invalidation."><rect x="20" y="30" width="240" height="54" rx="9" fill="var(--panel-2)" stroke="var(--eden)"></rect><text x="140" y="55" text-anchor="middle" fill="var(--eden)" font-size="13" font-weight="600">AppConfig</text><text x="140" y="72" text-anchor="middle" fill="var(--faint)" font-size="11">composition root · lazy</text></g>
+
+          <g data-node style="cursor:pointer" data-title="ObservabilityController (REST adapter)" data-detail="<b>Path:</b> <code>controller/ObservabilityController.java</code>. Thin REST adapter — never contains business logic.<br><b>Handlers:</b> <code>ingestMetric(name, value, type, tags)</code>, <code>startTrace(op, service)</code>, <code>finishSpan(span)</code>, <code>ingestLog(level, msg, service)</code>, <code>evaluateAlerts()</code>, <code>getAlerts()</code>, <code>getDashboard()</code>.<br><b>Delegates:</b> every handler calls <code>observabilityService.xxx()</code> — the Facade. Prints the simulated HTTP method + path before delegating.<br><b>Prod:</b> Spring <code>@RestController</code> with <code>@PostMapping</code> / <code>@GetMapping</code>."><rect x="20" y="110" width="240" height="54" rx="9" fill="var(--panel-2)" stroke="var(--border)"></rect><text x="140" y="135" text-anchor="middle" fill="var(--text)" font-size="13" font-weight="600">ObservabilityController</text><text x="140" y="152" text-anchor="middle" fill="var(--faint)" font-size="11">REST adapter · thin</text></g>
+
+          <g data-node style="cursor:pointer" data-title="MetricService (metrics pillar)" data-detail="<b>Path:</b> <code>service/MetricService.java</code>. Metric lifecycle: record · query · aggregate.<br><b>Deps (constructor-injected):</b> <code>MetricRepository</code> (persists definitions) · <code>TimeSeriesStore</code> (stores points) · <code>MetricAggregator</code> (statistical functions).<br><b>Flow — recordMetric(name, value, type, tags):</b><br>(1) <code>MetricPoint point = MetricPoint.of(name, value, type, tags)</code> — stamps <code>Instant.now()</code>.<br>(2) <code>timeSeriesStore.store(point)</code> — the STAR call.<br>(3) If <code>metricRepo.findByName(name).isEmpty()</code> → create Metric via Builder + save.<br><b>Convenience:</b> <code>recordCounter · recordGauge · recordHistogram · recordTimer</code>."><rect x="20" y="190" width="240" height="54" rx="9" fill="var(--panel-2)" stroke="var(--survivor)"></rect><text x="140" y="215" text-anchor="middle" fill="var(--survivor)" font-size="13" font-weight="600">MetricService</text><text x="140" y="232" text-anchor="middle" fill="var(--faint)" font-size="11">record · query · aggregate</text></g>
+
+          <g data-node style="cursor:pointer" data-title="TracingService (tracing pillar)" data-detail="<b>Path:</b> <code>service/TracingService.java</code>. Distributed-trace lifecycle.<br><b>Deps:</b> <code>TraceRepository</code> · <code>TraceAssembler</code> · <code>SamplingStrategy</code> (via SamplingEngine).<br><b>Internal state:</b> <code>Map&lt;String, TraceContext&gt; activeContexts</code> — tracks live traces.<br><b>Flow — startTrace(op, service):</b><br>(1) <code>TraceContext.newTrace()</code> — fresh UUID for traceId + spanId.<br>(2) <code>samplingEngine.shouldSample(context, op)</code> — head-based hash decision.<br>(3) Build root <code>Span.Builder(traceId, op, service).build()</code> (parentSpanId = null).<br>(4) <code>activeContexts.put(traceId, context)</code>.<br><b>startSpan(traceId, parentSpanId, op, service):</b> builds child span with parentSpanId set."><rect x="20" y="270" width="240" height="54" rx="9" fill="var(--panel-2)" stroke="var(--survivor)"></rect><text x="140" y="295" text-anchor="middle" fill="var(--survivor)" font-size="13" font-weight="600">TracingService</text><text x="140" y="312" text-anchor="middle" fill="var(--faint)" font-size="11">startTrace · startSpan</text></g>
+
+          <g data-node style="cursor:pointer" data-title="LogService (logging pillar)" data-detail="<b>Path:</b> <code>service/LogService.java</code>. Log ingestion + search.<br><b>Deps:</b> <code>LogRepository</code> · <code>LogProcessor</code> (Chain of Responsibility).<br><b>Flow — logWithTrace(level, msg, service, traceId, spanId):</b><br>(1) <code>new LogEntry(level, msg, serviceName)</code>.<br>(2) <code>entry.setTraceId(traceId); entry.setSpanId(spanId)</code> — CORRELATION.<br>(3) <code>logProcessor.process(entry)</code> — level gate + custom filters.<br>(4) If survives → <code>logRepo.save(entry)</code>.<br><b>Search:</b> <code>getLogsByTrace(traceId)</code> is the cross-pillar drilldown — sorted by timestamp."><rect x="20" y="350" width="240" height="54" rx="9" fill="var(--panel-2)" stroke="var(--survivor)"></rect><text x="140" y="375" text-anchor="middle" fill="var(--survivor)" font-size="13" font-weight="600">LogService</text><text x="140" y="392" text-anchor="middle" fill="var(--faint)" font-size="11">log · search · correlate</text></g>
+
+          <!-- Col 2 — Facade + engines + STAR + AlertService -->
+          <g data-node style="cursor:pointer" data-title="ObservabilityService (Facade)" data-detail="<b>Path:</b> <code>service/ObservabilityService.java</code>. The ONE DOOR for callers.<br><b>Delegation map:</b><br>• <code>recordMetric(...)</code> → MetricService.recordMetric<br>• <code>startTrace / startSpan / finishSpan</code> → TracingService<br>• <code>log / logWithTrace</code> → LogService<br>• <code>evaluateAlerts()</code> → AlertService.evaluateRules<br>• <code>getSystemOverview()</code> → DashboardService.getSystemOverview<br>• <code>registerServiceCall(...)</code> → ServiceMapService<br><b>Why:</b> callers depend on ONE interface, not six. Sub-services can be split across microservices later — the Facade signature stays."><rect x="330" y="30" width="240" height="54" rx="9" fill="var(--panel-2)" stroke="var(--survivor)"></rect><text x="450" y="55" text-anchor="middle" fill="var(--survivor)" font-size="13" font-weight="600">ObservabilityService</text><text x="450" y="72" text-anchor="middle" fill="var(--faint)" font-size="11">Facade · one door</text></g>
+
+          <g data-node style="cursor:pointer" data-title="MetricAggregator (stateless functions)" data-detail="<b>Path:</b> <code>engine/MetricAggregator.java</code>. Statistical functions over <code>List&lt;MetricPoint&gt;</code>.<br><b>Methods:</b><br>• <code>sum(points)</code> — O(n).<br>• <code>average(points)</code> — O(n).<br>• <code>min · max</code> — O(n).<br>• <code>percentile(points, p)</code> — sort ascending, index = <code>ceil(p/100 · N) − 1</code>, O(n log n) — nearest-rank (Prometheus / Datadog).<br>• <code>rate(points)</code> — sort by timestamp, <code>(last − first) / timeDelta</code> — O(n log n).<br>• <code>histogram(points, boundaries)</code> — distribute into labeled buckets, O(n · B).<br><b>Prod streaming:</b> t-digest / DDSketch / HDR Histogram — mergeable, O(1) amortized insertion, bounded error."><rect x="330" y="110" width="240" height="54" rx="9" fill="var(--panel-2)" stroke="var(--survivor)"></rect><text x="450" y="135" text-anchor="middle" fill="var(--survivor)" font-size="13" font-weight="600">MetricAggregator</text><text x="450" y="152" text-anchor="middle" fill="var(--faint)" font-size="11">sum · avg · pct · rate</text></g>
+
+          <g data-node style="cursor:pointer" data-title="TraceAssembler (buffer + assemble)" data-detail="<b>Path:</b> <code>engine/TraceAssembler.java</code>. Buffers spans until root arrives.<br><b>Data structure:</b> <code>Map&lt;String, List&lt;Span&gt;&gt; pendingSpans</code> — ConcurrentHashMap outer, <code>Collections.synchronizedList</code> inner.<br><b>addSpan(span):</b> <code>pendingSpans.computeIfAbsent(traceId, k -&gt; syncList).add(span)</code>.<br><b>assembleTrace(traceId):</b><br>(1) find root: <code>spans.stream().filter(s -&gt; s.getParentSpanId() == null).findFirst()</code>.<br>(2) if no root → <code>Optional.empty()</code> (defer, keep buffering).<br>(3) build <code>Trace(traceId, root.serviceName)</code>, addSpan all, remove from pending, return.<br><b>Prod OOM guard:</b> memory_limiter drops oldest traces; 60 s stale timeout."><rect x="330" y="190" width="240" height="54" rx="9" fill="var(--panel-2)" stroke="var(--survivor)"></rect><text x="450" y="215" text-anchor="middle" fill="var(--survivor)" font-size="13" font-weight="600">TraceAssembler</text><text x="450" y="232" text-anchor="middle" fill="var(--faint)" font-size="11">buffer · find root · build</text></g>
+
+          <g data-node style="cursor:pointer" data-title="LogProcessor (Chain of Responsibility)" data-detail="<b>Path:</b> <code>engine/LogProcessor.java</code>. Configurable filter pipeline for log entries.<br><b>State:</b> <code>LogLevel minLevel = INFO</code> · <code>List&lt;Predicate&lt;LogEntry&gt;&gt; filters</code> (composable).<br><b>process(entry):</b><br>(1) Level gate: <code>if (!entry.level.isAtLeast(minLevel)) return empty()</code>.<br>(2) Custom filters: iterate predicates, <code>if (!p.test(entry)) return empty()</code>.<br>(3) Return <code>Optional.of(entry)</code>.<br><b>Convenience:</b> <code>processBatch(entries)</code> — stream + filter present.<br><b>enrichWithCorrelation(entry, traceId, spanId):</b> sets IDs on the entry — the cross-signal glue."><rect x="330" y="270" width="240" height="54" rx="9" fill="var(--panel-2)" stroke="var(--survivor)"></rect><text x="450" y="295" text-anchor="middle" fill="var(--survivor)" font-size="13" font-weight="600">LogProcessor</text><text x="450" y="312" text-anchor="middle" fill="var(--faint)" font-size="11">level + predicates chain</text></g>
+
+          <g data-node style="cursor:pointer" data-title="TimeSeriesStore (STAR · engine core)" data-detail="<b>Path:</b> <code>engine/TimeSeriesStore.java</code>. The metric storage engine.<br><b>Data structure:</b> <code>Map&lt;String, TreeMap&lt;Long, List&lt;MetricPoint&gt;&gt;&gt; store</code>.<br>• Outer: <code>ConcurrentHashMap</code> — metric-name-level concurrency.<br>• Middle: <code>TreeMap</code> keyed by epochSecond — sorted, O(log n) range seek.<br>• Inner: <code>synchronizedList</code> — bucket-level writes.<br><b>store(point):</b> two <code>computeIfAbsent</code>s + <code>add</code>. O(log S).<br><b>query(name, from, to):</b> <code>subMap(from.epochSec, to.epochSec + 1).values().flatMap(List::stream)</code>. O(log S + K).<br><b>downsample(name, bucketSize):</b> group by <code>(epochSec / bucketSec) · bucketSec</code>, average → representative point.<br><b>Prod:</b> VictoriaMetrics / InfluxDB — same shape, LSM-tree + Gorilla compression on disk."><rect x="330" y="350" width="240" height="54" rx="9" fill="var(--panel-2)" stroke="var(--warn)" stroke-width="2"></rect><text x="450" y="375" text-anchor="middle" fill="var(--warn)" font-size="14" font-weight="700">TimeSeriesStore</text><text x="450" y="392" text-anchor="middle" fill="var(--faint)" font-size="11">TreeMap · subMap · O(log n)</text></g>
+
+          <g data-node style="cursor:pointer" data-title="AlertService (rule evaluator)" data-detail="<b>Path:</b> <code>service/AlertService.java</code>. Evaluates rules on a 60 s schedule.<br><b>Deps:</b> <code>AlertRepository</code> · <code>AlertingStrategy</code> · <code>MetricService</code>.<br><b>State:</b> <code>CopyOnWriteArrayList&lt;AlertRule&gt; rules</code> (read-heavy) · <code>Map&lt;String, String&gt; firingRules</code> (ruleId → alertId, dedup).<br><b>evaluateRules():</b><br>(1) window = [now − 60 s, now].<br>(2) for each enabled rule: <code>points = metricService.query(rule.metricName, windowStart, now)</code>.<br>(3) <code>alertingStrategy.shouldAlert(rule, points)</code>.<br>(4a) NEW → new Alert(FIRING), <code>alertRepo.save</code>, track in firingRules.<br>(4b) CLEARED → remove from firingRules, <code>alert.resolve()</code>, stamp <code>resolvedAt</code>."><rect x="330" y="430" width="240" height="54" rx="9" fill="var(--panel-2)" stroke="var(--warn)"></rect><text x="450" y="455" text-anchor="middle" fill="var(--warn)" font-size="13" font-weight="600">AlertService</text><text x="450" y="472" text-anchor="middle" fill="var(--faint)" font-size="11">evaluate · fire · resolve</text></g>
+
+          <!-- Col 3 — strategies + models + repos -->
+          <g data-node style="cursor:pointer" data-title="SamplingStrategy family (3 impls)" data-detail="<b>Path:</b> <code>strategy/sampling/</code>.<br><b>Interface:</b> <code>boolean shouldSample(TraceContext); boolean shouldSample(TraceContext, String opName); String getStrategyName();</code><br><b>Impls:</b><br>• <code>HeadBasedSamplingStrategy(sampleRate)</code> — <code>Math.abs(hash(traceId)) % 100 &lt; sampleRate · 100</code>. Deterministic. Consistent across services. O(1).<br>• <code>TailBasedSamplingStrategy(errorRate, latencyMs)</code> — <code>shouldSample(ctx) = true</code> (buffer all); <code>shouldSample(ctx, op)</code> checks baggage <code>error='true'</code> or <code>latency_ms &gt; threshold</code>.<br>• <code>RateLimitedSamplingStrategy(maxPerSec)</code> — <code>AtomicInteger</code> + <code>AtomicLong</code> for sliding window; CAS reset; O(1)."><rect x="640" y="30" width="240" height="54" rx="9" fill="var(--panel-2)" stroke="var(--fig)"></rect><text x="760" y="55" text-anchor="middle" fill="var(--fig)" font-size="13" font-weight="600">SamplingStrategy</text><text x="760" y="72" text-anchor="middle" fill="var(--faint)" font-size="11">Head · Tail · Rate</text></g>
+
+          <g data-node style="cursor:pointer" data-title="AggregationStrategy family (2 impls)" data-detail="<b>Path:</b> <code>strategy/aggregation/</code>.<br><b>Interface:</b> <code>double aggregate(List&lt;MetricPoint&gt; points); String getStrategyName();</code><br><b>Impls:</b><br>• <code>PercentileAggregationStrategy(percentile)</code> — sort ascending, index = <code>ceil(p/100 · N) − 1</code>, clamp. Nearest-rank. O(n log n).<br>• <code>RateAggregationStrategy</code> — sort by timestamp, <code>Δvalue / Δtime</code> (value-change per second). For COUNTER metrics.<br><b>Streaming alternative (prod):</b> t-digest / DDSketch — mergeable across shards, O(1) insertion, bounded relative error (0.01 % typical)."><rect x="640" y="110" width="240" height="54" rx="9" fill="var(--panel-2)" stroke="var(--fig)"></rect><text x="760" y="135" text-anchor="middle" fill="var(--fig)" font-size="13" font-weight="600">AggregationStrategy</text><text x="760" y="152" text-anchor="middle" fill="var(--faint)" font-size="11">Percentile · Rate</text></g>
+
+          <g data-node style="cursor:pointer" data-title="Domain models (Metric · Span · LogEntry · TraceContext)" data-detail="<b>Path:</b> <code>model/</code>. All immutable via Builders.<br><b>MetricPoint</b> — atomic unit: <code>name · value · timestamp · MetricType · tags (Map.copyOf)</code>. Factory <code>MetricPoint.of(...)</code> stamps <code>Instant.now()</code>.<br><b>Metric</b> — aggregated definition: id · name · type · description · unit · tags · dataPoints (unmodifiableList). Builder pattern.<br><b>Span</b> — one op: traceId · spanId · parentSpanId (null for root) · op · service · start/end/duration · SpanStatus · tags · logs.<br><b>Trace</b> — tree of spans + <code>buildSpanTree()</code> adjacency map.<br><b>TraceContext</b> — traceparent header carrier + baggage.<br><b>LogEntry</b> — level · message · service · <b>traceId, spanId (correlation)</b> · attributes."><rect x="640" y="270" width="240" height="54" rx="9" fill="var(--panel-2)" stroke="var(--old)"></rect><text x="760" y="295" text-anchor="middle" fill="var(--old)" font-size="13" font-weight="600">Domain models</text><text x="760" y="312" text-anchor="middle" fill="var(--faint)" font-size="11">Metric · Span · LogEntry</text></g>
+
+          <g data-node style="cursor:pointer" data-title="Alert models (Rule · Alert · Status)" data-detail="<b>Path:</b> <code>model/</code>.<br><b>AlertRule</b> (Builder) — id · name · metricName · condition (&gt;/&lt;) · threshold · durationSeconds · <code>AlertSeverity (INFO · WARNING · CRITICAL · PAGE)</code> · enabled.<br><b>Alert</b> — id · rule · <code>AlertStatus (PENDING → FIRING → ACKNOWLEDGED → RESOLVED)</code> · triggeredAt · resolvedAt · currentValue · message. Methods <code>resolve() · acknowledge()</code>.<br><b>ServiceNode</b> — vertex in the dependency graph: serviceName · dependencies (Set) · dependents (Set) · requestCount · errorRate · avgLatencyMs. Built from trace parent-child edges by <code>ServiceMapService.registerCall(caller, callee, ms, ok)</code>."><rect x="640" y="350" width="240" height="54" rx="9" fill="var(--panel-2)" stroke="var(--old)"></rect><text x="760" y="375" text-anchor="middle" fill="var(--old)" font-size="13" font-weight="600">Alert models</text><text x="760" y="392" text-anchor="middle" fill="var(--faint)" font-size="11">Rule · Alert · Status</text></g>
+
+          <g data-node style="cursor:pointer" data-title="AlertingStrategy family (2 impls)" data-detail="<b>Path:</b> <code>strategy/alerting/</code>.<br><b>Interface:</b> <code>boolean shouldAlert(AlertRule rule, List&lt;MetricPoint&gt; recentPoints); String getStrategyName();</code><br><b>Impls:</b><br>• <code>ThresholdAlertingStrategy</code> — computes arithmetic mean of recent points; parses condition <code>&gt;</code> or <code>&lt;</code>; returns <code>avg &gt; threshold</code> (or <code>&lt;</code>). Static bounds — good for infra metrics.<br>• <code>AnomalyDetectionAlertingStrategy(stdDevMultiplier)</code> — needs ≥ 3 points; computes mean + population stdDev; returns <code>|latest − mean| &gt; k · σ</code>. Adaptive — good for app metrics with natural variation.<br><b>Prod:</b> EWMA · Holt-Winters (seasonality) · Prophet · MAD (median absolute deviation)."><rect x="640" y="430" width="240" height="54" rx="9" fill="var(--panel-2)" stroke="var(--fig)"></rect><text x="760" y="455" text-anchor="middle" fill="var(--fig)" font-size="13" font-weight="600">AlertingStrategy</text><text x="760" y="472" text-anchor="middle" fill="var(--faint)" font-size="11">Threshold · Anomaly</text></g>
+
+          <g data-node style="cursor:pointer" data-title="Repositories (4 · in-memory)" data-detail="<b>Path:</b> <code>repository/</code>. 4 interfaces + 4 InMemory impls, all thread-safe.<br><b>MetricRepository</b> — save · findById · findByName · findByType · findAll. InMemory: <code>ConcurrentHashMap&lt;id, Metric&gt;</code>.<br><b>TraceRepository</b> — save · findById · findByServiceName · findByTimeRange · findAll.<br><b>LogRepository</b> — save · findByLevel (≥ level) · findByServiceName · <b>findByTraceId</b> · findByTimeRange. Uses <code>AtomicLong</code> id sequence.<br><b>AlertRepository</b> — save · findById · findByStatus · findFiring. <code>CopyOnWriteArrayList</code>-friendly.<br><b>Prod swap:</b> InMemory → Elasticsearch / Postgres / DynamoDB — Repository interface makes the swap 1 line."><rect x="640" y="190" width="240" height="54" rx="9" fill="var(--panel-2)" stroke="var(--old)"></rect><text x="760" y="215" text-anchor="middle" fill="var(--old)" font-size="13" font-weight="600">Repositories (4)</text><text x="760" y="232" text-anchor="middle" fill="var(--faint)" font-size="11">interface + InMemory</text></g>
+
+        </svg>
+      </div>
+      <div class="node-detail"><span class="nd-title">Click any class</span><div class="nd-body">Its file path, method signatures, and how it plugs into the observability pipeline appear here. The STAR (<code>TimeSeriesStore</code>) is the metric storage engine — bucketed TreeMap, O(log n) range queries via <code>subMap</code>.</div></div>
+    </div>
+  </section>
+
+  <!-- B · GORILLA / TIMESERIES CODE -->
+  <section>
+    <div class="sec-h"><span class="n">B</span><h2>The engine — <code>TimeSeriesStore.query</code> + downsample</h2><span class="tag">verbatim · TreeMap.subMap · O(log n + k)</span></div>
+    <div class="card">
+      <div class="kicker">from <code>engine/TimeSeriesStore.java</code></div>
+      <pre class="code"><span class="cm">// The core data structure — metricName → (epochSecond → points in that second)</span>
+private final Map&lt;String, TreeMap&lt;Long, List&lt;MetricPoint&gt;&gt;&gt; store = new ConcurrentHashMap&lt;&gt;();
+
+<span class="cm">// ── STORE — O(log S) where S = distinct seconds for that metric ──</span>
+public void store(MetricPoint point) {
+  store.computeIfAbsent(point.getName(), k -&gt; new TreeMap&lt;&gt;())
+       .computeIfAbsent(point.getTimestamp().getEpochSecond(),
+                        k -&gt; Collections.synchronizedList(new ArrayList&lt;&gt;()))
+       .add(point);
+}
+
+<span class="cm">// ── RANGE QUERY — the whole reason for TreeMap ──</span>
+<span class="cm">// subMap is inclusive-exclusive; +1 to include the 'to' second.</span>
+<span class="cm">// Returns a VIEW — no tree copy. O(log S + K) where K = points in range.</span>
+public List&lt;MetricPoint&gt; query(String metricName, Instant from, Instant to) {
+  TreeMap&lt;Long, List&lt;MetricPoint&gt;&gt; timeBuckets = store.get(metricName);
+  if (timeBuckets == null) return List.of();
+
+  return timeBuckets.subMap(from.getEpochSecond(), to.getEpochSecond() + 1)
+      .values().stream()
+      .flatMap(List::stream)
+      .collect(Collectors.toList());
+}
+
+<span class="cm">// ── DOWNSAMPLE — raw → 1-min → 5-min → 1-hr ──</span>
+<span class="cm">// Group by bucket key, average, one representative point per bucket.</span>
+public List&lt;MetricPoint&gt; downsample(String metricName, Duration bucketSize) {
+  TreeMap&lt;Long, List&lt;MetricPoint&gt;&gt; timeBuckets = store.get(metricName);
+  if (timeBuckets == null) return List.of();
+
+  long bucketSeconds = bucketSize.toSeconds();
+  Map&lt;Long, List&lt;MetricPoint&gt;&gt; downsampledBuckets = new TreeMap&lt;&gt;();
+
+  for (List&lt;MetricPoint&gt; points : timeBuckets.values()) {
+    for (MetricPoint point : points) {
+      <span class="cm">// bucket-align — 12:37:42 with 60 s bucket → 12:37:00</span>
+      long bucketKey = (point.getTimestamp().getEpochSecond() / bucketSeconds)
+                       * bucketSeconds;
+      downsampledBuckets.computeIfAbsent(bucketKey, k -&gt; new ArrayList&lt;&gt;())
+                        .add(point);
+    }
+  }
+
+  List&lt;MetricPoint&gt; result = new ArrayList&lt;&gt;();
+  for (Map.Entry&lt;Long, List&lt;MetricPoint&gt;&gt; entry : downsampledBuckets.entrySet()) {
+    double avgValue = entry.getValue().stream()
+        .mapToDouble(MetricPoint::getValue).average().orElse(0.0);
+    result.add(new MetricPoint(
+        metricName, avgValue,
+        Instant.ofEpochSecond(entry.getKey()),
+        entry.getValue().getFirst().getMetricType(),
+        entry.getValue().getFirst().getTags()));
+  }
+  return result;
+}</pre>
+    </div>
+    <div class="callout tip"><b>Why <code>TreeMap.subMap</code> beats <code>HashMap</code>:</b> HashMap point lookup is O(1) but range query = iterate ALL keys + filter = O(n). For time-series data, range queries dominate (every dashboard query is <code>[from, to]</code>). TreeMap gives O(log n) seek to <code>from</code>, then O(k) sequential iteration — exactly the access pattern we have. On top of this in prod, add: (1) <b>Gorilla compression</b> (delta-of-delta on timestamps + XOR on values = 10-20× shrink), (2) <b>LSM-tree on disk</b> for durability, (3) <b>columnar chunks</b> — same shape, orders-of-magnitude scale.</div>
+  </section>
+
+  <!-- C · SAMPLING TABS -->
+  <section>
+    <div class="sec-h"><span class="n">C</span><h2>Sampling strategy — 3 impls, swap via <code>setSamplingStrategy</code></h2><span class="tag">layer all 3 in prod</span></div>
+    <div data-tabscope>
+      <div class="tabs">
+        <div class="tab active" data-tab="samp-head">Head-based (10 % baseline)</div>
+        <div class="tab" data-tab="samp-tail">Tail-based (errors + slow)</div>
+        <div class="tab" data-tab="samp-rate">Rate-limited (cost ceiling)</div>
+        <div class="tab" data-tab="samp-cmp">comparison</div>
+      </div>
+      <div class="tabpanel active" data-panel="samp-head">
+        <div class="kicker">from <code>strategy/sampling/HeadBasedSamplingStrategy.java</code></div>
+        <pre class="code"><span class="cm">// Deterministic hash → same traceId always gets the same decision → </span>
+<span class="cm">// no cross-service coordination needed. O(1).</span>
+@Override
+public boolean shouldSample(TraceContext context) {
+  if (context == null || context.getTraceId() == null) return false;
+  int hash   = Math.abs(context.getTraceId().hashCode());  <span class="cm">// guards Integer.MIN_VALUE</span>
+  int bucket = hash % 100;
+  return bucket &lt; (int) (sampleRate * 100);               <span class="cm">// 0.1 → bucket &lt; 10</span>
+}
+
+<span class="cm">// Operation-agnostic — head-based decision is fixed at the trace root</span>
+@Override
+public boolean shouldSample(TraceContext context, String operationName) {
+  return shouldSample(context);
+}</pre>
+        <p class="muted"><b>Baseline for all traffic.</b> Dropped at the entry point, so downstream services don't waste CPU on unsampled traces. <b>Blind:</b> may drop a rare error trace at the same rate as normal ones — mitigate by layering tail-based on top.</p>
+      </div>
+      <div class="tabpanel" data-panel="samp-tail">
+        <div class="kicker">from <code>strategy/sampling/TailBasedSamplingStrategy.java</code></div>
+        <pre class="code"><span class="cm">// Phase 1 — collect all spans (return true always, buffer everything)</span>
+@Override
+public boolean shouldSample(TraceContext context) {
+  return true;
+}
+
+<span class="cm">// Phase 2 — post-collection decision, once collector has full trace</span>
+@Override
+public boolean shouldSample(TraceContext context, String operationName) {
+  if (context == null) return false;
+
+  <span class="cm">// Errors are ALWAYS interesting — 100 % retention</span>
+  String errorFlag = context.getBaggageItem("error");
+  if ("true".equalsIgnoreCase(errorFlag)) return true;
+
+  <span class="cm">// Slow traces (&gt; latencyThresholdMs) also kept — the debug tail</span>
+  String latencyStr = context.getBaggageItem("latency_ms");
+  if (latencyStr != null) {
+    try {
+      long latencyMs = Long.parseLong(latencyStr);
+      if (latencyMs &gt; latencyThresholdMs) return true;
+    } catch (NumberFormatException e) { <span class="cm">// malformed → drop</span> }
+  }
+  return false;
+}</pre>
+        <p class="muted"><b>Never loses errors or slow traces.</b> Requires all spans for a trace to reach the SAME collector instance — partition Kafka by <code>traceId</code>. Memory heavy: buffer all spans for the assembly window (typically 30 s).</p>
+      </div>
+      <div class="tabpanel" data-panel="samp-rate">
+        <div class="kicker">from <code>strategy/sampling/RateLimitedSamplingStrategy.java</code></div>
+        <pre class="code"><span class="cm">// Predictable cost ceiling. Lock-free CAS on AtomicInteger + AtomicLong.</span>
+<span class="cm">// Benign race on window reset can only OVER-sample, never under.</span>
+
+private final AtomicInteger counter = new AtomicInteger();
+private final AtomicLong windowStart = new AtomicLong();
+private final int maxPerSecond;
+
+@Override
+public boolean shouldSample(TraceContext context) {
+  long now = System.currentTimeMillis() / 1000;
+  long window = windowStart.get();
+
+  if (now != window) {                       <span class="cm">// new epoch second</span>
+    if (windowStart.compareAndSet(window, now)) {
+      counter.set(0);                        <span class="cm">// reset — winner sets</span>
+    }
+  }
+  int count = counter.incrementAndGet();
+  return count &lt;= maxPerSecond;
+}</pre>
+        <p class="muted"><b>Safety valve.</b> Combines with head + tail: if head 10 % + tail-all-errors still produces &gt; 1 000 traces/s during a spike, rate limit at 1 000 to prevent cost explosion (DDoS scenario). First N traces per second may be health checks — accepted trade-off.</p>
+      </div>
+      <div class="tabpanel" data-panel="samp-cmp">
+        <table>
+          <thead><tr><th>Strategy</th><th>Decision when</th><th>Cost</th><th>Loses errors?</th><th>Coordination?</th></tr></thead>
+          <tbody>
+            <tr><td><b>Head-based</b></td><td>Trace creation (root)</td><td>O(1) per trace</td><td><b>Yes</b> — drops errors at same rate</td><td>No — deterministic hash</td></tr>
+            <tr><td><b>Tail-based</b></td><td>Post-collection (after root)</td><td>Buffer all spans until assembly</td><td>No — 100 % errors kept</td><td>Yes — all spans → same collector (partition by traceId)</td></tr>
+            <tr><td><b>Rate-limited</b></td><td>Ingest time (per-second)</td><td>O(1) — atomic counter</td><td>Maybe (first-come-first-served in a burst)</td><td>No — per-node</td></tr>
+            <tr><td colspan="5"><b>Prod recipe:</b> layer all three — head 10 % baseline → tail keep 100 % errors + slow → rate 1 K/s ceiling. Result: bounded cost, no lost errors, ~2-5 % of original volume retained.</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+
+  <!-- D · RETENTION -->
+  <section>
+    <div class="sec-h"><span class="n">D</span><h2>Retention tiers — raw → 1-min → 5-min → 1-hr → archive</h2><span class="tag">1 000× shrink per year</span></div>
+    <div data-tabscope>
+      <div class="tabs">
+        <div class="tab active" data-tab="ret-raw">Raw · 1 h</div>
+        <div class="tab" data-tab="ret-1m">1-min avg · 24 h</div>
+        <div class="tab" data-tab="ret-5m">5-min avg · 7 d</div>
+        <div class="tab" data-tab="ret-1h">1-hr avg · 1 yr</div>
+        <div class="tab" data-tab="ret-archive">Cold archive · 2 yr+</div>
+      </div>
+      <div class="tabpanel active" data-panel="ret-raw">
+        <div class="kicker">Raw resolution — hot tier</div>
+        <ul class="tight">
+          <li><b>Retention:</b> 1 hour · <b>volume:</b> 3 600 pts/hr per series</li>
+          <li><b>Storage:</b> SSD / NVMe · <b>compression:</b> Gorilla (10-20×)</li>
+          <li><b>Use case:</b> real-time debugging — an on-call needs the exact spike shape at 15 s resolution</li>
+          <li><b>Query cost:</b> highest — full-resolution scan. Cache at Query Engine (30 s TTL).</li>
+        </ul>
+      </div>
+      <div class="tabpanel" data-panel="ret-1m">
+        <div class="kicker">1-min rollup · <code>downsample(name, Duration.ofMinutes(1))</code></div>
+        <pre class="code">Raw: 3 600 pts/hour
+  ↓ downsample bucket = (epochSec / 60) · 60
+  ↓ avg per bucket
+1-min avg: 60 pts/hour (60× shrink)</pre>
+        <ul class="tight">
+          <li><b>Retention:</b> 24 hours · <b>volume:</b> 1 440 pts/day per series</li>
+          <li><b>Use case:</b> yesterday's incident retro — resolution good enough to see the p99 spike</li>
+          <li><b>Query router:</b> range &gt; 1 h → hit this tier instead of raw</li>
+        </ul>
+      </div>
+      <div class="tabpanel" data-panel="ret-5m">
+        <div class="kicker">5-min rollup</div>
+        <ul class="tight">
+          <li><b>Retention:</b> 7 days · <b>volume:</b> 12 pts/hour · 288 pts/day</li>
+          <li><b>Use case:</b> weekly SLO reports · trend analysis · capacity planning inputs</li>
+          <li><b>Query router:</b> range &gt; 24 h → this tier · 12× shrink vs 1-min</li>
+        </ul>
+      </div>
+      <div class="tabpanel" data-panel="ret-1h">
+        <div class="kicker">1-hr rollup · <code>downsample(name, Duration.ofHours(1))</code></div>
+        <ul class="tight">
+          <li><b>Retention:</b> 1 year · <b>volume:</b> 24 pts/day · 8 760 pts/year</li>
+          <li><b>Use case:</b> capacity planning · year-over-year seasonality · Black Friday sizing</li>
+          <li><b>Total shrink:</b> raw 3 600 pts/hr → 1 pt/hr = <b>3 600× shrink</b> per year</li>
+        </ul>
+      </div>
+      <div class="tabpanel" data-panel="ret-archive">
+        <div class="kicker">Cold archive — S3 Glacier / GCS Archive / Azure Archive Blob</div>
+        <ul class="tight">
+          <li><b>Retention:</b> 2+ years · <b>volume:</b> 1-hr avg + compressed columnar (Parquet)</li>
+          <li><b>Storage cost:</b> pennies/GB — <code>$0.004/GB-mo</code> vs <code>$0.023/GB-mo</code> for hot S3</li>
+          <li><b>Retrieval latency:</b> minutes (Glacier) — <b>NOT</b> for interactive queries</li>
+          <li><b>Use case:</b> compliance (SOX / GDPR) · post-incident forensic replay · audit trail</li>
+        </ul>
+      </div>
+    </div>
+    <div class="callout tip"><b>Automatic resolution router:</b> the Query Engine picks the right tier by time range — <code>range &lt; 1 h ? raw : range &lt; 24 h ? 1-min : range &lt; 7 d ? 5-min : range &lt; 1 y ? 1-hr : archive</code>. Dashboard authors don't know this exists — they write <code>rate(http_requests_total[5m])</code> and the engine picks the cheapest tier that satisfies the resolution.</div>
+  </section>
+
+  <!-- E · ALERT STATE MACHINE -->
+  <section>
+    <div class="sec-h"><span class="n">E</span><h2>Alert state machine — <code>PENDING → FIRING → ACKNOWLEDGED → RESOLVED</code></h2><span class="tag">from <code>model/AlertStatus.java</code> + <code>service/AlertService.java</code></span></div>
+    <div class="card">
+      <div class="kicker">the evaluation loop (verbatim)</div>
+      <pre class="code">public void evaluateRules() {
+  Instant now         = Instant.now();
+  Instant windowStart = now.minusSeconds(60);         <span class="cm">// last 60 s of data</span>
+
+  for (AlertRule rule : rules) {
+    if (!rule.isEnabled()) continue;
+
+    <span class="cm">// 1. Query metric data DIRECTLY from TSDB — the CP contract, NO cache</span>
+    List&lt;MetricPoint&gt; points = metricService.query(
+        rule.getMetricName(), windowStart, now);
+
+    <span class="cm">// 2. Delegate to Strategy — Threshold or Anomaly</span>
+    boolean shouldAlert = alertingStrategy.shouldAlert(rule, points);
+
+    if (shouldAlert &amp;&amp; !firingRules.containsKey(rule.getId())) {
+      <span class="cm">// 3a. NEW alert — transition OK → FIRING</span>
+      double currentValue = points.isEmpty() ? 0.0
+          : points.get(points.size() - 1).getValue();
+
+      Alert alert = new Alert(rule, currentValue,
+          "Rule '" + rule.getName() + "' triggered: "
+              + rule.getCondition() + " " + rule.getThreshold()
+              + " (current=" + currentValue + ")");
+
+      alertRepo.save(alert);
+      firingRules.put(rule.getId(), alert.getId());   <span class="cm">// DEDUP — no double-page</span>
+
+      System.out.println("[ALERT] FIRING — rule '" + rule.getName() + "'");
+
+    } else if (!shouldAlert &amp;&amp; firingRules.containsKey(rule.getId())) {
+      <span class="cm">// 3b. Condition cleared — resolve existing</span>
+      String alertId = firingRules.remove(rule.getId());
+      resolveAlert(alertId);                          <span class="cm">// alert.resolve() stamps resolvedAt</span>
+    }
+  }
+}</pre>
+    </div>
+    <div class="callout warn"><b>Why <code>firingRules</code> is essential:</b> without it, every 60 s evaluation cycle that sees a firing condition would create a NEW Alert and re-notify — 60 pages/hour for a single ongoing outage. With it, the FIRST breach creates the Alert and adds to the dedup map; subsequent evaluations see it's already firing and skip. Only the resolution transition (breach clears) is announced.</div>
+    <div class="grid g2" style="margin-top:14px">
+      <div class="card"><div class="kicker">state transitions (enum <code>AlertStatus</code>)</div><pre class="code">PENDING            <span class="cm">// initial (not yet used in loop)</span>
+  ↓ new Alert(rule, value, msg)
+FIRING             <span class="cm">// evaluateRules detects breach</span>
+  ↓ alert.acknowledge()
+ACKNOWLEDGED       <span class="cm">// operator saw it, still investigating</span>
+  ↓ alert.resolve()
+RESOLVED           <span class="cm">// stamps resolvedAt = Instant.now()</span>
+
+<span class="cm">// Auto-resolve path:</span>
+FIRING
+  ↓ condition clears in next 60 s eval
+  ↓ AlertService.resolveAlert(alertId)
+RESOLVED</pre></div>
+      <div class="card"><div class="kicker">alerting strategies (Strategy pattern)</div><pre class="code"><span class="cm">// ThresholdAlertingStrategy — for infra metrics</span>
+double avg = points.stream()
+    .mapToDouble(MetricPoint::getValue)
+    .average().orElse(0);
+return condition.startsWith("&lt;")
+    ? avg &lt; threshold
+    : avg &gt; threshold;
+
+<span class="cm">// AnomalyDetectionAlertingStrategy — for app metrics</span>
+if (points.size() &lt; 3) return false;
+double mean = mean(values);
+double variance = sum((v - mean)^2) / n;
+double stdDev = sqrt(variance);
+double latest = points.getLast().getValue();
+return Math.abs(latest - mean)
+     &gt; (stdDevMultiplier * stdDev);          <span class="cm">// k · σ deviation</span></pre></div>
+    </div>
+  </section>
+
+  <!-- F · SEQUENCE DIAGRAM -->
+  <section>
+    <div class="sec-h"><span class="n">F</span><h2>Sequence — ingest → compress → store → query → alert</h2><span class="tag">who calls whom, in order</span></div>
+    <div class="card">
+      <pre class="code">App SDK                     Controller           ObservabilityService       MetricService          TimeSeriesStore          AlertService          AlertingStrategy      Notification
+  │  recordCounter("http.req", 1)  │                    │                          │                        │                        │                        │                        │
+  │──────────────────────────────► │                    │                          │                        │                        │                        │                        │
+  │                                │  ingestMetric(...) │                          │                        │                        │                        │                        │
+  │                                │─────────────────► │                          │                        │                        │                        │                        │
+  │                                │                   │  recordMetric(...)       │                        │                        │                        │                        │
+  │                                │                   │─────────────────────────►│                        │                        │                        │                        │
+  │                                │                   │                          │  MetricPoint.of(...)   │                        │                        │                        │
+  │                                │                   │                          │  (Instant.now())        │                        │                        │                        │
+  │                                │                   │                          │  ★ store(point)        │                        │                        │                        │
+  │                                │                   │                          │───────────────────────►│                        │                        │                        │
+  │                                │                   │                          │  computeIfAbsent×2 + add                        │                        │                        │
+  │                                │                   │                          │  metricRepo.save (if new)                        │                        │                        │
+  │                                │                   │  return                  │                        │                        │                        │                        │
+  │                                │◄──────────────────────────────────────────────                        │                        │                        │                        │
+  │ 202 Accepted                   │                   │                          │                        │                        │                        │                        │
+  │◄────────────────────────────── │                   │                          │                        │                        │                        │                        │
+
+<span class="cm">// ─── 60 s later — alert evaluation cycle ───</span>
+                                                          AlertService.evaluateRules()
+                                                          │  for each rule:
+                                                          │    metricService.query(name, now-60s, now)  ────────► timeSeriesStore.subMap ──► List&lt;MetricPoint&gt;
+                                                          │    alertingStrategy.shouldAlert(rule, points) ──────► Threshold / Anomaly
+                                                          │    if breach + not in firingRules:
+                                                          │      new Alert(rule, value, msg)
+                                                          │      alertRepo.save; firingRules.put; ─────────────► Notification.send (SETNX dedup)
+                                                          │      PagerDuty / Slack / Email</pre>
+    </div>
+    <div class="callout tip"><b>Latency budget (happy path ingest):</b> HTTP receive 1 ms · MetricPoint.of + tags 0.1 ms · <code>timeSeriesStore.store</code> 0.5 ms (two <code>computeIfAbsent</code>s + list append) · repo write (only first time) 0.5 ms · 202 return 0.5 ms = <b>&lt; 3 ms end-to-end</b>. That's why we can absorb 100 M points/s across a scaled ingestor fleet — the hot path is O(log n) TreeMap insert, nothing else.</div>
+  </section>
+
+  <!-- FILE MAP + GLOSSARY -->
+  <section>
+    <div class="sec-h"><span class="n">§</span><h2>File map + Glossary</h2></div>
+    <div class="grid g2">
+      <div class="card"><div class="kicker">file map</div><table><tbody>
+        <tr><td><code>config/AppConfig.java</code></td><td>Composition root — factory + lazy init + strategy invalidation cascade</td></tr>
+        <tr><td><code>controller/ObservabilityController.java</code></td><td>REST adapter — 8 simulated endpoints</td></tr>
+        <tr><td><code>service/ObservabilityService.java</code></td><td><b>Facade</b> — one door for 6 sub-services</td></tr>
+        <tr><td><code>service/{Metric,Tracing,Log,Alert,Dashboard,ServiceMap}Service.java</code></td><td>7 pillar / cross-pillar services</td></tr>
+        <tr><td><code>engine/TimeSeriesStore.java</code></td><td><b>The STAR</b> — bucketed TreeMap + subMap + downsample</td></tr>
+        <tr><td><code>engine/{MetricAggregator,TraceAssembler,LogProcessor,SamplingEngine}.java</code></td><td>4 stateless / stateful engines</td></tr>
+        <tr><td><code>strategy/sampling/*.java</code></td><td>Head · Tail · RateLimited + interface</td></tr>
+        <tr><td><code>strategy/aggregation/*.java</code></td><td>Percentile · Rate + interface</td></tr>
+        <tr><td><code>strategy/alerting/*.java</code></td><td>Threshold · AnomalyDetection + interface</td></tr>
+        <tr><td><code>model/*.java</code></td><td>15 files — MetricPoint · Metric · Span · Trace · LogEntry · Alert · AlertRule · enums</td></tr>
+        <tr><td><code>repository/*.java</code></td><td>4 interfaces + 4 InMemory* (thread-safe)</td></tr>
+        <tr><td><code>exception/*.java</code></td><td>4 exceptions — ObservabilityException + 3 domain-specific</td></tr>
+      </tbody></table></div>
+      <div class="card"><div class="kicker">glossary</div><table><tbody>
+        <tr><td><b>Bucketed TreeMap</b></td><td>metric → (epochSec → List&lt;Point&gt;); <code>subMap</code> = O(log n) range seek</td></tr>
+        <tr><td><b>Gorilla compression</b></td><td>Facebook algo — delta-of-delta timestamps + XOR values = 10-20× shrink</td></tr>
+        <tr><td><b>Downsample bucket key</b></td><td><code>(epochSec / bucketSec) · bucketSec</code> — align to bucket start</td></tr>
+        <tr><td><b>Nearest-rank percentile</b></td><td>sort ascending; <code>index = ceil(p/100 · N) − 1</code>. What Prometheus / Datadog use</td></tr>
+        <tr><td><b>Chain of Responsibility (LogProcessor)</b></td><td>ordered <code>Predicate&lt;LogEntry&gt;</code> chain — each drops or forwards</td></tr>
+        <tr><td><b>Strategy pattern</b></td><td>3 families: Sampling · Aggregation · Alerting — swap at runtime via <code>setXxxStrategy</code></td></tr>
+        <tr><td><b>Facade (ObservabilityService)</b></td><td>one entry point delegating to 6 sub-services — callers depend on one interface</td></tr>
+        <tr><td><b>Repository (4)</b></td><td>interface + InMemory impl backed by <code>ConcurrentHashMap</code>; swap for prod DB</td></tr>
+        <tr><td><b>firingRules dedup</b></td><td><code>Map&lt;ruleId, alertId&gt;</code> so 60 s evaluation doesn't re-fire the same alert</td></tr>
+        <tr><td><b>traceparent header</b></td><td>W3C: <code>00-{traceId}-{spanId}-01</code> — cross-service context propagation</td></tr>
+      </tbody></table></div>
+    </div>
+  </section>
+
+  <footer>
+    <p>Use case 18 · Observability Platform — Canvas 2 of 3 (LLD). All classes verified against real Java under <code>18-observability-platform/src/</code>. No invented method signatures.</p>
+    <p class="run"><a href="hld.html">← Canvas 1 · HLD</a> · Canvas 2 · LLD · <a href="deepdive.html">Canvas 3 · Deep-dive &amp; Trade-offs →</a> &nbsp;|&nbsp; <a href="../index.html">Hub</a></p>
+  </footer>
+
+</div>
+<script src="../assets/canvas.js"></script>
+</body>
+</html>

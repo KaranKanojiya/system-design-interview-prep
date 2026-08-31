@@ -1,0 +1,536 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>15 · File Storage — LLD</title>
+<link rel="stylesheet" href="../assets/canvas.css">
+</head>
+<body>
+<div class="wrap">
+
+  <header class="hero">
+    <h1>File Storage — Low-Level Design</h1>
+    <div class="sub">Canvas 2 of 3. The <b>real Java classes</b> under <code>15-file-storage/src/</code> — no invention. Composition root (<code>AppConfig</code>) → facade (<code>FileStorageService</code>) → orchestrators (Upload / Download / Sync / Sharing / Trash / Version) → primitives (Metadata / Dedup / BlockStore) → strategies (Chunking / Dedup / Conflict) + repositories. Click each class for its role, method signatures, and call chain. Includes the <b>SHA-256 → dedup → refCount</b> deep-dive with verbatim code, and side-by-side tabs for every strategy pair.</div>
+    <div class="badges">
+      <span class="badge lvl">Use case 15 · LLD</span>
+      <span class="badge">Canvas 2 of 3</span>
+      <span class="badge">grounded in code</span>
+      <span class="badge">Strategy · Facade · Builder · Factory · Repository</span>
+    </div>
+    <div class="legend">
+      <span><i class="dot" style="background:var(--eden)"></i> composition root / entry</span>
+      <span><i class="dot" style="background:var(--survivor)"></i> facade &amp; orchestrators</span>
+      <span><i class="dot" style="background:var(--fig)"></i> strategies (swappable)</span>
+      <span><i class="dot" style="background:var(--old)"></i> data / repositories</span>
+    </div>
+  </header>
+
+  <!-- A · CLASS MAP -->
+  <section>
+    <div class="sec-h"><span class="n">A</span><h2>Class map — click any class</h2><span class="tag">from <code>src/main/java/com/systemdesign/filestorage/</code></span></div>
+    <div>
+      <div class="arch">
+        <svg viewBox="0 0 900 420" width="100%" style="max-width:900px" role="img" aria-label="File Storage class map">
+          <defs>
+            <marker id="ah2" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" fill="var(--muted)"></path></marker>
+          </defs>
+
+          <!-- ═══════ arrows ═══════ -->
+          <!-- AppConfig → Controller (wires) -->
+          <line class="arrow" x1="105" y1="70" x2="105" y2="86" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah2)"></line>
+          <!-- AppConfig → Domain (seeds users, folders) -->
+          <line class="arrow" x1="20" y1="48" x2="15" y2="232" stroke="var(--muted)" stroke-width="1.5" stroke-dasharray="4 3" marker-end="url(#ah2)"></line>
+          <text class="edge-label" x="5" y="200" transform="rotate(-90,5,200)">seeds</text>
+
+          <!-- Controller → Facade -->
+          <line class="arrow" x1="105" y1="130" x2="105" y2="150" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah2)"></line>
+          <!-- Facade → Domain (uses) -->
+          <line class="arrow" x1="105" y1="194" x2="105" y2="210" stroke="var(--muted)" stroke-width="1.5" stroke-dasharray="4 3" marker-end="url(#ah2)"></line>
+
+          <!-- Facade fan-out into services (col2) -->
+          <line class="arrow" x1="190" y1="165" x2="220" y2="48" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah2)"></line>
+          <line class="arrow" x1="190" y1="170" x2="220" y2="108" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah2)"></line>
+          <line class="arrow" x1="190" y1="172" x2="220" y2="172" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah2)"></line>
+          <line class="arrow" x1="190" y1="175" x2="220" y2="232" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah2)"></line>
+          <line class="arrow" x1="190" y1="178" x2="220" y2="292" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah2)"></line>
+
+          <!-- UploadService → ChunkingStrategy -->
+          <line class="arrow" x1="390" y1="40" x2="620" y2="40" stroke="var(--muted)" stroke-width="1.8" marker-end="url(#ah2)"></line>
+          <text class="edge-label" x="510" y="34">chunk(fileId, data)</text>
+          <!-- UploadService → DedupService -->
+          <line class="arrow" x1="390" y1="48" x2="420" y2="86" stroke="var(--muted)" stroke-width="1.8" marker-end="url(#ah2)"></line>
+          <text class="edge-label" x="393" y="66">storeChunk</text>
+          <!-- UploadService → MetadataService -->
+          <line class="arrow" x1="390" y1="42" x2="420" y2="42" stroke="var(--muted)" stroke-width="1.8" marker-end="url(#ah2)"></line>
+          <!-- UploadService → VersionService -->
+          <line class="arrow" x1="390" y1="55" x2="420" y2="172" stroke="var(--muted)" stroke-width="1.5" stroke-dasharray="4 3" marker-end="url(#ah2)"></line>
+          <!-- UploadService → SyncService -->
+          <line class="arrow" x1="305" y1="70" x2="305" y2="150" stroke="var(--muted)" stroke-width="1.5" stroke-dasharray="4 3" marker-end="url(#ah2)"></line>
+          <text class="edge-label" x="310" y="105">recordChange</text>
+
+          <!-- DownloadService → MetadataService -->
+          <line class="arrow" x1="390" y1="102" x2="420" y2="48" stroke="var(--muted)" stroke-width="1.8" marker-end="url(#ah2)"></line>
+          <!-- DownloadService → VersionService -->
+          <line class="arrow" x1="390" y1="115" x2="420" y2="165" stroke="var(--muted)" stroke-width="1.8" marker-end="url(#ah2)"></line>
+          <!-- DownloadService → DedupService -->
+          <line class="arrow" x1="390" y1="108" x2="420" y2="108" stroke="var(--muted)" stroke-width="1.8" marker-end="url(#ah2)"></line>
+          <text class="edge-label" x="393" y="102">getChunk</text>
+
+          <!-- SyncService → ConflictStrategy -->
+          <line class="arrow" x1="390" y1="172" x2="620" y2="172" stroke="var(--muted)" stroke-width="1.8" marker-end="url(#ah2)"></line>
+          <text class="edge-label" x="500" y="166">resolve(local, remote)</text>
+
+          <!-- SharingService → MetadataService -->
+          <line class="arrow" x1="390" y1="232" x2="420" y2="55" stroke="var(--muted)" stroke-width="1.5" stroke-dasharray="4 3" marker-end="url(#ah2)"></line>
+
+          <!-- TrashService → MetadataService / DedupService / VersionService / SyncService -->
+          <line class="arrow" x1="390" y1="285" x2="420" y2="60" stroke="var(--muted)" stroke-width="1.5" stroke-dasharray="4 3" marker-end="url(#ah2)"></line>
+          <line class="arrow" x1="390" y1="290" x2="420" y2="118" stroke="var(--muted)" stroke-width="1.5" stroke-dasharray="4 3" marker-end="url(#ah2)"></line>
+          <text class="edge-label" x="393" y="132">GC · ref–</text>
+          <line class="arrow" x1="390" y1="292" x2="420" y2="178" stroke="var(--muted)" stroke-width="1.5" stroke-dasharray="4 3" marker-end="url(#ah2)"></line>
+          <line class="arrow" x1="305" y1="270" x2="305" y2="194" stroke="var(--muted)" stroke-width="1.5" stroke-dasharray="4 3" marker-end="url(#ah2)"></line>
+
+          <!-- DedupService → DedupStrategy -->
+          <line class="arrow" x1="590" y1="108" x2="620" y2="108" stroke="var(--muted)" stroke-width="1.8" marker-end="url(#ah2)"></line>
+          <text class="edge-label" x="591" y="102">isDuplicate</text>
+          <!-- DedupService → BlockStore -->
+          <line class="arrow" x1="505" y1="130" x2="505" y2="210" stroke="var(--muted)" stroke-width="1.8" marker-end="url(#ah2)"></line>
+          <text class="edge-label" x="510" y="180">storeBlock</text>
+
+          <!-- BlockStore → InMemoryBlockStore (implements) -->
+          <line class="arrow" x1="505" y1="254" x2="505" y2="270" stroke="var(--muted)" stroke-width="1.5" stroke-dasharray="2 2" marker-end="url(#ah2)"></line>
+          <text class="edge-label" x="510" y="265">implements</text>
+
+          <!-- MetadataService → Repositories -->
+          <line class="arrow" x1="590" y1="42" x2="620" y2="222" stroke="var(--muted)" stroke-width="1.5" stroke-dasharray="4 3" marker-end="url(#ah2)"></line>
+          <text class="edge-label" x="595" y="130">FileRepo · FolderRepo</text>
+          <!-- VersionService → Repositories (VersionRepository) -->
+          <line class="arrow" x1="590" y1="172" x2="620" y2="222" stroke="var(--muted)" stroke-width="1.5" stroke-dasharray="4 3" marker-end="url(#ah2)"></line>
+
+          <!-- UploadService throws Exceptions -->
+          <line class="arrow" x1="220" y1="60" x2="20" y2="352" stroke="var(--muted)" stroke-width="1.2" stroke-dasharray="2 3" marker-end="url(#ah2)"></line>
+          <text class="edge-label" x="120" y="340">throws QuotaExceeded · FileNotFound</text>
+
+          <!-- ═══════ NODES ═══════ -->
+
+          <!-- Col 1: entry / composition -->
+          <g data-node style="cursor:pointer" data-title="AppConfig (Factory · composition root)" data-detail="<b>Path:</b> <code>config/AppConfig.java</code>. <b>THE only place</b> where <code>new ConcreteClass()</code> appears in the codebase.<br><b>Constructor wiring (7 layers):</b><br>1) Infrastructure — <code>InMemoryBlockStore</code>.<br>2) Strategies — <code>HashBasedDedup</code>, <code>FixedSizeChunking</code>, <code>LastWriterWinsStrategy</code>.<br>3) Repositories — 4 in-memory repos.<br>4) Core services — Dedup, Metadata, Version, Sync, Sharing.<br>5) Orchestration — Upload, Download, Trash (each receives its deps).<br>6) Facade — <code>FileStorageService</code>.<br>7) Controller + StatsDisplay.<br><b>Seeds</b> 3 users (Alice/Bob/Charlie) each with 50 MB quota and a root folder (like Google Drive's 'My Drive').<br><b>Swap point:</b> change one line (e.g., <code>new FixedSizeChunking()</code> → <code>new ContentDefinedChunking()</code>) and the entire pipeline uses Rabin fingerprint chunking. Strategy pattern's payoff."><rect x="20" y="26" width="170" height="44" rx="9" fill="var(--panel-2)" stroke="var(--eden)"></rect><text x="105" y="46" text-anchor="middle" fill="var(--eden)" font-size="12" font-weight="600">AppConfig</text><text x="105" y="60" text-anchor="middle" fill="var(--faint)" font-size="10">Factory · composition root</text></g>
+
+          <g data-node style="cursor:pointer" data-title="FileStorageController" data-detail="<b>Path:</b> <code>controller/FileStorageController.java</code>. HTTP-adapter layer.<br><b>Role:</b> maps HTTP requests to Facade method calls. Adds request logging + input validation. Never contains business logic.<br><b>Depends on ONE thing:</b> <code>FileStorageService</code> (the facade). This kept the dependency graph clean — swap the transport (HTTP → gRPC) without touching business code."><rect x="20" y="86" width="170" height="44" rx="9" fill="var(--panel-2)" stroke="var(--border)"></rect><text x="105" y="106" text-anchor="middle" fill="var(--text)" font-size="12" font-weight="600">FileStorageController</text><text x="105" y="120" text-anchor="middle" fill="var(--faint)" font-size="10">HTTP adapter</text></g>
+
+          <g data-node style="cursor:pointer" data-title="FileStorageService (Facade)" data-detail="<b>Path:</b> <code>service/FileStorageService.java</code>. The single door to the domain.<br><b>Delegates:</b> upload → UploadService, download → DownloadService, share → SharingService, sync → SyncService, versions → VersionService, trash → TrashService, folder ops → MetadataService.<br><b>Why:</b> callers see one class with a coherent API instead of the internal service graph. New devs can find any operation without knowing internal decomposition. Also: the Facade is the natural place to add cross-cutting concerns (auth, request logging, feature flags) if needed."><rect x="20" y="150" width="170" height="44" rx="9" fill="var(--panel-2)" stroke="var(--survivor)"></rect><text x="105" y="170" text-anchor="middle" fill="var(--survivor)" font-size="12" font-weight="600">FileStorageService</text><text x="105" y="184" text-anchor="middle" fill="var(--faint)" font-size="10">Facade</text></g>
+
+          <g data-node style="cursor:pointer" data-title="Domain models (Builder for FileMetadata)" data-detail="<b>Path:</b> <code>model/</code>. Plain data — no behaviour beyond validation.<br><b>Types:</b> <code>User</code>, <code>StorageQuota</code>, <code>Folder</code>, <code>FileMetadata</code>, <code>FileVersion</code>, <code>FileChunk</code>, <code>ShareLink</code>, <code>SharePermission</code>, <code>SyncEvent</code>, <code>SyncEventType</code>, <code>ConflictResolution</code>.<br><b>Builder pattern:</b> <code>FileMetadata.Builder(fileId, fileName).filePath(...).mimeType(...).sizeBytes(...).fileHash(...).ownerId(...).parentFolderId(...).build()</code> — 8+ optional fields make constructor param-lists unusable. Builder gives readable call sites and enforces required fields."><rect x="20" y="210" width="170" height="44" rx="9" fill="var(--panel-2)" stroke="var(--border)"></rect><text x="105" y="230" text-anchor="middle" fill="var(--text)" font-size="12" font-weight="600">Domain models</text><text x="105" y="244" text-anchor="middle" fill="var(--faint)" font-size="10">Builder for FileMetadata</text></g>
+
+          <g data-node style="cursor:pointer" data-title="Exception hierarchy" data-detail="<b>Path:</b> <code>exception/</code>. Typed failures — never generic <code>RuntimeException</code>.<br><b>Hierarchy:</b> <code>FileStorageException</code> (base) → <code>FileNotFoundException</code>, <code>StorageQuotaExceededException</code>, <code>PermissionDeniedException</code>, <code>ChunkMismatchException</code>.<br><b>Why typed:</b> each maps to a distinct HTTP status (404, 413, 403, 500). Controllers can pattern-match by exception type — no if-string-contains-x parsing."><rect x="20" y="330" width="170" height="44" rx="9" fill="var(--panel-2)" stroke="var(--warn)"></rect><text x="105" y="350" text-anchor="middle" fill="var(--warn)" font-size="12" font-weight="600">Exceptions</text><text x="105" y="364" text-anchor="middle" fill="var(--faint)" font-size="10">FileNotFound · QuotaExceeded · ChunkMismatch</text></g>
+
+          <!-- Col 2: orchestrators -->
+          <g data-node style="cursor:pointer" data-title="UploadService (orchestrator)" data-detail="<b>Path:</b> <code>service/UploadService.java</code>. The upload pipeline.<br><b>Two entry points:</b> <code>uploadFile(userId, name, path, byte[], parentFolderId?)</code> for single-shot; <code>initResumableUpload → uploadChunk × N → finalizeResumableUpload</code> for chunked.<br><b>Full flow (single):</b> (1) quota check → (2) SHA-256 whole-file → (3) <code>chunkingStrategy.chunk(fileId, data)</code> → List&lt;FileChunk&gt; → (4) loop: <code>deduplicationService.storeChunk(chunk, chunkData)</code> — returns true if dup → (5) build <code>FileMetadata</code> via Builder → (6) create <code>FileVersion</code> #1 → (7) update quota → (8) <code>syncService.recordChange</code>.<br><b>Resumable:</b> in-memory <code>ConcurrentHashMap&lt;String, ResumableUpload&gt;</code> — tracks per-chunk hash. Chunks can arrive out of order and duplicates retry idempotently.<br><b>Throws:</b> <code>StorageQuotaExceededException</code>, <code>FileNotFoundException</code>."><rect x="220" y="26" width="170" height="44" rx="9" fill="var(--panel-2)" stroke="var(--survivor)"></rect><text x="305" y="46" text-anchor="middle" fill="var(--survivor)" font-size="12" font-weight="600">UploadService</text><text x="305" y="60" text-anchor="middle" fill="var(--faint)" font-size="10">chunked · resumable · quota</text></g>
+
+          <g data-node style="cursor:pointer" data-title="DownloadService" data-detail="<b>Path:</b> <code>service/DownloadService.java</code>.<br><b>Method:</b> <code>byte[] downloadFile(fileId)</code>. Steps:<br>1) <code>metadataService.getFile(fileId)</code> — reject if <code>isDeleted</code>.<br>2) <code>versionService.getLatestVersion(fileId)</code> — get chunk hash list.<br>3) Allocate <code>byte[sizeBytes]</code>. For each hash: <code>deduplicationService.getChunk(hash)</code> and <code>System.arraycopy</code> into result at offset.<br>4) SHA-256(reassembled) must equal stored <code>fileHash</code> — else <code>ChunkMismatchException</code> (data corruption).<br>Also: <code>downloadVersion(fileId, versionNumber)</code> for old versions."><rect x="220" y="86" width="170" height="44" rx="9" fill="var(--panel-2)" stroke="var(--survivor)"></rect><text x="305" y="106" text-anchor="middle" fill="var(--survivor)" font-size="12" font-weight="600">DownloadService</text><text x="305" y="120" text-anchor="middle" fill="var(--faint)" font-size="10">reassemble · verify SHA-256</text></g>
+
+          <g data-node style="cursor:pointer" data-title="SyncService" data-detail="<b>Path:</b> <code>service/SyncService.java</code>. Change tracking + conflict resolution.<br><b>State:</b> <code>Map&lt;userId, List&lt;SyncEvent&gt;&gt;</code> — thread-safe.<br><b>Methods:</b><br>• <code>recordChange(userId, fileId, name, type, deviceId)</code> — called by Upload/Trash after mutation; simulates 'SYNC PUSH' log.<br>• <code>getChangesSince(userId, Instant cursor)</code> — returns events filtered <code>timestamp.isAfter(cursor)</code> plus new cursor.<br>• <code>resolveConflict(local, remote)</code> — delegates to injected <code>ConflictStrategy</code>.<br><b>Cursor</b> is just the timestamp of the latest event — client stores it opaquely."><rect x="220" y="150" width="170" height="44" rx="9" fill="var(--panel-2)" stroke="var(--survivor)"></rect><text x="305" y="170" text-anchor="middle" fill="var(--survivor)" font-size="12" font-weight="600">SyncService</text><text x="305" y="184" text-anchor="middle" fill="var(--faint)" font-size="10">cursor · conflict resolution</text></g>
+
+          <g data-node style="cursor:pointer" data-title="SharingService" data-detail="<b>Path:</b> <code>service/SharingService.java</code>. ACL management.<br><b>Methods:</b> <code>shareWithUser(fileId, targetUserId, role)</code>, <code>createShareLink(fileId, accessLevel, expiresIn, password?)</code>, <code>listSharedWithMe(userId)</code>, <code>revokeShare(shareId)</code>, <code>checkPermission(userId, resourceId)</code> — walks folder hierarchy via materialized path.<br><b>Depends on</b> MetadataService for file lookup + folder walks. Never touches BlockStore or chunks directly — sharing is a metadata concern."><rect x="220" y="210" width="170" height="44" rx="9" fill="var(--panel-2)" stroke="var(--survivor)"></rect><text x="305" y="230" text-anchor="middle" fill="var(--survivor)" font-size="12" font-weight="600">SharingService</text><text x="305" y="244" text-anchor="middle" fill="var(--faint)" font-size="10">ACL · share links</text></g>
+
+          <g data-node style="cursor:pointer" data-title="TrashService (soft-delete + GC)" data-detail="<b>Path:</b> <code>service/TrashService.java</code>. Delete pipeline.<br><b>Two-phase:</b> (1) <code>softDelete(fileId)</code> — flips <code>isDeleted=true, deletedAt=now</code>; file hidden from tree; <code>syncService.recordChange</code> publishes DELETED event. (2) <code>permanentDelete(fileId)</code> — decrements every <code>referenceCount</code> in BlockStore, releases quota, removes metadata. Only called by background GC after 30 days.<br><b>Depends on</b> Metadata, Version, Dedup, User, Sync — needs everything because delete cascades.<br><b>Restore:</b> <code>restore(fileId)</code> reverses soft-delete (as long as within 30-day window and metadata still present)."><rect x="220" y="270" width="170" height="44" rx="9" fill="var(--panel-2)" stroke="var(--survivor)"></rect><text x="305" y="290" text-anchor="middle" fill="var(--survivor)" font-size="12" font-weight="600">TrashService</text><text x="305" y="304" text-anchor="middle" fill="var(--faint)" font-size="10">soft-delete · GC</text></g>
+
+          <!-- Col 3: primitives -->
+          <g data-node style="cursor:pointer" data-title="MetadataService" data-detail="<b>Path:</b> <code>service/MetadataService.java</code>. CRUD on the file tree.<br><b>Methods:</b> <code>createFile(FileMetadata)</code>, <code>getFile(fileId)</code>, <code>updateFile(FileMetadata)</code>, <code>createFolder(...)</code>, <code>listFolderContents(folderId)</code>, <code>moveFile(fileId, newFolderId)</code>, <code>search(userId, query)</code>.<br><b>Sits on top of</b> two repositories: <code>FileRepository</code> + <code>FolderRepository</code>. Never touches chunks or blocks — it operates entirely on metadata rows."><rect x="420" y="26" width="170" height="44" rx="9" fill="var(--panel-2)" stroke="var(--border)"></rect><text x="505" y="46" text-anchor="middle" fill="var(--text)" font-size="12" font-weight="600">MetadataService</text><text x="505" y="60" text-anchor="middle" fill="var(--faint)" font-size="10">File · Folder CRUD</text></g>
+
+          <g data-node style="cursor:pointer" data-title="DeduplicationService ★ (THE star)" data-detail="<b>Path:</b> <code>service/DeduplicationService.java</code>. Wraps DedupStrategy + BlockStore.<br><b>The core method:</b><br><pre style='background:var(--panel);padding:6px;border-radius:4px;font-size:11px;overflow-x:auto'>public boolean storeChunk(FileChunk chunk, byte[] data) {\n  if (strategy.isDuplicate(chunk.getHash())) {\n    blockStore.storeBlock(chunk.getHash(), data);  // increments refCount\n    if (strategy instanceof HashBasedDedup h) h.recordDuplicate(chunk.getSizeBytes());\n    return true;  // was a duplicate\n  }\n  blockStore.storeBlock(chunk.getHash(), data);   // new block\n  strategy.registerHash(chunk.getHash());\n  return false;\n}</pre><b>The key idea:</b> even for duplicates, we still call <code>blockStore.storeBlock(...)</code> — which detects the hash already exists and just increments the ref count. Never store bytes twice.<br><b>Other methods:</b> <code>getChunk(hash)</code>, <code>removeChunk(hash)</code>, <code>getStats()</code> — reports 'X duplicates found, Y saved, Z unique blocks, W stored'."><rect x="420" y="86" width="170" height="44" rx="9" fill="var(--panel-2)" stroke="var(--border)"></rect><text x="505" y="106" text-anchor="middle" fill="var(--text)" font-size="12" font-weight="600">DeduplicationService ★</text><text x="505" y="120" text-anchor="middle" fill="var(--faint)" font-size="10">strategy + blockStore glue</text></g>
+
+          <g data-node style="cursor:pointer" data-title="VersionService" data-detail="<b>Path:</b> <code>service/VersionService.java</code>.<br><b>Methods:</b><br>• <code>createVersion(fileId, List&lt;String&gt; chunkHashes, sizeBytes, userId, note)</code> — appends FileVersion #n+1 with the list of chunk hashes. Old versions preserved.<br>• <code>getLatestVersion(fileId)</code> — used by DownloadService.<br>• <code>getVersions(fileId)</code> — list all N versions.<br>• <code>rollback(fileId, targetVersion)</code> — promotes an old version to current.<br><b>Copy-on-write:</b> new version's <code>chunkHashes</code> often points at OLD blocks — storage cost of 'save' is only the delta."><rect x="420" y="150" width="170" height="44" rx="9" fill="var(--panel-2)" stroke="var(--border)"></rect><text x="505" y="170" text-anchor="middle" fill="var(--text)" font-size="12" font-weight="600">VersionService</text><text x="505" y="184" text-anchor="middle" fill="var(--faint)" font-size="10">CoW · rollback</text></g>
+
+          <g data-node style="cursor:pointer" data-title="BlockStore (interface)" data-detail="<b>Path:</b> <code>store/BlockStore.java</code>.<br><b>Interface:</b><br><pre style='background:var(--panel);padding:6px;border-radius:4px;font-size:11px'>void storeBlock(String hash, byte[] data);\nbyte[] getBlock(String hash);\nvoid deleteBlock(String hash);\nboolean exists(String hash);\nint getBlockCount();\nlong getTotalSizeBytes();</pre><b>Contract:</b> <code>storeBlock</code> is idempotent — if the hash already exists, just increment the ref count (do not re-write bytes). Same content, same hash, same block."><rect x="420" y="210" width="170" height="44" rx="9" fill="var(--panel-2)" stroke="var(--old)"></rect><text x="505" y="230" text-anchor="middle" fill="var(--old)" font-size="12" font-weight="600">BlockStore (interface)</text><text x="505" y="244" text-anchor="middle" fill="var(--faint)" font-size="10">content-addressable API</text></g>
+
+          <g data-node style="cursor:pointer" data-title="InMemoryBlockStore" data-detail="<b>Path:</b> <code>store/InMemoryBlockStore.java</code>. The demo implementation of BlockStore.<br><b>Fields:</b><br>• <code>Map&lt;String, byte[]&gt; blocks</code> — the bytes.<br>• <code>Map&lt;String, AtomicInteger&gt; refCounts</code> — reference counts.<br><b>storeBlock:</b> if hash present → <code>refCounts.get(hash).incrementAndGet()</code>. Else <code>blocks.put(hash, data); refCounts.put(hash, new AtomicInteger(1))</code>.<br><b>deleteBlock:</b> <code>refCount.decrementAndGet()</code>; if &lt;= 0 → remove both maps. If &gt; 0 keep — other files still reference it.<br><b>In production:</b> swap with <code>S3BlockStore</code> — same interface, S3 as byte storage, Postgres/DynamoDB for ref counts."><rect x="420" y="270" width="170" height="44" rx="9" fill="var(--panel-2)" stroke="var(--old)"></rect><text x="505" y="290" text-anchor="middle" fill="var(--old)" font-size="12" font-weight="600">InMemoryBlockStore</text><text x="505" y="304" text-anchor="middle" fill="var(--faint)" font-size="10">demo impl · AtomicInteger refs</text></g>
+
+          <!-- Col 4: strategies + repos -->
+          <g data-node style="cursor:pointer" data-title="ChunkingStrategy (interface + 2 impls)" data-detail="<b>Path:</b> <code>strategy/chunking/</code>.<br><b>Interface:</b> <code>List&lt;FileChunk&gt; chunk(String fileId, byte[] data)</code>.<br><b>Implementations:</b><br>• <code>FixedSizeChunking</code> — 4 MB constant. Simple, predictable, but shifting bytes at file start invalidates ALL chunk boundaries → dedup drops to ~0 %. Used by Google Drive.<br>• <code>ContentDefinedChunking</code> — rolling Gear hash of a 48-byte sliding window. Cut when <code>hash &amp; 0x3FFFFF == 0</code> (avg ~4 MB). MIN 1 MB, MAX 8 MB. Insertion invalidates only local chunks → dedup stays ~40 %. Used by Dropbox.<br><b>Section C</b> — side-by-side tabs with real code + example."><rect x="620" y="26" width="170" height="44" rx="9" fill="var(--panel-2)" stroke="var(--fig)"></rect><text x="705" y="46" text-anchor="middle" fill="var(--fig)" font-size="12" font-weight="600">ChunkingStrategy</text><text x="705" y="60" text-anchor="middle" fill="var(--faint)" font-size="10">FixedSize vs ContentDefined</text></g>
+
+          <g data-node style="cursor:pointer" data-title="DeduplicationStrategy (2 impls)" data-detail="<b>Path:</b> <code>strategy/dedup/</code>.<br><b>Interface:</b> <code>isDuplicate(hash)</code>, <code>registerHash(hash)</code>, <code>getDeduplicatedCount()</code>, <code>getSavedBytes()</code>.<br><b>Implementations:</b><br>• <code>HashBasedDedup</code> — the production choice. <code>Set&lt;String&gt; knownHashes</code>; O(1) lookup. Records duplicate count + saved bytes for stats display.<br>• <code>NoDedup</code> — always returns false. Baseline for measuring dedup benefit (turn off and see storage explode).<br><b>Section D</b> — tabs with code diff + savings math."><rect x="620" y="86" width="170" height="44" rx="9" fill="var(--panel-2)" stroke="var(--fig)"></rect><text x="705" y="106" text-anchor="middle" fill="var(--fig)" font-size="12" font-weight="600">DedupStrategy</text><text x="705" y="120" text-anchor="middle" fill="var(--faint)" font-size="10">HashBased · NoDedup</text></g>
+
+          <g data-node style="cursor:pointer" data-title="ConflictStrategy (2 impls)" data-detail="<b>Path:</b> <code>strategy/sync/</code>.<br><b>Interface:</b> <code>ConflictResolution resolve(FileMetadata local, FileMetadata remote)</code>.<br><b>Implementations:</b><br>• <code>LastWriterWinsStrategy</code> — compare <code>updatedAt</code>; latest wins; loser silently lost. Google Drive.<br>• <code>KeepBothStrategy</code> — never data loss; creates <code>document_conflict_alice_2026-04-26.pdf</code> for the losing side. Dropbox.<br><b>Section E</b> — tabs with resolve() code and the trade-off explanation."><rect x="620" y="150" width="170" height="44" rx="9" fill="var(--panel-2)" stroke="var(--fig)"></rect><text x="705" y="170" text-anchor="middle" fill="var(--fig)" font-size="12" font-weight="600">ConflictStrategy</text><text x="705" y="184" text-anchor="middle" fill="var(--faint)" font-size="10">LastWriterWins · KeepBoth</text></g>
+
+          <g data-node style="cursor:pointer" data-title="Repositories (In-Memory · 4 impls)" data-detail="<b>Path:</b> <code>repository/</code>. Interface + in-memory impl per aggregate.<br><b>Interfaces:</b> <code>FileRepository</code>, <code>FolderRepository</code>, <code>VersionRepository</code>, <code>UserRepository</code>.<br><b>Impl:</b> <code>InMemoryFileRepository</code>, etc. — thread-safe <code>ConcurrentHashMap</code>-backed.<br><b>In production:</b> replaced by JDBC/JPA implementations against sharded Postgres — the domain code doesn't change. Repository pattern's payoff is testability + storage-swap.<br><b>Sharding key:</b> <code>userId</code> for File/Folder/User; <code>fileId</code> for Version."><rect x="620" y="210" width="170" height="44" rx="9" fill="var(--panel-2)" stroke="var(--old)"></rect><text x="705" y="230" text-anchor="middle" fill="var(--old)" font-size="12" font-weight="600">Repositories</text><text x="705" y="244" text-anchor="middle" fill="var(--faint)" font-size="10">File · Folder · Version · User</text></g>
+
+        </svg>
+      </div>
+      <div class="node-detail"><span class="nd-title">Click any class</span><div class="nd-body">Method signatures, source file path, and how it wires into the pipeline appear here.</div></div>
+    </div>
+  </section>
+
+  <!-- B · DEDUP CODE -->
+  <section>
+    <div class="sec-h"><span class="n">B</span><h2>The core loop — <code>DeduplicationService.storeChunk</code></h2><span class="tag">verbatim · &lt;20 LOC</span></div>
+    <div class="card">
+      <div class="kicker">from <code>service/DeduplicationService.java</code></div>
+      <pre class="code"><span class="cm">/** Store a chunk with deduplication. Returns true if it was a duplicate. */</span>
+public boolean storeChunk(FileChunk chunk, byte[] data) {
+  if (strategy.isDuplicate(chunk.getHash())) {
+    <span class="cm">// Chunk already exists — skip storing bytes,</span>
+    <span class="cm">// but DO increment refCount so we know another file uses it.</span>
+    blockStore.storeBlock(chunk.getHash(), data);
+
+    if (strategy instanceof HashBasedDedup hashDedup) {
+      hashDedup.recordDuplicate(chunk.getSizeBytes());
+    }
+    return true;   <span class="cm">// was a duplicate</span>
+  }
+
+  <span class="cm">// New chunk — store bytes and register hash</span>
+  blockStore.storeBlock(chunk.getHash(), data);
+  strategy.registerHash(chunk.getHash());
+  return false;    <span class="cm">// was NOT a duplicate</span>
+}</pre>
+    </div>
+    <div class="card">
+      <div class="kicker">from <code>store/InMemoryBlockStore.java</code> — <b>refCount is where the magic happens</b></div>
+      <pre class="code">public void storeBlock(String hash, byte[] data) {
+  if (blocks.containsKey(hash)) {
+    <span class="cm">// Block already exists — just bump refCount.</span>
+    <span class="cm">// Same hash = same content, so no need to re-store bytes.</span>
+    refCounts.get(hash).incrementAndGet();
+  } else {
+    blocks.put(hash, data);
+    refCounts.put(hash, new AtomicInteger(1));
+  }
+}
+
+public void deleteBlock(String hash) {
+  AtomicInteger refCount = refCounts.get(hash);
+  if (refCount == null) return;
+
+  int remaining = refCount.decrementAndGet();
+  if (remaining &lt;= 0) {
+    <span class="cm">// No more references — safe to free bytes.</span>
+    blocks.remove(hash);
+    refCounts.remove(hash);
+  }
+  <span class="cm">// If remaining &gt; 0, other files still reference this block — keep it.</span>
+}</pre>
+    </div>
+    <div class="callout tip"><b>The correctness invariant:</b> a block is deleted <b>only</b> when the last file referencing it is permanently deleted. This is why <code>TrashService</code> calls <code>deleteBlock(hash)</code> per chunk on permanent purge instead of doing bulk clean-up — the refCount arithmetic must be exact.</div>
+  </section>
+
+  <!-- C · CHUNKING STRATEGY TABS -->
+  <section>
+    <div class="sec-h"><span class="n">C</span><h2>Chunking strategy — Strategy pattern</h2><span class="tag">swap by changing one line in AppConfig</span></div>
+    <div data-tabscope>
+      <div class="tabs">
+        <div class="tab active" data-tab="fixed">FixedSizeChunking (Google Drive)</div>
+        <div class="tab" data-tab="rabin">ContentDefinedChunking (Dropbox)</div>
+        <div class="tab" data-tab="chunk-cmp">side-by-side comparison</div>
+      </div>
+      <div class="tabpanel active" data-panel="fixed">
+        <div class="kicker">from <code>strategy/chunking/FixedSizeChunking.java</code> · CHUNK_SIZE = 4 MB</div>
+        <pre class="code">public List&lt;FileChunk&gt; chunk(String fileId, byte[] data) {
+  List&lt;FileChunk&gt; chunks = new ArrayList&lt;&gt;();
+  int offset = 0, chunkIndex = 0;
+
+  while (offset &lt; data.length) {
+    int end = Math.min(offset + CHUNK_SIZE, data.length);
+    byte[] chunkData = Arrays.copyOfRange(data, offset, end);
+
+    <span class="cm">// SHA-256 hash of the chunk content — content-addressable key</span>
+    String hash = sha256(chunkData);
+
+    chunks.add(new FileChunk(
+        UUID.randomUUID().toString(), fileId, chunkIndex,
+        hash, chunkData.length));
+
+    offset = end;
+    chunkIndex++;
+  }
+  return chunks;
+}</pre>
+        <p class="muted"><b>Pros:</b> simple, predictable chunk count = <code>ceil(size / 4 MB)</code>, deterministic offsets. Great for aligned uploads.<br><b>Cons:</b> inserting <b>1 byte at offset 0</b> shifts every boundary — 100 MB file → all 25 chunks become new content → dedup benefit ~0 %.</p>
+      </div>
+      <div class="tabpanel" data-panel="rabin">
+        <div class="kicker">from <code>strategy/chunking/ContentDefinedChunking.java</code> · Gear hash · avg ~4 MB</div>
+        <pre class="code"><span class="cm">// Parameters (matching FastCDC-style content-defined chunking)</span>
+private static final int WINDOW_SIZE  = 48;               <span class="cm">// sliding window</span>
+private static final int MIN_CHUNK    = 1 * 1024 * 1024;  <span class="cm">// 1 MB</span>
+private static final int MAX_CHUNK    = 8 * 1024 * 1024;  <span class="cm">// 8 MB</span>
+private static final long BOUNDARY_MASK = 0x3FFFFF;       <span class="cm">// avg ~4 MB</span>
+
+<span class="cm">// Gear table: 256 pre-computed random longs for a fast rolling hash</span>
+private static final long[] GEAR_TABLE = new long[256];
+static { <span class="cm">// deterministic LCG seed for reproducibility</span>
+  long seed = 0xABCDEF0123456789L;
+  for (int i = 0; i &lt; 256; i++) {
+    seed = seed * 6364136223846793005L + 1442695040888963407L;
+    GEAR_TABLE[i] = seed;
+  }
+}
+
+<span class="cm">// Inside chunk(): scan bytes with a rolling hash and cut when</span>
+<span class="cm">// (rollingHash &amp; BOUNDARY_MASK) == 0 — a content-defined boundary.</span></pre>
+        <p class="muted"><b>Pros:</b> insertion invalidates only the chunks near the edit point (usually 1-2), everything else remains dedup-eligible. Dropbox reports it doubles their dedup ratio vs fixed-size.<br><b>Cons:</b> more CPU per byte (rolling hash), variable chunk sizes (harder for parallel offset math), MIN/MAX guards required to avoid pathological cases.</p>
+      </div>
+      <div class="tabpanel" data-panel="chunk-cmp">
+        <table>
+          <thead><tr><th>Property</th><th>FixedSizeChunking</th><th>ContentDefinedChunking (Rabin/Gear)</th></tr></thead>
+          <tbody>
+            <tr><td>Chunk size</td><td>4 MB (constant)</td><td>1–8 MB, avg ~4 MB</td></tr>
+            <tr><td>Boundary decision</td><td>every 4 MB by offset</td><td>rolling hash &amp; BOUNDARY_MASK == 0</td></tr>
+            <tr><td>CPU cost per byte</td><td>SHA-256 only</td><td>Gear hash + SHA-256 (~1.5×)</td></tr>
+            <tr><td>Dedup ratio (insert 1 B at start)</td><td>0 % (all chunks shift)</td><td>~99 % (only 1-2 chunks change)</td></tr>
+            <tr><td>Dedup ratio (append at end)</td><td>~99 %</td><td>~99 %</td></tr>
+            <tr><td>Used by</td><td>Google Drive, iCloud</td><td>Dropbox, restic, borg, rsync</td></tr>
+            <tr><td>Best for</td><td>immutable files (photos, videos)</td><td>editable files (docs, source code, VMs)</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+
+  <!-- D · DEDUP STRATEGY TABS -->
+  <section>
+    <div class="sec-h"><span class="n">D</span><h2>Deduplication strategy — swap in <code>AppConfig</code></h2><span class="tag">Strategy pattern · 2 impls</span></div>
+    <div data-tabscope>
+      <div class="tabs">
+        <div class="tab active" data-tab="hashdedup">HashBasedDedup (production)</div>
+        <div class="tab" data-tab="nodedup">NoDedup (baseline)</div>
+        <div class="tab" data-tab="dedup-cmp">measured savings</div>
+      </div>
+      <div class="tabpanel active" data-panel="hashdedup">
+        <div class="kicker">from <code>strategy/dedup/HashBasedDedup.java</code></div>
+        <pre class="code">public class HashBasedDedup implements DeduplicationStrategy {
+  private final Set&lt;String&gt; knownHashes = new HashSet&lt;&gt;();
+  private int  deduplicatedCount = 0;
+  private long savedBytes = 0;
+
+  public boolean isDuplicate(String hash) {
+    return knownHashes.contains(hash);
+  }
+
+  public void registerHash(String hash) {
+    knownHashes.add(hash);
+  }
+
+  public void recordDuplicate(long chunkSizeBytes) {
+    deduplicatedCount++;
+    savedBytes += chunkSizeBytes;
+  }
+}</pre>
+        <p class="muted"><b>In production:</b> the in-memory <code>Set&lt;String&gt;</code> is replaced by a distributed store — Redis (hot set) + Postgres (durable index) + Bloom filter in front for the negative-lookup fast path. At 300 B unique hashes × 64 B = ~20 TB index — manageable but big.</p>
+      </div>
+      <div class="tabpanel" data-panel="nodedup">
+        <div class="kicker">from <code>strategy/dedup/NoDedup.java</code> — the baseline</div>
+        <pre class="code">public class NoDedup implements DeduplicationStrategy {
+  public boolean isDuplicate(String hash) { return false; }
+  public void registerHash(String hash) { <span class="cm">/* no-op */</span> }
+  public int getDeduplicatedCount() { return 0; }
+  public long getSavedBytes() { return 0; }
+}</pre>
+        <p class="muted"><b>Why it exists:</b> the value of dedup only becomes obvious when you turn it off. Swap this in and re-run the upload demo — storage inflates ~1.6× (matches Dropbox's ~40 % dedup savings). Also useful for compliance modes where cross-tenant dedup is disallowed.</p>
+      </div>
+      <div class="tabpanel" data-panel="dedup-cmp">
+        <table>
+          <thead><tr><th>Scenario (10 users, same 100 MB set)</th><th>NoDedup</th><th>HashBasedDedup</th><th>Savings</th></tr></thead>
+          <tbody>
+            <tr><td>10 users upload the same 100 MB video</td><td>1000 MB</td><td>100 MB</td><td>90 %</td></tr>
+            <tr><td>10 users upload the same PDF (~5 MB) + unique 95 MB each</td><td>1000 MB</td><td>~955 MB</td><td>4.5 %</td></tr>
+            <tr><td>1 user saves 10 versions with 10 % change per save</td><td>1000 MB</td><td>190 MB</td><td>81 %</td></tr>
+            <tr><td>Realistic mix (Dropbox blog data)</td><td>1000 MB</td><td>~600 MB</td><td>~40 %</td></tr>
+          </tbody>
+        </table>
+        <p class="muted">The mix depends on your users. Version history (single user, many saves) is where dedup shines brightest.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- E · CONFLICT STRATEGY TABS -->
+  <section>
+    <div class="sec-h"><span class="n">E</span><h2>Conflict resolution — Strategy pattern</h2><span class="tag">Google Drive vs Dropbox</span></div>
+    <div data-tabscope>
+      <div class="tabs">
+        <div class="tab active" data-tab="lww">LastWriterWinsStrategy (Google Drive)</div>
+        <div class="tab" data-tab="keepboth">KeepBothStrategy (Dropbox)</div>
+        <div class="tab" data-tab="conflict-cmp">trade-off</div>
+      </div>
+      <div class="tabpanel active" data-panel="lww">
+        <div class="kicker">from <code>strategy/sync/LastWriterWinsStrategy.java</code></div>
+        <pre class="code">public ConflictResolution resolve(FileMetadata localFile, FileMetadata remoteFile) {
+  if (localFile.getUpdatedAt() == null &amp;&amp; remoteFile.getUpdatedAt() == null)
+    return ConflictResolution.KEEP_REMOTE;   <span class="cm">// tie-break: server wins</span>
+  if (localFile.getUpdatedAt() == null)  return ConflictResolution.KEEP_REMOTE;
+  if (remoteFile.getUpdatedAt() == null) return ConflictResolution.KEEP_LOCAL;
+
+  <span class="cm">// Compare timestamps: most recent wins</span>
+  if (localFile.getUpdatedAt().isAfter(remoteFile.getUpdatedAt()))
+    return ConflictResolution.KEEP_LOCAL;
+  else
+    return ConflictResolution.KEEP_REMOTE;   <span class="cm">// tie → server wins</span>
+}</pre>
+        <p class="muted"><b>Simple, deterministic.</b> Losing side's changes silently discarded. Google Drive's choice — cleaner folder, but "I edited it on my laptop AND on my phone" produces one lost edit.</p>
+      </div>
+      <div class="tabpanel" data-panel="keepboth">
+        <div class="kicker">from <code>strategy/sync/KeepBothStrategy.java</code></div>
+        <pre class="code">public ConflictResolution resolve(FileMetadata localFile, FileMetadata remoteFile) {
+  <span class="cm">// Both sides preserved: create "file_conflict_&lt;user&gt;_&lt;date&gt;.ext"</span>
+  return ConflictResolution.KEEP_BOTH;
+}
+
+<span class="cm">// Downstream: SyncService renames the losing side to</span>
+<span class="cm">//   "document (alice's conflicted copy 2026-04-26).pdf"</span>
+<span class="cm">// User sees both files, must merge manually.</span></pre>
+        <p class="muted"><b>Never data loss</b> — but cluttered folders and manual merge. Dropbox's choice. Best for professional-user files (code, docs) where a lost edit is catastrophic.</p>
+      </div>
+      <div class="tabpanel" data-panel="conflict-cmp">
+        <table>
+          <thead><tr><th>Property</th><th>LastWriterWins</th><th>KeepBoth</th></tr></thead>
+          <tbody>
+            <tr><td>Data loss risk</td><td>YES — losing side silently gone</td><td>NEVER</td></tr>
+            <tr><td>User intervention</td><td>none</td><td>manual merge required</td></tr>
+            <tr><td>Folder cleanliness</td><td>clean</td><td>can accumulate '_conflict_' files</td></tr>
+            <tr><td>Best for</td><td>consumer files (photos, casual docs)</td><td>professional files (code, contracts)</td></tr>
+            <tr><td>Used by</td><td>Google Drive, iCloud</td><td>Dropbox, Box</td></tr>
+          </tbody>
+        </table>
+        <p class="muted"><b>The right answer</b> in interviews: for a general-purpose product, offer BOTH — LastWriterWins by default (matches user expectation for photos/casual files), KeepBoth for files marked as 'important' or in shared team folders.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- F · SEQUENCE -->
+  <section>
+    <div class="sec-h"><span class="n">F</span><h2>Request sequences (call chains)</h2><span class="tag">who calls whom</span></div>
+    <div class="grid g2">
+      <div class="card">
+        <div class="kicker">upload — <code>POST /files</code></div>
+        <pre class="code">Controller.handleUpload(userId, name, byte[])
+  → FileStorageService.uploadFile(userId, name, path, byte[])
+    → UploadService.uploadFile(userId, name, path, byte[])
+      1. userRepository.findById(userId) + quota.canStore(size) ✓
+      2. String fileHash = sha256(data)
+      3. chunkingStrategy.chunk(fileId, data) → List&lt;FileChunk&gt;
+      4. for each chunk:
+           deduplicationService.storeChunk(chunk, chunkData)
+             → strategy.isDuplicate(hash) ?
+                 blockStore.storeBlock(hash, data)  <span class="cm">// refCount++</span>
+                 hashDedup.recordDuplicate(size)
+                 return true
+               : blockStore.storeBlock(hash, data)  <span class="cm">// new</span>
+                 strategy.registerHash(hash)
+                 return false
+      5. FileMetadata metadata = new FileMetadata.Builder(...).build()
+         metadataService.createFile(metadata)
+      6. versionService.createVersion(fileId, chunkHashes, size, userId, "Initial upload")
+      7. user.getStorageQuota().addUsage(size)
+      8. syncService.recordChange(userId, fileId, name, CREATED, deviceId)</pre>
+      </div>
+      <div class="card">
+        <div class="kicker">download — <code>GET /files/{id}</code></div>
+        <pre class="code">Controller.handleDownload(fileId)
+  → FileStorageService.downloadFile(fileId)
+    → DownloadService.downloadFile(fileId)
+      1. FileMetadata meta = metadataService.getFile(fileId)
+         if (meta.isDeleted()) throw FileNotFoundException
+      2. FileVersion latest = versionService.getLatestVersion(fileId)
+      3. byte[] result = new byte[latest.getSizeBytes()]
+         int offset = 0
+         for (String hash : latest.getChunkHashes()):
+           byte[] chunk = deduplicationService.getChunk(hash)
+           if (chunk == null) throw FileNotFoundException
+           System.arraycopy(chunk, 0, result, offset, chunk.length)
+           offset += chunk.length
+      4. String actualHash = sha256(result)
+         if (!actualHash.equals(meta.getFileHash()))
+           throw ChunkMismatchException  <span class="cm">// integrity failure</span>
+      5. return result</pre>
+      </div>
+      <div class="card">
+        <div class="kicker">sync — <code>GET /sync/changes?cursor=X</code></div>
+        <pre class="code">Controller.handleSync(userId, cursorStr)
+  → FileStorageService.syncChanges(userId, cursor)
+    → SyncService.getChangesSince(userId, lastCursor)
+      1. List&lt;SyncEvent&gt; events = eventsByUser.get(userId)
+      2. newEvents = events.stream()
+                        .filter(e -&gt; e.getTimestamp().isAfter(lastCursor))
+                        .collect(toList())
+      3. Instant newCursor = newEvents.isEmpty()
+                              ? lastCursor
+                              : newEvents.last().getTimestamp()
+      4. return new SyncResult(newEvents, newCursor)</pre>
+      </div>
+      <div class="card">
+        <div class="kicker">permanent delete — cron job</div>
+        <pre class="code">GarbageCollector.run()  <span class="cm">// scheduled hourly</span>
+  filesToPurge = fileRepository.findWhere(
+                    isDeleted AND deletedAt &lt; now - 30d)
+  for each file:
+    → TrashService.permanentDelete(fileId)
+      1. FileMetadata meta = metadataService.getFile(fileId)
+      2. for each version in versionService.getVersions(fileId):
+           for each hash in version.getChunkHashes():
+             deduplicationService.removeChunk(hash)
+               → blockStore.deleteBlock(hash)
+                 refCount.decrementAndGet()
+                 if (refCount &lt;= 0):
+                   blocks.remove(hash); refCounts.remove(hash)
+      3. metadataService.deleteFile(fileId)  <span class="cm">// hard delete row</span>
+      4. user.getStorageQuota().removeUsage(meta.getSizeBytes())</pre>
+      </div>
+    </div>
+  </section>
+
+  <!-- GLOSSARY -->
+  <section>
+    <div class="sec-h"><span class="n">§</span><h2>File map + Glossary</h2><span class="tag">where each class lives</span></div>
+    <div class="grid g2">
+      <div class="card">
+        <div class="kicker">file map — <code>15-file-storage/src/main/java/com/systemdesign/filestorage/</code></div>
+        <pre class="code">config/AppConfig.java              <span class="cm">// composition root</span>
+controller/FileStorageController   <span class="cm">// HTTP adapter</span>
+service/FileStorageService         <span class="cm">// FACADE</span>
+service/UploadService              <span class="cm">// upload pipeline</span>
+service/DownloadService            <span class="cm">// reassemble + verify</span>
+service/DeduplicationService       <span class="cm">// star — strategy + blockStore</span>
+service/MetadataService            <span class="cm">// file/folder CRUD</span>
+service/VersionService             <span class="cm">// versions + rollback</span>
+service/SyncService                <span class="cm">// change tracking + conflicts</span>
+service/SharingService             <span class="cm">// ACL + share links</span>
+service/TrashService               <span class="cm">// soft-delete + GC</span>
+store/BlockStore + InMemoryBlockStore
+strategy/chunking/{ChunkingStrategy, FixedSizeChunking,
+                   ContentDefinedChunking}
+strategy/dedup/{DeduplicationStrategy, HashBasedDedup, NoDedup}
+strategy/sync/{ConflictStrategy, LastWriterWinsStrategy,
+               KeepBothStrategy}
+repository/{File,Folder,Version,User}Repository (+ InMemory impls)
+model/{FileMetadata, FileVersion, FileChunk, Folder, User,
+       StorageQuota, ShareLink, SharePermission, SyncEvent,
+       SyncEventType, ConflictResolution}
+exception/{FileStorageException, FileNotFoundException,
+           StorageQuotaExceededException, PermissionDeniedException,
+           ChunkMismatchException}</pre>
+      </div>
+      <div class="card">
+        <div class="kicker">glossary</div>
+        <table><tbody>
+          <tr><td><b>Composition root</b></td><td><code>AppConfig</code> — the only place <code>new ConcreteClass()</code> appears; wires the graph</td></tr>
+          <tr><td><b>Facade</b></td><td><code>FileStorageService</code> — one door to the service graph for callers</td></tr>
+          <tr><td><b>Strategy pattern</b></td><td>3 pluggable behaviours: chunking, dedup, conflict resolution</td></tr>
+          <tr><td><b>Builder pattern</b></td><td><code>FileMetadata.Builder</code> — required + 8 optional fields, readable at call sites</td></tr>
+          <tr><td><b>Repository</b></td><td>interface per aggregate; in-memory impl swappable for JDBC/Postgres</td></tr>
+          <tr><td><b>Content-addressable</b></td><td>storage keyed by SHA-256 of content itself → dedup is trivially correct</td></tr>
+          <tr><td><b>Reference count</b></td><td><code>AtomicInteger</code> per block; deleteBlock is only 'real' when refCount hits 0</td></tr>
+          <tr><td><b>Resumable upload</b></td><td>server tracks per-chunk state; client re-uploads only failed chunks (idempotent)</td></tr>
+        </tbody></table>
+      </div>
+    </div>
+  </section>
+
+  <footer>
+    <p>Use case 15 · File Storage — Canvas 2 of 3 (LLD). All classes verified against real Java under <code>15-file-storage/src/</code>. No invented method signatures.</p>
+    <p class="run"><a href="hld.html">← Canvas 1 · HLD</a> · Canvas 2 · LLD · <a href="deepdive.html">Canvas 3 · Deep-dive &amp; Trade-offs →</a> &nbsp;|&nbsp; <a href="../index.html">Hub</a></p>
+  </footer>
+
+</div>
+<script src="../assets/canvas.js"></script>
+</body>
+</html>
