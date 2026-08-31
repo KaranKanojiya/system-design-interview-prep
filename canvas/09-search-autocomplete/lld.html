@@ -1,0 +1,389 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>09 · Search Autocomplete — LLD</title>
+<link rel="stylesheet" href="../assets/canvas.css">
+</head>
+<body>
+<div class="wrap">
+
+  <header class="hero">
+    <h1>Search Autocomplete — Low-Level Design</h1>
+    <div class="sub">Use case 09 · Canvas 2 of 3. From boxes to classes: the actual Java object model. Start with the <b>interactive class map</b> — click a class to see its responsibility and how <code>AppConfig → Controller → AutocompleteService(Facade) → TrieService / RankingService / Cache / Filters</code> is wired — then dig into the <b>TopKTrie</b> pre-computed top-K algorithm, the pluggable Trie / ranking strategies, and the request pipeline.</div>
+    <div class="badges">
+      <span class="badge lvl">Use case 09 · LLD</span>
+      <span class="badge">Canvas 2 of 3</span>
+      <span class="badge">interactive</span>
+      <span class="badge">Trie · Strategy · Facade · Decorator · Repository</span>
+    </div>
+    <div class="legend">
+      <span><i class="dot" style="background:var(--eden)"></i> entry / composition root</span>
+      <span><i class="dot" style="background:var(--survivor)"></i> interface / contract</span>
+      <span><i class="dot" style="background:var(--old)"></i> concrete implementation</span>
+      <span><i class="dot" style="background:var(--warn)"></i> domain model</span>
+      <span><i class="dot" style="background:var(--muted)"></i> click a class for its role</span>
+    </div>
+  </header>
+
+  <!-- A · CLASS DESIGN (interactive class map) -->
+  <section>
+    <div class="sec-h"><span class="n">A</span><h2>Class design — click a class in the map</h2><span class="tag">the object model, wired</span></div>
+    <div>
+      <div class="arch">
+        <svg viewBox="0 0 810 410" width="100%" style="max-width:810px" role="img" aria-label="Search autocomplete class map">
+          <defs>
+            <marker id="ah" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" fill="var(--muted)"></path></marker>
+          </defs>
+
+          <!-- wiring arrows (under boxes) -->
+          <!-- AppConfig wires Controller -->
+          <line class="arrow" x1="62" y1="62" x2="62" y2="176" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"></line>
+          <!-- Controller uses Facade -->
+          <line class="arrow" x1="126" y1="192" x2="170" y2="150" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"></line>
+          <!-- Facade uses the five services -->
+          <line class="arrow" x1="286" y1="118" x2="328" y2="37" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"></line>
+          <line class="arrow" x1="286" y1="126" x2="328" y2="101" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"></line>
+          <line class="arrow" x1="286" y1="134" x2="328" y2="165" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"></line>
+          <line class="arrow" x1="286" y1="142" x2="328" y2="229" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"></line>
+          <line class="arrow" x1="286" y1="150" x2="328" y2="293" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"></line>
+          <!-- services -> next column -->
+          <line class="arrow" x1="446" y1="37" x2="496" y2="37" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"></line>
+          <line class="arrow" x1="446" y1="101" x2="496" y2="101" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"></line>
+          <line class="arrow" x1="446" y1="165" x2="496" y2="165" stroke="var(--muted)" stroke-width="2" stroke-dasharray="4 3" marker-end="url(#ah)"></line>
+          <line class="arrow" x1="446" y1="229" x2="496" y2="229" stroke="var(--muted)" stroke-width="2" stroke-dasharray="4 3" marker-end="url(#ah)"></line>
+          <line class="arrow" x1="446" y1="293" x2="496" y2="293" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"></line>
+          <!-- interfaces -> impls (dashed = implements) -->
+          <line class="arrow" x1="612" y1="37" x2="662" y2="37" stroke="var(--muted)" stroke-width="2" stroke-dasharray="4 3" marker-end="url(#ah)"></line>
+          <line class="arrow" x1="612" y1="101" x2="662" y2="101" stroke="var(--muted)" stroke-width="2" stroke-dasharray="4 3" marker-end="url(#ah)"></line>
+          <line class="arrow" x1="612" y1="293" x2="662" y2="293" stroke="var(--muted)" stroke-width="2" stroke-dasharray="4 3" marker-end="url(#ah)"></line>
+          <!-- TopKTrie / Suggestion domain uses -->
+          <line class="arrow" x1="718" y1="60" x2="612" y2="330" stroke="var(--muted)" stroke-width="2" stroke-dasharray="2 3" marker-end="url(#ah)"></line>
+          <text x="70" y="150" fill="var(--faint)" font-size="9">wires</text>
+          <text x="300" y="112" fill="var(--faint)" font-size="9">uses</text>
+
+          <!-- nodes -->
+          <g data-node style="cursor:pointer" data-title="AppConfig  (config)" data-detail="<b>Role:</b> composition root / Factory — the ONLY class that says <code>new ConcreteClass()</code>.<br><b>build():</b> wires the graph bottom-up — QueryRepository → TopKTrie → TrieService, InMemorySuggestionCache, the ranking strategies, ProfanityFilter chain, DataCollectionService + TrieBuilderService, then the AutocompleteService facade and finally the Controller.<br><b>Default trie:</b> <code>new TopKTrie(config.getTopKPerNode())</code>. <b>Default ranking:</b> <code>PersonalizedRankingStrategy(TimeDecayRankingStrategy(decayFactor))</code>. Swap an impl here, nothing else changes."><rect x="14" y="20" width="112" height="42" rx="9" fill="var(--panel-2)" stroke="var(--eden)"></rect><text x="70" y="39" text-anchor="middle" fill="var(--eden)" font-size="12" font-weight="600">AppConfig</text><text x="70" y="54" text-anchor="middle" fill="var(--faint)" font-size="9">composition root</text></g>
+
+          <g data-node style="cursor:pointer" data-title="AutocompleteController  (controller)" data-detail="<b>Role:</b> framework-free stand-in for a Spring @RestController.<br><b>handleSearch(prefix,userId):</b> builds a <code>SearchContext</code> and calls <code>service.getSuggestions()</code>.<br><b>handleRecordQuery():</b> → <code>service.recordQuery()</code>. <b>handleGetTrending()</b> and <b>handleGetStats()</b> read through the facade's accessors. Holds ONLY the AutocompleteService — the facade hides every subsystem."><rect x="14" y="178" width="112" height="42" rx="9" fill="var(--panel-2)" stroke="var(--border)"></rect><text x="70" y="197" text-anchor="middle" fill="var(--text)" font-size="12" font-weight="600">Controller</text><text x="70" y="212" text-anchor="middle" fill="var(--faint)" font-size="9">REST endpoints</text></g>
+
+          <g data-node style="cursor:pointer" data-title="AutocompleteService  «Facade»" data-detail="<b>Role:</b> the Facade — one <code>getSuggestions(prefix, context)</code> hides the whole pipeline.<br><b>Pipeline:</b> normalize prefix → <code>cache.get</code> (hit? return) → <code>trieService.getSuggestions</code> → run each <code>FilterStrategy</code> → <code>rankingService.rankSuggestions</code> → trim to maxResults → <code>cache.put</code>.<br><b>recordQuery():</b> logs to DataCollection, inserts into the trie, and invalidates every prefix of the query in the cache. Holds only interfaces + service refs, all constructor-injected."><rect x="170" y="98" width="116" height="54" rx="9" fill="var(--panel-2)" stroke="var(--border)"></rect><text x="228" y="120" text-anchor="middle" fill="var(--text)" font-size="12" font-weight="600">AutocompleteService</text><text x="228" y="135" text-anchor="middle" fill="var(--faint)" font-size="9">«Facade» orchestrator</text></g>
+
+          <g data-node style="cursor:pointer" data-title="TrieService" data-detail="<b>Role:</b> thread-safe wrapper around the <code>Trie</code>. Holds a <code>ReentrantReadWriteLock</code>.<br><b>Reads</b> (getSuggestions, search, size) take the <b>read lock</b> — many concurrent readers.<br><b>Writes</b> (insertQuery, deleteQuery, rebuildTrie) take the <b>write lock</b> — exclusive.<br><b>rebuildTrie(newTrie):</b> atomic reference swap (double-buffering) so the old trie keeps serving until the swap. Keeps threading OUT of the data structure."><rect x="330" y="16" width="116" height="42" rx="9" fill="var(--panel-2)" stroke="var(--border)"></rect><text x="388" y="35" text-anchor="middle" fill="var(--text)" font-size="12" font-weight="600">TrieService</text><text x="388" y="50" text-anchor="middle" fill="var(--faint)" font-size="9">ReadWriteLock</text></g>
+
+          <g data-node style="cursor:pointer" data-title="RankingService" data-detail="<b>Role:</b> holds the active <code>RankingStrategy</code> and delegates <code>rankSuggestions(list, context)</code> to it.<br><b>setStrategy():</b> swap the algorithm at runtime — the hook for A/B tests (50% frequency, 50% time-decay during a live event).<br>The facade never knows which strategy is active; that is the whole point of the wrapper."><rect x="330" y="80" width="116" height="42" rx="9" fill="var(--panel-2)" stroke="var(--border)"></rect><text x="388" y="99" text-anchor="middle" fill="var(--text)" font-size="12" font-weight="600">RankingService</text><text x="388" y="114" text-anchor="middle" fill="var(--faint)" font-size="9">strategy holder</text></g>
+
+          <g data-node style="cursor:pointer" data-title="SuggestionCache  «interface»" data-detail="<b>Role:</b> the caching contract — <code>get(prefix): Optional&lt;List&lt;Suggestion&gt;&gt;</code>, <code>put</code>, <code>invalidate</code>, <code>invalidateAll</code>, <code>size</code>, <code>getHitRate</code>.<br><b>Why:</b> lets the facade skip the whole trie→filter→rank pipeline on popular prefixes. Storage swaps (in-memory LRU today; Redis/Caffeine tomorrow) with no facade change."><rect x="330" y="144" width="116" height="42" rx="9" fill="var(--panel-2)" stroke="var(--survivor)"></rect><text x="388" y="163" text-anchor="middle" fill="var(--survivor)" font-size="11" font-weight="600">SuggestionCache</text><text x="388" y="178" text-anchor="middle" fill="var(--faint)" font-size="9">«interface»</text></g>
+
+          <g data-node style="cursor:pointer" data-title="FilterStrategy  «interface»" data-detail="<b>Role:</b> content-filtering contract — <code>filter(List&lt;Suggestion&gt;): List&lt;Suggestion&gt;</code>.<br><b>Why separate from ranking?</b> SRP — ranking changes ORDER, filtering changes CONTENT. The facade holds a <code>List&lt;FilterStrategy&gt;</code> and chains them (Chain-of-Responsibility): profanity → spam → NSFW, each fed the previous output."><rect x="330" y="208" width="116" height="42" rx="9" fill="var(--panel-2)" stroke="var(--survivor)"></rect><text x="388" y="227" text-anchor="middle" fill="var(--survivor)" font-size="11" font-weight="600">FilterStrategy</text><text x="388" y="242" text-anchor="middle" fill="var(--faint)" font-size="9">«interface»</text></g>
+
+          <g data-node style="cursor:pointer" data-title="DataCollectionService" data-detail="<b>Role:</b> the analytics/Observer side. <code>recordQuery(text,userId)</code> increments frequency in the repository, stamps a timestamp for trending, and saves a <code>SearchQuery</code> for known users.<br><b>getTrendingQueries():</b> a query is trending when its recent count exceeds ~2× its average hourly rate (a simplified Z-score). Feeds future trie rebuilds via <code>TrieBuilderService</code>."><rect x="330" y="272" width="116" height="42" rx="9" fill="var(--panel-2)" stroke="var(--border)"></rect><text x="388" y="291" text-anchor="middle" fill="var(--text)" font-size="11" font-weight="600">DataCollection</text><text x="388" y="306" text-anchor="middle" fill="var(--faint)" font-size="9">logging · trending</text></g>
+
+          <g data-node style="cursor:pointer" data-title="Trie  «interface»" data-detail="<b>Role:</b> the data-structure contract — <code>insert(word,freq)</code>, <code>search</code>, <code>getSuggestions(prefix,k)</code>, <code>delete</code>, <code>startsWith</code>, <code>size</code>, <code>getFrequency</code>, <code>clear</code>.<br><b>Why:</b> Standard / Compressed / TopK all implement it, so the trie algorithm is a runtime choice (Strategy at the data-structure level). Consumers depend only on this interface."><rect x="496" y="16" width="116" height="42" rx="9" fill="var(--panel-2)" stroke="var(--survivor)"></rect><text x="554" y="35" text-anchor="middle" fill="var(--survivor)" font-size="12" font-weight="600">Trie</text><text x="554" y="50" text-anchor="middle" fill="var(--faint)" font-size="9">«interface»</text></g>
+
+          <g data-node style="cursor:pointer" data-title="RankingStrategy  «interface»" data-detail="<b>Role:</b> the ranking contract — <code>rank(List&lt;Suggestion&gt;, SearchContext): List&lt;Suggestion&gt;</code> + <code>getName()</code>.<br><b>Three impls:</b> Frequency (raw sort), TimeDecay (<code>score = freq·e^(-λ·ageHours)</code>), Personalized (Decorator wrapping a base). Swapping any of them requires ZERO changes to the service."><rect x="496" y="80" width="116" height="42" rx="9" fill="var(--panel-2)" stroke="var(--survivor)"></rect><text x="554" y="99" text-anchor="middle" fill="var(--survivor)" font-size="11" font-weight="600">RankingStrategy</text><text x="554" y="114" text-anchor="middle" fill="var(--faint)" font-size="9">«interface»</text></g>
+
+          <g data-node style="cursor:pointer" data-title="InMemorySuggestionCache" data-detail="<b>Role:</b> the LRU implementation. A <code>LinkedHashMap(maxSize, 0.75f, accessOrder=true)</code> with <code>removeEldestEntry</code> auto-evicting the least-recently-used entry.<br>Each value is a <code>CacheEntry</code> (list + createdAt) for <b>TTL</b> checks; every method is <code>synchronized</code>; tracks hits/misses for <code>getHitRate()</code> (Zipf traffic → 70-90% hit rate). Negative results are cached too."><rect x="496" y="144" width="116" height="42" rx="9" fill="var(--panel-2)" stroke="var(--old)"></rect><text x="554" y="163" text-anchor="middle" fill="var(--old)" font-size="10" font-weight="600">InMemoryCache</text><text x="554" y="178" text-anchor="middle" fill="var(--faint)" font-size="9">LinkedHashMap LRU</text></g>
+
+          <g data-node style="cursor:pointer" data-title="ProfanityFilterStrategy" data-detail="<b>Role:</b> the one shipped FilterStrategy. Holds a lowercased <code>Set&lt;String&gt;</code> banned words; drops any suggestion whose text <i>contains</i> a banned substring.<br><b>Cost:</b> O(S·B·L). At scale you'd use Aho-Corasick or a Bloom filter. <code>getName()</code> reports the banned-word count."><rect x="496" y="208" width="116" height="42" rx="9" fill="var(--panel-2)" stroke="var(--old)"></rect><text x="554" y="227" text-anchor="middle" fill="var(--old)" font-size="10" font-weight="600">ProfanityFilter</text><text x="554" y="242" text-anchor="middle" fill="var(--faint)" font-size="9">blocklist</text></g>
+
+          <g data-node style="cursor:pointer" data-title="QueryRepository  «interface»" data-detail="<b>Role:</b> data-access contract for query history — <code>save</code>, <code>incrementFrequency</code>, <code>findByPrefix</code>, <code>findTopK</code>, <code>size</code>.<br><b>Why:</b> the DataCollectionService talks to this interface only, so storage (ConcurrentHashMap today; Redis / Cassandra tomorrow) swaps without service changes. Repository pattern."><rect x="496" y="272" width="116" height="42" rx="9" fill="var(--panel-2)" stroke="var(--survivor)"></rect><text x="554" y="291" text-anchor="middle" fill="var(--survivor)" font-size="11" font-weight="600">QueryRepository</text><text x="554" y="306" text-anchor="middle" fill="var(--faint)" font-size="9">«interface»</text></g>
+
+          <g data-node style="cursor:pointer" data-title="TopKTrie  (default)" data-detail="<b>Role:</b> THE production trie. Delegates basic ops to an internal <code>StandardTrie</code>, but on <b>insert</b> it walks the path and updates a pre-computed top-K list at <b>every ancestor node</b> — O(L·K).<br><b>getSuggestions:</b> walk to the prefix node, return its cached list — O(L) to reach, <b>O(1)</b> to return, no DFS. This is the interview-winning optimization (see §B). Wired as the default by AppConfig."><rect x="662" y="16" width="130" height="42" rx="9" fill="var(--panel-2)" stroke="var(--old)"></rect><text x="727" y="35" text-anchor="middle" fill="var(--old)" font-size="11" font-weight="600">TopKTrie</text><text x="727" y="50" text-anchor="middle" fill="var(--faint)" font-size="9">O(1) getSuggestions</text></g>
+
+          <g data-node style="cursor:pointer" data-title="PersonalizedRankingStrategy  «Decorator»" data-detail="<b>Role:</b> a Decorator that WRAPS a base <code>RankingStrategy</code> (TimeDecay by default). Calls <code>base.rank()</code> first, then boosts: ×1.5 if the user searched this query before, ×1.2 on language/locale match, then re-sorts.<br>Anonymous context → returns the base ranking untouched. Stack it: Personalized(TimeDecay(Frequency))."><rect x="662" y="80" width="130" height="42" rx="9" fill="var(--panel-2)" stroke="var(--old)"></rect><text x="727" y="99" text-anchor="middle" fill="var(--old)" font-size="10" font-weight="600">PersonalizedRanking</text><text x="727" y="114" text-anchor="middle" fill="var(--faint)" font-size="9">«Decorator» base+boost</text></g>
+
+          <g data-node style="cursor:pointer" data-title="InMemoryQueryRepository" data-detail="<b>Role:</b> the MVP repository — a <code>ConcurrentHashMap&lt;String,SearchQuery&gt;</code> keyed by query text. Lock-free reads, safe concurrent increments. <code>findTopK</code> streams + sorts by frequency. Swap for Redis/Cassandra with no service change."><rect x="662" y="272" width="130" height="42" rx="9" fill="var(--panel-2)" stroke="var(--old)"></rect><text x="727" y="291" text-anchor="middle" fill="var(--old)" font-size="10" font-weight="600">InMemoryQueryRepo</text><text x="727" y="306" text-anchor="middle" fill="var(--faint)" font-size="9">ConcurrentHashMap</text></g>
+
+          <g data-node style="cursor:pointer" data-title="TrieNode  (model)" data-detail="<b>Role:</b> the core building block of every trie variant.<br><b>Fields:</b> <code>Map&lt;Character,TrieNode&gt; children</code>, <code>isEndOfWord</code>, <code>frequency</code>, <code>List&lt;Suggestion&gt; topSuggestions</code> (the pre-computed top-K that makes TopKTrie O(1)), and an <code>edgeLabel</code> used by CompressedTrie.<br><code>getOrCreateChild(c)</code> uses <code>computeIfAbsent</code>; children is a HashMap (not TrieNode[26]) to handle digits/spaces/unicode."><rect x="496" y="344" width="116" height="42" rx="9" fill="var(--panel-2)" stroke="var(--warn)"></rect><text x="554" y="363" text-anchor="middle" fill="var(--warn)" font-size="12" font-weight="600">TrieNode</text><text x="554" y="378" text-anchor="middle" fill="var(--faint)" font-size="9">trie building block</text></g>
+
+          <g data-node style="cursor:pointer" data-title="Suggestion  (model)" data-detail="<b>Role:</b> the result object returned to the caller. Fields: <code>text</code>, mutable <code>score</code>, <code>SuggestionSource</code> (POPULAR / TRENDING / PERSONALIZED / AUTOCORRECT).<br><b>Comparable:</b> natural order is score <b>descending</b>, ties broken alphabetically — so <code>Collections.sort(list)</code> everywhere just works. <code>equals/hashCode</code> key on <code>text</code>."><rect x="662" y="344" width="130" height="42" rx="9" fill="var(--panel-2)" stroke="var(--warn)"></rect><text x="727" y="363" text-anchor="middle" fill="var(--warn)" font-size="12" font-weight="600">Suggestion</text><text x="727" y="378" text-anchor="middle" fill="var(--faint)" font-size="9">Comparable result</text></g>
+        </svg>
+      </div>
+      <div class="node-detail"><span class="nd-title">Click any class</span><div class="nd-body">Its responsibility, key methods, and how it is wired appear here. Dashed arrows are <i>implements</i>; solid arrows are <i>uses</i>. Notice the <b>AutocompleteService facade</b> holds only the two <b>«interface»</b> boxes (Cache, Filter) plus service wrappers — that is what makes the trie, ranking, filtering and storage independently swappable.</div></div>
+    </div>
+  </section>
+
+  <!-- B · TOPK TRIE ALGORITHM -->
+  <section>
+    <div class="sec-h"><span class="n">B</span><h2>TopKTrie — the core algorithm</h2><span class="tag">pre-computed top-K = O(1) lookup</span></div>
+    <div class="grid g2">
+      <div class="card">
+        <div class="kicker">insert — update top-K at every ancestor</div>
+        <pre class="code"><span class="kw">public void</span> <span class="ty">insert</span>(String word, <span class="kw">long</span> freq) {
+  String w = word.toLowerCase().trim();
+  <span class="cm">// 1. normal insert builds the path + terminal</span>
+  standardTrie.insert(w, freq);
+
+  <span class="cm">// 2. walk the path AGAIN, refresh top-K</span>
+  TrieNode t = standardTrie.findNode(w);
+  Suggestion s = <span class="kw">new</span> Suggestion(w, t.getFrequency());
+
+  updateTopK(standardTrie.getRoot(), s);
+  TrieNode cur = standardTrie.getRoot();
+  <span class="kw">for</span> (<span class="kw">int</span> i = <span class="num">0</span>; i &lt; w.length(); i++) {
+    cur = cur.getChild(w.charAt(i));
+    updateTopK(cur, s);          <span class="cm">// O(K) each</span>
+  }
+}</pre>
+        <p class="muted"><code>updateTopK</code> replaces the entry if the word already exists, else adds it only if there is room or it beats the worst, then <code>Collections.sort</code> (score desc) and caps at K. Insert is <b>O(L·K)</b>.</p>
+      </div>
+      <div class="card">
+        <div class="kicker">worked example — K = 3</div>
+        <pre class="code"><span class="cm">// insert "apple" (freq 200)</span>
+root,a,p,p,l,e  topK = [apple(200)]
+
+<span class="cm">// insert "app" (freq 500)</span>
+node 'p' (2nd)  topK = [app(500), apple(200)]
+node 'p' (1st)  topK = [app(500), apple(200)]
+node 'a'        topK = [app(500), apple(200)]
+root            topK = [app(500), apple(200)]
+
+<span class="cm">// query getSuggestions("ap", 3)</span>
+walk root → a → p        <span class="cm">// O(L)</span>
+return node.topSuggestions <span class="cm">// O(1) — no DFS!</span>
+        → [app(500), apple(200)]</pre>
+        <p class="muted">A StandardTrie would DFS the whole subtree under <code>ap</code> and sort — <b>O(L + N log N)</b>. For a hot prefix like <code>"a"</code> that is millions of nodes per keystroke.</p>
+      </div>
+    </div>
+    <div class="callout tip"><b>Why pre-compute?</b> Autocomplete is ~99.9% reads and fires on <i>every keystroke</i>, while inserts happen offline during batch rebuilds. TopKTrie deliberately trades a heavier insert (<code>O(L·K)</code>, and K is a small constant ~10) for a <b>constant-time</b> lookup at the prefix node. The read path never walks the subtree, so a query for <code>"a"</code> costs the same as a query for <code>"application"</code>. Delete is lazy — it clears the terminal but leaves stale top-K lists until the next rebuild (see §C · TrieBuilderService atomic swap).</div>
+  </section>
+
+  <!-- C · STRATEGIES COMPARED -->
+  <section>
+    <div class="sec-h"><span class="n">C</span><h2>Trie &amp; ranking strategies (Strategy pattern ×2)</h2><span class="tag">swap the algorithm, not the service</span></div>
+    <div data-tabscope>
+      <div class="tabs">
+        <button class="tab active" data-tab="std">Trie · Standard</button>
+        <button class="tab" data-tab="cmp">Trie · Compressed</button>
+        <button class="tab" data-tab="topk">Trie · TopK</button>
+        <button class="tab" data-tab="rank">Ranking ×3</button>
+      </div>
+      <div class="tabpanel active" data-panel="std">
+        <p><b>StandardTrie</b> — HashMap children, DFS-based lookup. <span class="run">getTrieType() = "STANDARD"</span></p>
+        <ul class="tight">
+          <li><b>insert:</b> O(L) — walk char by char via <code>getOrCreateChild</code>, mark terminal, set frequency.</li>
+          <li><b>getSuggestions:</b> walk to the prefix node O(L), then <code>collectSuggestions</code> DFS the subtree, sort by score, take top-K — <b>O(L + N log N)</b>.</li>
+          <li><b>When:</b> small datasets, prototyping, insert-heavy rebuilds. The O(N) DFS is the bottleneck TopK removes.</li>
+        </ul>
+      </div>
+      <div class="tabpanel" data-panel="cmp">
+        <p><b>CompressedTrie</b> — radix / Patricia tree: single-child chains merge into one edge with a string <code>edgeLabel</code>.</p>
+        <ul class="tight">
+          <li><b>Space:</b> "facebook / face / faq" collapses from 11 nodes to 5 (~55% fewer). Big win when the trie lives in memory.</li>
+          <li><b>Split on insert:</b> find the longest common prefix, split the existing edge, add an intermediate node.</li>
+          <li><b>getSuggestions:</b> still a DFS from the match node — O(L + N). Compression saves memory, not lookup time.</li>
+        </ul>
+      </div>
+      <div class="tabpanel" data-panel="topk">
+        <p><b>TopKTrie</b> — the default. Wraps a StandardTrie and keeps a pre-computed top-K list at every node. <span class="run">the AppConfig production choice</span></p>
+        <ul class="tight">
+          <li><b>insert:</b> O(L·K) — refresh top-K at each ancestor (§B).</li>
+          <li><b>getSuggestions:</b> O(L) to reach the node, <b>O(1)</b> to return the cached list — no DFS.</li>
+          <li><b>Cost:</b> O(N_nodes · K) extra memory; delete is lazy (rebuild to purge). The right call for read-heavy, latency-critical serving.</li>
+        </ul>
+      </div>
+      <div class="tabpanel" data-panel="rank">
+        <p>Ranking is a <i>second</i> Strategy axis behind <code>RankingStrategy</code>, held by <code>RankingService</code>:</p>
+        <ul class="tight">
+          <li><b>FrequencyRankingStrategy:</b> score = raw frequency; just <code>Collections.sort</code>. Cold-start / anonymous baseline.</li>
+          <li><b>TimeDecayRankingStrategy:</b> <code>score = freq · e^(-λ·ageHours)</code>; half-life = <code>ln(2)/λ</code> (λ=0.01 → ~69 h). Favors fresh/trending queries.</li>
+          <li><b>PersonalizedRankingStrategy:</b> a <b>Decorator</b> over a base — ×1.5 for the user's past queries, ×1.2 on locale match, then re-sort. Default wiring: Personalized(TimeDecay).</li>
+        </ul>
+      </div>
+    </div>
+    <table>
+      <thead><tr><th>Aspect</th><th>StandardTrie</th><th>CompressedTrie</th><th>TopKTrie</th></tr></thead>
+      <tbody>
+        <tr><td>insert</td><td>O(L)</td><td>O(L) amort.</td><td>O(L · K)</td></tr>
+        <tr><td>getSuggestions</td><td>O(L + N log N)</td><td>O(L + N)</td><td>O(L) → O(1) at node</td></tr>
+        <tr><td>space</td><td>O(ALPHABET · N)</td><td>O(N) compact</td><td>O(N_nodes · K) + trie</td></tr>
+        <tr><td>delete</td><td>O(L) + cleanup</td><td>O(L) + merge</td><td>lazy (rebuild)</td></tr>
+        <tr><td>best for</td><td>prototyping</td><td>memory-bound</td><td>production serving</td></tr>
+      </tbody>
+    </table>
+    <div class="callout"><b>The pattern:</b> <code>TrieService</code> holds a single <code>Trie</code> reference and <code>RankingService</code> a single <code>RankingStrategy</code> — neither ever branches on a type. Switching StandardTrie→TopKTrie, or Frequency→TimeDecay, is one line in <code>AppConfig</code> with <b>zero</b> changes to the facade, controller, or cache. <code>TrieBuilderService</code> builds a fresh trie offline and <code>TrieService.rebuildTrie()</code> swaps the reference atomically (double-buffering) — no downtime, and the rebuild is when stale TopK/delete state gets purged.</div>
+  </section>
+
+  <!-- D · DATA MODEL -->
+  <section>
+    <div class="sec-h"><span class="n">D</span><h2>Data model detail</h2><span class="tag">TrieNode · Suggestion · SearchQuery · Config</span></div>
+    <div class="grid g2">
+      <div class="card">
+        <div class="kicker">TrieNode — the building block</div>
+        <pre class="code">children      Map&lt;Character,TrieNode&gt;  <span class="cm">// HashMap</span>
+isEndOfWord   boolean
+frequency     long            <span class="cm">// search count</span>
+topSuggestions List&lt;Suggestion&gt; <span class="cm">// pre-computed top-K</span>
+edgeLabel     String          <span class="cm">// CompressedTrie only</span></pre>
+        <p class="muted">A <code>HashMap</code> (not <code>TrieNode[26]</code>) so digits, spaces and unicode all fit, and memory is proportional to real children. <code>topSuggestions</code> is empty for Standard/Compressed and populated by TopKTrie.</p>
+      </div>
+      <div class="card">
+        <div class="kicker">Suggestion — the result object (Comparable)</div>
+        <pre class="code">text    String
+score   double          <span class="cm">// mutable → re-ranking</span>
+source  SuggestionSource <span class="cm">// POPULAR | TRENDING</span>
+                         <span class="cm">// | PERSONALIZED | AUTOCORRECT</span>
+
+compareTo → score DESC, then text ASC</pre>
+        <p class="muted"><code>equals/hashCode</code> key on <code>text</code> (so a word is de-duped in a top-K list); natural order is score-descending so <code>Collections.sort</code> is used everywhere instead of ad-hoc comparators.</p>
+      </div>
+      <div class="card">
+        <div class="kicker">SearchQuery — history record (Builder)</div>
+        <pre class="code">queryText    String
+frequency    long
+lastSearched LocalDateTime  <span class="cm">// time-decay</span>
+userId       String         <span class="cm">// personalization</span>
+
+SearchQuery.builder(text).userId(u)
+   .lastSearched(now).build()</pre>
+        <p class="muted">Stored in <code>InMemoryQueryRepository</code> keyed by text. Metadata (frequency, timestamp, user) is exactly what the ranking strategies consume. Built via the Builder pattern to avoid a telescoping constructor.</p>
+      </div>
+      <div class="card">
+        <div class="kicker">AutocompleteConfig — tuning (Builder + defaults)</div>
+        <pre class="code">maxResults      int   <span class="cm">// 10</span>
+maxPrefixLength int   <span class="cm">// 50</span>
+minFrequency    long  <span class="cm">// 2</span>
+decayFactor     double <span class="cm">// 0.01  (λ)</span>
+topKPerNode     int   <span class="cm">// 10   → K</span>
+cacheSize       int   <span class="cm">// LRU capacity</span>
+cacheTtlSeconds int</pre>
+        <p class="muted">Single source of truth for every knob. <code>AutocompleteConfig.defaultConfig()</code> gives sensible values; the Builder lets tests override only what matters. Passed by constructor into AppConfig.</p>
+      </div>
+    </div>
+    <div class="callout tip"><b>Two frequency counters, on purpose:</b> the <code>QueryRepository</code> holds the authoritative lifetime frequency (write path, off the keystroke); the trie's <code>TrieNode.frequency</code> + pre-computed <code>topSuggestions</code> are the read-optimized copy rebuilt from that data. The cache is a third, ephemeral layer keyed by prefix. Each layer trades freshness for speed on the read hot path.</div>
+  </section>
+
+  <!-- E · REQUEST SEQUENCES -->
+  <section>
+    <div class="sec-h"><span class="n">E</span><h2>Request handling sequence</h2><span class="tag">which class does what, in order</span></div>
+
+    <div class="collapsible open">
+      <div class="c-head"><h3>GET /autocomplete?q=app &nbsp;→&nbsp; the read hot path</h3></div>
+      <div class="c-body">
+        <pre class="code"><span class="cm">Controller.handleSearch("app", userId)</span>
+  └─ new SearchContext(userId, "en", "US", now)
+  └─ AutocompleteService.getSuggestions("app", ctx)
+       1  normalize → "app"; clamp to maxPrefixLength
+       2  cache.get("app")                 <span class="cm">// LRU + TTL</span>
+            present? → return  <span class="cm">// CACHE HIT, skip pipeline</span>
+       3  trieService.getSuggestions("app", 10)
+            [read lock] → TopKTrie → O(1) node.topSuggestions
+            empty? → cache.put (negative) → return
+       4  for (FilterStrategy f : filters)  <span class="cm">// profanity…</span>
+              suggestions = f.filter(suggestions)
+       5  rankingService.rankSuggestions(suggestions, ctx)
+            → Personalized(TimeDecay).rank(...)
+       6  trim to maxResults
+       7  cache.put("app", ranked)
+  └─ [200] formatted suggestion list</pre>
+        <p class="muted">The cache short-circuits everything on popular prefixes; on a miss the whole trie → filter → rank pipeline runs once and the result is memoized. The trie read holds only a shared read lock, so thousands of keystrokes proceed concurrently.</p>
+      </div>
+    </div>
+
+    <div class="collapsible open">
+      <div class="c-head"><h3>POST /query?q=apple &nbsp;→&nbsp; record a completed search (write path)</h3></div>
+      <div class="c-body">
+        <pre class="code"><span class="cm">Controller.handleRecordQuery("apple", userId)</span>
+  └─ AutocompleteService.recordQuery("apple", userId)
+       1  dataCollectionService.recordQuery("apple", userId)
+            → queryRepository.incrementFrequency("apple")
+            → stamp timestamp (trending window)
+            → if userId: repository.save(SearchQuery)
+       2  trieService.insertQuery("apple", 1)
+            [write lock] → TopKTrie.insert → refresh top-K
+       3  for i in 1..len: cache.invalidate("apple".sub(0,i))
+            <span class="cm">// "a","ap","app","appl","apple" now stale</span>
+  └─ confirmation</pre>
+        <p class="muted">Writes are rare relative to reads. The write lock briefly blocks readers for the single insert; invalidating every prefix of the word forces the next keystroke on those prefixes to recompute from the updated trie. Periodic full rebuilds (TrieBuilderService) fold accumulated frequencies back in and purge lazy deletes.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- F · DESIGN PATTERNS -->
+  <section>
+    <div class="sec-h"><span class="n">F</span><h2>Design patterns used</h2><span class="tag">GoF-categorized</span></div>
+    <div class="grid g3">
+      <div class="card">
+        <div class="kicker">Creational</div>
+        <ul class="tight">
+          <li><b>Builder</b> — <code>AutocompleteConfig.Builder</code> (7 knobs) and <code>SearchQuery.builder()</code>. Optional fields with defaults, no telescoping constructor.</li>
+          <li><b>Factory</b> — <code>AppConfig</code> is the only class that says <code>new ConcreteClass()</code>; each <code>create*()</code> is effectively a @Bean.</li>
+          <li><b>Singleton (conceptual)</b> — one shared <code>AutocompleteConfig</code> so every service reads identical tuning values.</li>
+        </ul>
+      </div>
+      <div class="card">
+        <div class="kicker">Behavioral</div>
+        <ul class="tight">
+          <li><b>Strategy ×3</b> — <code>Trie</code> (Standard/Compressed/TopK), <code>RankingStrategy</code>, <code>FilterStrategy</code>. Three independent axes of variation.</li>
+          <li><b>Observer</b> — <code>DataCollectionService</code> observes search events to update frequencies/trending, decoupled from serving.</li>
+          <li><b>Iterator</b> — the trie's DFS traversal collects suggestions without exposing node internals.</li>
+        </ul>
+      </div>
+      <div class="card">
+        <div class="kicker">Structural (+ arch)</div>
+        <ul class="tight">
+          <li><b>Facade</b> — <code>AutocompleteService</code> hides trie + cache + filter + rank behind one <code>getSuggestions()</code>.</li>
+          <li><b>Decorator</b> — <code>PersonalizedRankingStrategy</code> wraps a base ranking, adding boosts transparently.</li>
+          <li><b>Repository</b> — <code>QueryRepository → InMemoryQueryRepository</code>. Domain never sees storage.</li>
+        </ul>
+      </div>
+    </div>
+    <div class="callout"><b>Why they cluster:</b> the three Strategies + Repository + constructor injection deliver the Open-Closed Principle — new tries, ranking algorithms, filters and storage backends are <i>additions</i>, never edits. The Facade keeps controllers trivial; the Decorator lets personalization stack on any base ranking; the Chain-of-Responsibility over <code>List&lt;FilterStrategy&gt;</code> composes filters. <span class="run">→ scaling, sharding &amp; the distributed-trie follow-up on canvas 3</span></div>
+  </section>
+
+  <!-- RUN IT -->
+  <section>
+    <div class="sec-h"><span class="n">▶</span><h2>Run it — repo file map</h2><span class="tag">concept → actual Java class</span></div>
+    <table>
+      <thead><tr><th>Concept above</th><th>File in <code>09-search-autocomplete/src/main/java/…/autocomplete/</code></th></tr></thead>
+      <tbody>
+        <tr><td>Composition root / factory wiring</td><td><code>config/AppConfig.java</code></td></tr>
+        <tr><td>REST-like endpoints</td><td><code>controller/AutocompleteController.java</code></td></tr>
+        <tr><td>Facade orchestrator (§E)</td><td><code>service/AutocompleteService.java</code></td></tr>
+        <tr><td>Thread-safe trie wrapper (ReadWriteLock)</td><td><code>service/TrieService.java</code></td></tr>
+        <tr><td>Ranking holder + rebuild + analytics</td><td><code>service/RankingService.java</code> · <code>TrieBuilderService.java</code> · <code>DataCollectionService.java</code></td></tr>
+        <tr><td>Trie contract + impls (§B, §C)</td><td><code>trie/Trie.java</code> · <code>StandardTrie.java</code> · <code>CompressedTrie.java</code> · <code>TopKTrie.java</code></td></tr>
+        <tr><td>Ranking strategies (§C)</td><td><code>strategy/ranking/RankingStrategy.java</code> · <code>FrequencyRankingStrategy.java</code> · <code>TimeDecayRankingStrategy.java</code> · <code>PersonalizedRankingStrategy.java</code></td></tr>
+        <tr><td>Filtering</td><td><code>strategy/filtering/FilterStrategy.java</code> · <code>ProfanityFilterStrategy.java</code></td></tr>
+        <tr><td>LRU cache contract + impl</td><td><code>store/SuggestionCache.java</code> · <code>InMemorySuggestionCache.java</code></td></tr>
+        <tr><td>Repository contract + impl</td><td><code>repository/QueryRepository.java</code> · <code>InMemoryQueryRepository.java</code></td></tr>
+        <tr><td>Domain models (§D)</td><td><code>model/TrieNode.java</code> · <code>Suggestion.java</code> · <code>SearchQuery.java</code> · <code>SearchContext.java</code> · <code>AutocompleteConfig.java</code></td></tr>
+        <tr><td>Exceptions · stats display</td><td><code>exception/AutocompleteException.java</code> · <code>TrieCapacityException.java</code> · <code>display/AutocompleteStatsDisplay.java</code></td></tr>
+        <tr><td>Runnable demo (main)</td><td><code>SearchAutocompleteApp.java</code></td></tr>
+      </tbody>
+    </table>
+    <div class="callout tip"><b>Run the demo</b> (Gradle <code>application</code> plugin, mainClass <code>SearchAutocompleteApp</code>, no framework):<br><pre class="code">./gradlew :09-search-autocomplete:run</pre>It seeds a Zipf-distributed query set, compares Standard vs Compressed vs TopK tries, exercises the ranking strategies side-by-side, demonstrates the profanity filter, trending detection, and prints cache hit/miss stats.</div>
+  </section>
+
+  <!-- GLOSSARY -->
+  <section>
+    <div class="sec-h"><span class="n">§</span><h2>Glossary — one-liners</h2><span class="tag">terms used above</span></div>
+    <div class="grid g2">
+      <div class="card"><table><tbody>
+        <tr><td><b>Trie (prefix tree)</b></td><td>tree keyed by characters; a path from root spells a word, so a prefix maps to a subtree</td></tr>
+        <tr><td><b>Top-K pre-computation</b></td><td>store the best K suggestions at every node so a prefix lookup is O(1), not a DFS</td></tr>
+        <tr><td><b>Compressed / radix trie</b></td><td>merge single-child chains into one edge label to cut node count</td></tr>
+        <tr><td><b>Time-decay ranking</b></td><td>score = freq · e^(-λ·age); half-life = ln(2)/λ — fresh queries outrank stale ones</td></tr>
+        <tr><td><b>Strategy pattern</b></td><td>interchangeable algorithms behind one interface, chosen at runtime</td></tr>
+      </tbody></table></div>
+      <div class="card"><table><tbody>
+        <tr><td><b>Facade</b></td><td>one entry point (getSuggestions) hiding trie + cache + filter + rank</td></tr>
+        <tr><td><b>Decorator</b></td><td>wrap a base object to add behavior transparently (personalization over ranking)</td></tr>
+        <tr><td><b>ReadWriteLock</b></td><td>many concurrent readers, one exclusive writer — ideal for read-heavy autocomplete</td></tr>
+        <tr><td><b>LRU + TTL cache</b></td><td>LinkedHashMap access-order evicting the least-recently-used entry, plus per-entry expiry</td></tr>
+        <tr><td><b>Atomic trie swap</b></td><td>build a new trie offline, then swap the reference under the write lock — zero downtime</td></tr>
+      </tbody></table></div>
+    </div>
+  </section>
+
+  <footer>
+    <p>Use case 09 · Search Autocomplete — Canvas 2 of 3 (LLD). Grounded in <code>09-search-autocomplete/docs/lld/</code>, <code>docs/patterns/</code>, and the Java under <code>src/main/java/com/systemdesign/autocomplete</code>.</p>
+    <p class="run">This use case: <a href="hld.html">Canvas 1 · HLD</a> · LLD · <a href="deepdive.html">Canvas 3 · Deep-dive &amp; Trade-offs</a> &nbsp;|&nbsp; Next → <a href="deepdive.html">Canvas 3 · Deep-dive &amp; Trade-offs</a> &nbsp;|&nbsp; <a href="../index.html">Hub</a></p>
+  </footer>
+
+</div>
+<script src="../assets/canvas.js"></script>
+</body>
+</html>

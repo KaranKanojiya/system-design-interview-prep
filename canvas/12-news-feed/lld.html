@@ -1,0 +1,439 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>12 · News Feed — LLD</title>
+<link rel="stylesheet" href="../assets/canvas.css">
+</head>
+<body>
+<div class="wrap">
+
+  <header class="hero">
+    <h1>News Feed — Low-Level Design</h1>
+    <div class="sub">Use case 12 · Canvas 2 of 3. From boxes to classes: the actual Java object model. Start with the <b>interactive class map</b> — click a class to see its responsibility and how <code>AppConfig → Controller → Services → Strategies / Repositories / Cache</code> is wired — then dig into the <b>algorithmic ranking</b> formula, the two <b>fan-out strategies</b> composed by <code>HybridFanoutStrategy</code>, and the read-path assembly pipeline.</div>
+    <div class="badges">
+      <span class="badge lvl">Use case 12 · LLD</span>
+      <span class="badge">Canvas 2 of 3</span>
+      <span class="badge">interactive</span>
+      <span class="badge">Strategy × 2 · Composite · Facade · Builder · Repository</span>
+    </div>
+    <div class="legend">
+      <span><i class="dot" style="background:var(--eden)"></i> entry / composition root</span>
+      <span><i class="dot" style="background:var(--survivor)"></i> interface / contract</span>
+      <span><i class="dot" style="background:var(--old)"></i> concrete implementation</span>
+      <span><i class="dot" style="background:var(--warn)"></i> domain model</span>
+      <span><i class="dot" style="background:var(--muted)"></i> click a class for its role</span>
+    </div>
+  </header>
+
+  <!-- A · CLASS MAP -->
+  <section>
+    <div class="sec-h"><span class="n">A</span><h2>Class design — click a class in the map</h2><span class="tag">the object model, wired</span></div>
+    <div>
+      <div class="arch">
+        <svg viewBox="0 0 900 480" width="100%" style="max-width:900px" role="img" aria-label="News feed class map">
+          <defs>
+            <marker id="ah" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" fill="var(--muted)"></path></marker>
+          </defs>
+
+          <!-- wiring arrows -->
+          <line class="arrow" x1="85" y1="70" x2="85" y2="110" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"></line>
+          <line class="arrow" x1="150" y1="132" x2="203" y2="132" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"></line>
+          <line class="arrow" x1="333" y1="122" x2="393" y2="80" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"></line>
+          <line class="arrow" x1="333" y1="132" x2="393" y2="170" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"></line>
+          <line class="arrow" x1="333" y1="145" x2="393" y2="250" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"></line>
+          <line class="arrow" x1="270" y1="154" x2="270" y2="200" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"></line>
+          <line class="arrow" x1="475" y1="80" x2="620" y2="55" stroke="var(--muted)" stroke-width="2" stroke-dasharray="4 3" marker-end="url(#ah)"></line>
+          <line class="arrow" x1="475" y1="90" x2="620" y2="120" stroke="var(--muted)" stroke-width="2" stroke-dasharray="4 3" marker-end="url(#ah)"></line>
+          <line class="arrow" x1="475" y1="170" x2="620" y2="190" stroke="var(--muted)" stroke-width="2" stroke-dasharray="4 3" marker-end="url(#ah)"></line>
+          <line class="arrow" x1="475" y1="180" x2="620" y2="245" stroke="var(--muted)" stroke-width="2" stroke-dasharray="4 3" marker-end="url(#ah)"></line>
+          <line class="arrow" x1="475" y1="255" x2="620" y2="310" stroke="var(--muted)" stroke-width="2" stroke-dasharray="4 3" marker-end="url(#ah)"></line>
+          <line class="arrow" x1="475" y1="265" x2="620" y2="370" stroke="var(--muted)" stroke-width="2" stroke-dasharray="4 3" marker-end="url(#ah)"></line>
+          <line class="arrow" x1="475" y1="345" x2="620" y2="425" stroke="var(--muted)" stroke-width="2" stroke-dasharray="4 3" marker-end="url(#ah)"></line>
+          <line class="arrow" x1="270" y1="290" x2="270" y2="340" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"></line>
+          <line class="arrow" x1="270" y1="380" x2="270" y2="420" stroke="var(--muted)" stroke-width="2" stroke-dasharray="4 3" marker-end="url(#ah)"></line>
+          <text x="94" y="94" fill="var(--faint)" font-size="9">wires</text>
+          <text x="158" y="126" fill="var(--faint)" font-size="9">uses</text>
+
+          <!-- nodes -->
+          <g data-node style="cursor:pointer" data-title="AppConfig  (composition root)" data-detail="<b>Role:</b> the ONLY place where <code>new ConcreteClass()</code> appears. Poor-man's DI container / Factory.<br><b>Wiring order:</b> Layer 0 storage (repos + TimelineCache) → Layer 1 strategies (Fan-out ×3 + Ranking ×2) → Layer 2 core services (SocialGraph, Notification, Timeline, Ranking) → Layer 3 orchestrators (Fan-out, Post, Engagement, Feed) → Layer 4 FeedController → Layer 5 FeedStatsDisplay.<br><b>Seeds:</b> normal users + celebrities (elon, taylor, cristiano — followerCount &gt; 10 000)."><rect x="20" y="26" width="130" height="44" rx="9" fill="var(--panel-2)" stroke="var(--eden)"></rect><text x="85" y="46" text-anchor="middle" fill="var(--eden)" font-size="12" font-weight="600">AppConfig</text><text x="85" y="59" text-anchor="middle" fill="var(--faint)" font-size="10">composition root</text></g>
+
+          <g data-node style="cursor:pointer" data-title="FeedController  (REST)" data-detail="<b>Role:</b> framework-free stand-in for a Spring @RestController.<br><b>Handlers:</b> handleCreatePost (POST /posts), handleGetFeed (GET /feed/{userId}), handleLike, handleComment, handleShare, handleFollow, handleUnfollow.<br>Each handler catches <code>FeedException</code> and returns clean errors — no business logic here."><rect x="20" y="110" width="130" height="44" rx="9" fill="var(--panel-2)" stroke="var(--border)"></rect><text x="85" y="130" text-anchor="middle" fill="var(--text)" font-size="12" font-weight="600">FeedController</text><text x="85" y="145" text-anchor="middle" fill="var(--faint)" font-size="10">REST endpoints</text></g>
+
+          <g data-node style="cursor:pointer" data-title="PostService  (write path)" data-detail="<b>Role:</b> WRITE-PATH entry. <code>createPost(userId, content, contentType, mediaUrl)</code>: validate author → build via <code>Post.Builder</code> with UUID(8-char) post_id → <code>postRepository.save</code> → <code>author.incrementPostCount()</code> → <code>fanoutService.distribute(post, author)</code>.<br><b>In production:</b> save is sync, fan-out is async via Kafka."><rect x="205" y="110" width="130" height="44" rx="9" fill="var(--panel-2)" stroke="var(--border)"></rect><text x="270" y="130" text-anchor="middle" fill="var(--text)" font-size="12" font-weight="600">PostService</text><text x="270" y="145" text-anchor="middle" fill="var(--faint)" font-size="10">write orchestrator</text></g>
+
+          <g data-node style="cursor:pointer" data-title="FeedService  «Facade» (read path)" data-detail="<b>Role:</b> the READ-PATH orchestrator. <code>getFeed(userId, cursor)</code> runs 5 steps: (1) <b>timelineService.getTimeline</b> → cached postIds from normal friends, (2) for each celebrity in <code>socialGraphService.getFollowing</code> → <b>postRepository.findRecentByAuthorId(id, 10)</b> (celebrity pull), (3) de-dupe by postId (<code>HashSet</code>), (4) <b>rankingService.rank</b>, (5) <b>applyPagination(cursor)</b>.<br>Only Facade in the system — it hides 5 collaborators behind one call."><rect x="205" y="240" width="130" height="52" rx="9" fill="var(--panel-2)" stroke="var(--border)"></rect><text x="270" y="262" text-anchor="middle" fill="var(--text)" font-size="12" font-weight="600">FeedService</text><text x="270" y="277" text-anchor="middle" fill="var(--faint)" font-size="10">«Facade» · 5-step</text></g>
+
+          <g data-node style="cursor:pointer" data-title="FanoutService  (orchestrator)" data-detail="<b>Role:</b> bridge between PostService and the fan-out strategy.<br><code>distribute(post, author)</code>: (1) <code>socialGraphService.getFollowers(authorId)</code>, (2) delegate to injected <code>FanoutStrategy.distribute(...)</code> — the strategy owns the push-vs-noop decision, (3) <code>notificationService.notifyNewPost(followerIds, post)</code>, (4) record fan-out ms.<br>In production: fan-out is async — Kafka publishes, workers consume."><rect x="205" y="340" width="130" height="44" rx="9" fill="var(--panel-2)" stroke="var(--border)"></rect><text x="270" y="360" text-anchor="middle" fill="var(--text)" font-size="12" font-weight="600">FanoutService</text><text x="270" y="375" text-anchor="middle" fill="var(--faint)" font-size="10">orchestrator</text></g>
+
+          <g data-node style="cursor:pointer" data-title="EngagementService  (likes / comments / shares)" data-detail="<b>Role:</b> writes engagement, updates counters, and feeds the ranker.<br><code>likePost(userId, postId)</code>: idempotency check via <code>engagementRepository.hasLiked</code>, save Like, <code>post.incrementLikes()</code>, <b><code>algorithmicRanking.recordInteraction(viewer, author)</code></b> — this is how affinity grows — then <code>notificationService.notifyLike</code>. Same shape for comment / share (share is the strongest affinity signal)."><rect x="205" y="420" width="130" height="42" rx="9" fill="var(--panel-2)" stroke="var(--border)"></rect><text x="270" y="440" text-anchor="middle" fill="var(--text)" font-size="12" font-weight="600">EngagementService</text><text x="270" y="454" text-anchor="middle" fill="var(--faint)" font-size="10">likes · comments · shares</text></g>
+
+          <g data-node style="cursor:pointer" data-title="FanoutStrategy  «interface»" data-detail="<b>Contract:</b> <code>void distribute(Post post, User author, List&lt;String&gt; followerIds, TimelineCache cache)</code>, <code>String getStrategyName()</code>.<br><b>Why:</b> FanoutService depends on the interface only — the celebrity-vs-normal branch never appears in service code (Open-Closed).<br>Three implementations ship."><rect x="395" y="56" width="130" height="44" rx="9" fill="var(--panel-2)" stroke="var(--survivor)"></rect><text x="460" y="76" text-anchor="middle" fill="var(--survivor)" font-size="12" font-weight="600">FanoutStrategy</text><text x="460" y="90" text-anchor="middle" fill="var(--faint)" font-size="10">«interface»</text></g>
+
+          <g data-node style="cursor:pointer" data-title="FanoutOnWriteStrategy  (push)" data-detail="<b>Role:</b> for-loop over follower IDs, <code>cache.addToTimeline(followerId, post.getPostId(), post.getCreatedAt())</code>.<br><b>Cost:</b> O(N) writes on publish, O(1) on read.<br><b>Great for:</b> normal users (100–1 000 followers). <b>Kills:</b> a celebrity with 50 M followers → 500 s / 8 min of fan-out per post."><rect x="620" y="20" width="130" height="42" rx="9" fill="var(--panel-2)" stroke="var(--old)"></rect><text x="685" y="40" text-anchor="middle" fill="var(--old)" font-size="12" font-weight="600">FanoutOnWrite</text><text x="685" y="54" text-anchor="middle" fill="var(--faint)" font-size="10">push · O(N) writes</text></g>
+
+          <g data-node style="cursor:pointer" data-title="FanoutOnReadStrategy  (pull)" data-detail="<b>Role:</b> pure NO-OP — logs and returns. Celebrity's post lives only in author's own timeline; followers pull it in <code>FeedService</code> step 2.<br><b>Cost:</b> O(1) on publish, O(C) on read (C = celebrities followed, typically 5–20).<br><b>Great for:</b> celebrities. <b>Never used alone</b> — always via Hybrid."><rect x="620" y="70" width="130" height="42" rx="9" fill="var(--panel-2)" stroke="var(--old)"></rect><text x="685" y="90" text-anchor="middle" fill="var(--old)" font-size="12" font-weight="600">FanoutOnRead</text><text x="685" y="104" text-anchor="middle" fill="var(--faint)" font-size="10">pull · no-op push</text></g>
+
+          <g data-node style="cursor:pointer" data-title="HybridFanoutStrategy  «Composite»" data-detail="<b>Role:</b> Strategy + Composite. Injected with both <code>writeStrategy</code> and <code>readStrategy</code>. The single routing decision:<br><code>if (author.isCelebrity()) readStrategy.distribute(...) else writeStrategy.distribute(...)</code>.<br><b>Threshold:</b> <code>User.CELEBRITY_THRESHOLD = 10_000</code> in code (~1 M in production).<br>Tracks <code>writePathCount / readPathCount</code> AtomicInts for stats."><rect x="620" y="120" width="130" height="52" rx="9" fill="var(--panel-2)" stroke="var(--old)"></rect><text x="685" y="140" text-anchor="middle" fill="var(--old)" font-size="12" font-weight="600">HybridFanout</text><text x="685" y="155" text-anchor="middle" fill="var(--faint)" font-size="10">«Composite»</text></g>
+
+          <g data-node style="cursor:pointer" data-title="RankingStrategy  «interface»" data-detail="<b>Contract:</b> <code>List&lt;FeedItem&gt; rank(List&lt;FeedItem&gt; items, User viewer)</code>, <code>String getStrategyName()</code>.<br>Two ships: <code>ChronologicalRankingStrategy</code> (score = epoch seconds — Twitter Classic / Mastodon) and <code>AlgorithmicRankingStrategy</code> (Facebook / LinkedIn formula, section B)."><rect x="395" y="180" width="130" height="44" rx="9" fill="var(--panel-2)" stroke="var(--survivor)"></rect><text x="460" y="200" text-anchor="middle" fill="var(--survivor)" font-size="12" font-weight="600">RankingStrategy</text><text x="460" y="214" text-anchor="middle" fill="var(--faint)" font-size="10">«interface»</text></g>
+
+          <g data-node style="cursor:pointer" data-title="AlgorithmicRankingStrategy" data-detail="<b>Formula:</b> <code>score = affinity × recencyDecay × engagementBoost × contentTypeWeight</code>.<br>Holds <code>Map&lt;viewerId, Map&lt;authorId, Integer&gt;&gt; interactionHistory</code> (ConcurrentHashMap). <code>recordInteraction(v, a)</code> increments the counter — called by EngagementService on every like/comment/share.<br><b>Constants:</b> RECENCY_DECAY_CONSTANT 0.05, MAX_AFFINITY 2.0, AFFINITY_PER_INTERACTION 0.1, ENGAGEMENT_LOG_DIVISOR 10.0."><rect x="620" y="180" width="130" height="52" rx="9" fill="var(--panel-2)" stroke="var(--old)"></rect><text x="685" y="200" text-anchor="middle" fill="var(--old)" font-size="12" font-weight="600">Algorithmic</text><text x="685" y="214" text-anchor="middle" fill="var(--faint)" font-size="10">affinity × rec × eng × type</text></g>
+
+          <g data-node style="cursor:pointer" data-title="ChronologicalRankingStrategy" data-detail="<b>Formula:</b> score = epoch-day × 86 400 + secondOfDay — pure timestamp ordering. This was Twitter's ranking until 2016 (still Mastodon's).<br><b>Pros:</b> transparent, no filter bubble, no ML infra. <b>Cons:</b> a follow-1 000-accounts user misses posts from close friends buried by high-volume posters."><rect x="620" y="240" width="130" height="42" rx="9" fill="var(--panel-2)" stroke="var(--old)"></rect><text x="685" y="260" text-anchor="middle" fill="var(--old)" font-size="12" font-weight="600">Chronological</text><text x="685" y="274" text-anchor="middle" fill="var(--faint)" font-size="10">score = timestamp</text></g>
+
+          <g data-node style="cursor:pointer" data-title="TimelineCache  «interface»" data-detail="<b>Contract:</b> <code>addToTimeline(userId, postId, timestamp)</code>, <code>getTimeline(userId, limit)</code>, <code>getTimelineWithCursor(userId, cursor)</code>, <code>removeFromTimeline</code>, <code>getTimelineSize</code>.<br>Analogue of Redis Sorted Set (ZADD / ZREVRANGEBYSCORE). Concrete: <code>InMemoryTimelineCache</code>. Swap to a Jedis / Lettuce impl in production."><rect x="395" y="298" width="130" height="42" rx="9" fill="var(--panel-2)" stroke="var(--survivor)"></rect><text x="460" y="318" text-anchor="middle" fill="var(--survivor)" font-size="12" font-weight="600">TimelineCache</text><text x="460" y="332" text-anchor="middle" fill="var(--faint)" font-size="10">«interface»</text></g>
+
+          <g data-node style="cursor:pointer" data-title="InMemoryTimelineCache" data-detail="<b>Guts:</b> <code>Map&lt;String, TreeMap&lt;LocalDateTime,String&gt;&gt;</code> — one TreeMap per user, sorted <code>Collections.reverseOrder()</code> (newest first).<br><b>Cap:</b> <code>MAX_TIMELINE_SIZE = 1000</code> — <code>pollLastEntry()</code> after every insert, the O(1) analogue of Redis <code>ZREMRANGEBYRANK 0 -501</code>.<br>Cursor read via <code>timeline.tailMap(cursorTs, false)</code> — O(log N) skip. Sync-block per-user TreeMap for thread safety."><rect x="620" y="298" width="130" height="42" rx="9" fill="var(--panel-2)" stroke="var(--old)"></rect><text x="685" y="318" text-anchor="middle" fill="var(--old)" font-size="12" font-weight="600">InMemoryTimeline</text><text x="685" y="332" text-anchor="middle" fill="var(--faint)" font-size="10">TreeMap · reverseOrder</text></g>
+
+          <g data-node style="cursor:pointer" data-title="TimelineService" data-detail="<b>Role:</b> wraps TimelineCache. <code>addToTimeline</code> (called by FanoutOnWriteStrategy), <code>getTimeline(userId, cursor)</code> which fetches postIds from the cache then hydrates via <code>postRepository.findByIds(postIds)</code>.<br><b>Why hydrate at read:</b> if a post is edited or its counters change, we always fetch the latest — the cache only stores postIds, never bodies."><rect x="20" y="200" width="130" height="42" rx="9" fill="var(--panel-2)" stroke="var(--border)"></rect><text x="85" y="220" text-anchor="middle" fill="var(--text)" font-size="12" font-weight="600">TimelineService</text><text x="85" y="234" text-anchor="middle" fill="var(--faint)" font-size="10">cache + hydrate</text></g>
+
+          <g data-node style="cursor:pointer" data-title="SocialGraphService" data-detail="<b>Role:</b> follow / unfollow, follower &amp; following lists, celebrity check.<br><code>follow(a, b)</code>: validate both, block self-follow, block duplicate, <code>followRepository.save</code>, refresh denormalised counters on both User objects.<br><code>isCelebrity(u)</code> = <code>User.followerCount &gt; 10_000</code>.<br>Used by FanoutService.getFollowers and FeedService.getFollowing (for celebrity pull)."><rect x="395" y="350" width="130" height="42" rx="9" fill="var(--panel-2)" stroke="var(--border)"></rect><text x="460" y="370" text-anchor="middle" fill="var(--text)" font-size="12" font-weight="600">SocialGraphService</text><text x="460" y="384" text-anchor="middle" fill="var(--faint)" font-size="10">follow · celeb-check</text></g>
+
+          <g data-node style="cursor:pointer" data-title="Repositories  «interfaces»" data-detail="<b>4 contracts:</b> <code>UserRepository</code>, <code>PostRepository</code>, <code>FollowRepository</code>, <code>EngagementRepository</code>. Concretes: <code>InMemoryUser/Post/Follow/Engagement Repository</code> (ConcurrentHashMap backed).<br>Repository pattern — services talk to interfaces, so swapping in Cassandra / Postgres impls needs zero service changes."><rect x="395" y="405" width="330" height="42" rx="9" fill="var(--panel-2)" stroke="var(--survivor)"></rect><text x="560" y="425" text-anchor="middle" fill="var(--survivor)" font-size="12" font-weight="600">Repositories (User · Post · Follow · Engagement)</text><text x="560" y="439" text-anchor="middle" fill="var(--faint)" font-size="10">«interfaces» · InMemory impls</text></g>
+
+          <g data-node style="cursor:pointer" data-title="Domain models" data-detail="<b>Post</b> (Builder, immutable core + AtomicInteger like/comment/shareCount, ContentType enum).<br><b>User</b> (userId, name, follower/following/postCount denormalised, <code>CELEBRITY_THRESHOLD=10_000</code>).<br><b>FeedItem</b> (post + score + position + <code>FeedItemSource.TIMELINE_CACHE | PULLED_ON_READ</code> — implements Comparable score-DESC).<br><b>FeedCursor</b> (lastPostId + lastTimestamp + pageSize=20; static <code>firstPage()</code> / <code>nextPage()</code>).<br><b>ContentType</b> enum (TEXT 1.0, IMAGE 1.3, VIDEO 1.5, LINK 1.1, POLL 1.4).<br>Plus Follow, Like, Comment."><rect x="20" y="280" width="150" height="42" rx="9" fill="var(--panel-2)" stroke="var(--warn)"></rect><text x="95" y="300" text-anchor="middle" fill="var(--warn)" font-size="12" font-weight="600">Domain models</text><text x="95" y="314" text-anchor="middle" fill="var(--faint)" font-size="10">Post · User · FeedItem · Cursor …</text></g>
+
+        </svg>
+      </div>
+      <div class="node-detail"><span class="nd-title">Click any class</span><div class="nd-body">Its responsibility, key methods, and how it is wired appear here. Dashed arrows are <i>implements</i> / <i>uses</i>; solid arrows are core wiring. Notice the services depend only on the <b>«interface»</b> boxes (FanoutStrategy, RankingStrategy, TimelineCache, Repositories) — that is what makes the fan-out mode, the ranking algorithm, and the cache backend all swappable.</div></div>
+    </div>
+  </section>
+
+  <!-- B · ALGORITHMIC RANKING (the core formula) -->
+  <section>
+    <div class="sec-h"><span class="n">B</span><h2>Algorithmic ranking — the core formula</h2><span class="tag">AlgorithmicRankingStrategy</span></div>
+    <div class="grid g2">
+      <div class="card">
+        <div class="kicker">the code (verbatim, from computeScore)</div>
+        <pre class="code"><span class="kw">private double</span> <span class="ty">computeScore</span>(FeedItem it, User viewer) {
+  <span class="kw">double</span> aff   = computeAffinityScore(
+                    viewer.getUserId(),
+                    it.getPost().getAuthorId());
+  <span class="kw">double</span> rec   = computeRecencyDecay(
+                    it.getPost().getCreatedAt());
+  <span class="kw">double</span> eng   = computeEngagementBoost(it.getPost());
+  <span class="kw">double</span> ctype = it.getPost().getContentType()
+                                .getWeight();
+  <span class="kw">return</span> aff * rec * eng * ctype;
+}
+
+<span class="cm">// affinity: 1.0 + interactions*0.1, capped 2.0</span>
+Math.min(1.0 + n * 0.1, 2.0)
+
+<span class="cm">// recency: exp(-0.05 * hoursAge)</span>
+Math.exp(-0.05 * hoursAge)
+
+<span class="cm">// engagement: log-compressed (comments×2, shares×3)</span>
+1.0 + Math.log(1 + likes + com*2 + sh*3) / 10.0</pre>
+        <p class="muted">Constants: <code>RECENCY_DECAY_CONSTANT 0.05</code>, <code>AFFINITY_PER_INTERACTION 0.1</code>, <code>MAX_AFFINITY 2.0</code>, <code>ENGAGEMENT_LOG_DIVISOR 10.0</code>. <code>ContentType</code> weights TEXT 1.0 · IMAGE 1.3 · VIDEO 1.5 · LINK 1.1 · POLL 1.4.</p>
+      </div>
+      <div class="card">
+        <div class="kicker">worked example — best friend vs viral stranger</div>
+        <pre class="code"><span class="cm">// P1: best friend, 2 h old, 50 likes, 10 com, 5 sh, VIDEO</span>
+aff = min(1.0 + 5*0.1, 2.0)        = <span class="st">1.5</span>
+rec = exp(-0.05 * 2)               = <span class="st">0.905</span>
+eng = 1 + log(1 + 50 + 20 + 15)/10 = <span class="st">1.445</span>
+ctype = VIDEO                      = <span class="st">1.5</span>
+score = 1.5 * 0.905 * 1.445 * 1.5  = <span class="st">2.94</span>
+
+<span class="cm">// P2: stranger, 1 h old, 500 likes, 50 com, 20 sh, VIDEO</span>
+aff = 1.0 (no history)             = <span class="st">1.0</span>
+rec = exp(-0.05 * 1)               = <span class="st">0.951</span>
+eng = 1 + log(1 + 500+100+60)/10   = <span class="st">1.649</span>
+ctype = VIDEO                      = <span class="st">1.5</span>
+score = 1.0 * 0.951 * 1.649 * 1.5  = <span class="st">2.35</span>
+
+<span class="cm">// P1 &gt; P2. AFFINITY DOMINATES.</span></pre>
+        <p class="muted">This is why your best-friend's mundane video ranks above a stranger's viral one. Even though P2 has 10× the engagement and is newer, the 1.5× affinity multiplier flips the ranking.</p>
+      </div>
+    </div>
+    <div class="callout tip"><b>Why <i>log</i> on engagement and <i>exp</i> on recency?</b> Log compression on engagement stops a 1 M-like post from permanently owning the feed (5 → 50 likes matters more than 100 K → 1 M). Exponential decay on recency drops off <i>fast</i>: a 24-hour-old post scores 0.30, a 72-hour-old one 0.03 — effectively invisible. Affinity is <i>additive</i> (0.1 per interaction, capped 2.0) so it doesn't explode. Each factor has its own shape and its own reason.</div>
+  </section>
+
+  <!-- C · FAN-OUT STRATEGIES (tabs) -->
+  <section>
+    <div class="sec-h"><span class="n">C</span><h2>Fan-out strategies (Strategy + Composite)</h2><span class="tag">swap the distribution, not the service</span></div>
+    <div data-tabscope>
+      <div class="tabs">
+        <button class="tab active" data-tab="write">Fan-out on Write (push)</button>
+        <button class="tab" data-tab="read">Fan-out on Read (pull)</button>
+        <button class="tab" data-tab="hybrid">Hybrid (Composite)</button>
+        <button class="tab" data-tab="pattern">The pattern</button>
+      </div>
+      <div class="tabpanel active" data-panel="write">
+        <p><b>FanoutOnWriteStrategy</b> — <span class="run">O(N) writes on publish, O(1) on read</span></p>
+        <pre class="code"><span class="kw">public void</span> <span class="ty">distribute</span>(Post post, User author,
+                       List&lt;String&gt; followerIds,
+                       TimelineCache cache) {
+  <span class="kw">for</span> (String followerId : followerIds) {
+    cache.addToTimeline(followerId,
+                         post.getPostId(),
+                         post.getCreatedAt());
+  }
+}</pre>
+        <ul class="tight">
+          <li><b>Great for:</b> normal users (100–1 000 followers). Bounded write cost.</li>
+          <li><b>Kills:</b> celebrities — 10 M followers × 10 posts/day = 100 M cache writes/day <i>from one user</i>.</li>
+          <li><b>In production:</b> the for-loop is a Kafka consumer that pipelines 1 000 <code>ZADD</code>s per round-trip against Redis Cluster.</li>
+        </ul>
+      </div>
+      <div class="tabpanel" data-panel="read">
+        <p><b>FanoutOnReadStrategy</b> — <span class="run">O(1) publish, O(C) read</span> (C = celebrities followed)</p>
+        <pre class="code"><span class="kw">public void</span> <span class="ty">distribute</span>(Post post, User author,
+                       List&lt;String&gt; followerIds,
+                       TimelineCache cache) {
+  <span class="cm">// NO-OP — celebrity's post stays in author's</span>
+  <span class="cm">// user timeline. Pulled at read by FeedService.</span>
+}</pre>
+        <ul class="tight">
+          <li><b>Great for:</b> celebrities — post is instant, no write amplification.</li>
+          <li><b>Cost:</b> each feed request must query C celebrity timelines. Cache with a per-node local L1 (Caffeine, 10 s TTL) to survive the thundering herd.</li>
+        </ul>
+      </div>
+      <div class="tabpanel" data-panel="hybrid">
+        <p><b>HybridFanoutStrategy</b> — Strategy + Composite. <span class="run">the production answer</span></p>
+        <pre class="code"><span class="kw">public void</span> <span class="ty">distribute</span>(Post post, User author,
+                       List&lt;String&gt; followerIds,
+                       TimelineCache cache) {
+  <span class="kw">if</span> (author.isCelebrity()) {   <span class="cm">// followerCount &gt; 10_000</span>
+    readPathCount.incrementAndGet();
+    readStrategy.distribute(post, author,
+                             followerIds, cache);
+  } <span class="kw">else</span> {
+    writePathCount.incrementAndGet();
+    writeStrategy.distribute(post, author,
+                              followerIds, cache);
+  }
+}</pre>
+        <ul class="tight">
+          <li>A single <code>if</code>-statement is the entire hybrid design. From <code>FanoutService</code>'s side, it's just one strategy — the routing is invisible.</li>
+          <li>Composite pattern: it <i>wraps</i> both concrete strategies and delegates. Owned by <code>AppConfig</code>, which wires <code>new HybridFanoutStrategy(writeStrategy, readStrategy)</code>.</li>
+          <li>Tracks <code>writePathCount</code> / <code>readPathCount</code> AtomicInts — surfaced in <code>FeedStatsDisplay</code>.</li>
+        </ul>
+      </div>
+      <div class="tabpanel" data-panel="pattern">
+        <p>Two <b>Strategy</b> axes power the whole system:</p>
+        <pre class="code">FanoutStrategy      →  Write · Read · <b>Hybrid</b> (composite)
+RankingStrategy     →  <b>Algorithmic</b> · Chronological</pre>
+        <ul class="tight">
+          <li><b>Anti-pattern:</b> a god <code>UglyFeedService</code> with <code>if (isCelebrity)</code> hardcoded in <code>publishPost</code> and a growing <code>switch(rankMode)</code> in <code>getFeed</code>. Adding an algorithm = editing service code (violates OCP).</li>
+          <li><b>Clean:</b> services depend only on the two interfaces. Adding a new fan-out mode = new class + one line in <code>AppConfig</code>. Zero service edits. A/B testing per user cohort becomes trivial.</li>
+        </ul>
+      </div>
+    </div>
+    <table>
+      <thead><tr><th>Strategy</th><th>Publish cost</th><th>Feed-read cost</th><th>Storage</th><th>Best for</th></tr></thead>
+      <tbody>
+        <tr><td>Fan-out on Write</td><td>O(N followers)</td><td>O(1)</td><td>N copies of postId</td><td>normal users</td></tr>
+        <tr><td>Fan-out on Read</td><td>O(1)</td><td>O(C followed celebs)</td><td>1 copy</td><td>celebrities</td></tr>
+        <tr><td><b>Hybrid</b></td><td>route by <code>isCelebrity()</code></td><td>merge cached + pulled</td><td>both, right-sized</td><td>everyone (production)</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <!-- D · TIMELINE CACHE DATA STRUCTURE -->
+  <section>
+    <div class="sec-h"><span class="n">D</span><h2>Timeline cache — the sorted-set analogue</h2><span class="tag">InMemoryTimelineCache</span></div>
+    <div class="grid g2">
+      <div class="card">
+        <div class="kicker">the guts (Java stand-in for Redis ZSET)</div>
+        <pre class="code">Map&lt;String, TreeMap&lt;LocalDateTime, String&gt;&gt; timelines;
+<span class="cm">// per-user TreeMap, sorted reverseOrder (newest first)</span>
+
+<span class="cm">// WRITE (fan-out on write):</span>
+timeline = computeIfAbsent(userId,
+    k -&gt; <span class="kw">new</span> TreeMap&lt;&gt;(Collections.reverseOrder()));
+<span class="kw">synchronized</span>(timeline) {
+  timeline.put(timestamp, postId);
+  <span class="kw">while</span> (timeline.size() &gt; MAX_TIMELINE_SIZE) {  <span class="cm">// 1000</span>
+    timeline.pollLastEntry();  <span class="cm">// evict oldest — O(1)</span>
+  }
+}
+
+<span class="cm">// READ (cursor):</span>
+NavigableMap&lt;LocalDateTime, String&gt; afterCursor =
+  timeline.tailMap(cursor.getLastTimestamp(), false);
+<span class="cm">// tailMap of a reverse-ordered TreeMap = older posts. O(log N).</span></pre>
+      </div>
+      <div class="card">
+        <div class="kicker">Redis mapping</div>
+        <pre class="code"><span class="cm">// Java (in-memory)         Redis (production)</span>
+addToTimeline          →  <span class="ty">ZADD</span> timeline:{u} score post
+pollLastEntry (cap 1K) →  <span class="ty">ZREMRANGEBYRANK</span> timeline:{u} 0 -1001
+getTimeline(u, limit)  →  <span class="ty">ZREVRANGEBYSCORE</span> +inf -inf
+                             LIMIT 0 20
+tailMap(cursorTs)      →  <span class="ty">ZREVRANGEBYSCORE</span> (cursorScore -inf
+                             LIMIT 0 20
+removeFromTimeline     →  <span class="ty">ZREM</span> timeline:{u} postId
+
+<span class="cm">// TTL (production):</span>
+                           <span class="ty">EXPIRE</span> timeline:{u} 604800   <span class="cm">// 7d</span></pre>
+        <p class="muted">The in-memory <code>TreeMap</code> is not a toy — it's an O(log N) sorted structure with <i>the same</i> ops as a Redis ZSET (with an O(1) tail evict via <code>pollLastEntry</code>).</p>
+      </div>
+    </div>
+    <div class="callout"><b>Timestamp collisions:</b> if two posts hit the same <code>LocalDateTime</code>, the code appends <code>plusNanos(1)</code> in a loop to avoid overwriting the map entry. Redis avoids this natively because ZSET members are unique — score ties are broken by member string. In prod, <code>score = ranking_score</code>, <code>member = post_id</code>.</div>
+  </section>
+
+  <!-- E · REQUEST SEQUENCES -->
+  <section>
+    <div class="sec-h"><span class="n">E</span><h2>Request handling sequence</h2><span class="tag">which class does what, in order</span></div>
+
+    <div class="collapsible open">
+      <div class="c-head"><h3>POST /posts &nbsp;→&nbsp; publish (write path)</h3></div>
+      <div class="c-body">
+        <pre class="code"><span class="cm">FeedController.handleCreatePost(userId, content, contentType, mediaUrl)</span>
+  └─ PostService.createPost(...)
+       1  userRepository.findById(userId)                <span class="cm">// or UserNotFound</span>
+       2  Post.Builder()
+             .postId(UUID.randomUUID()...substring(0,8))
+             .authorId(userId).authorName(name)
+             .content(content).contentType(type)
+             .mediaUrl(url).createdAt(now).build()
+       3  postRepository.save(post)                      <span class="cm">// ConcurrentHashMap put</span>
+       4  author.incrementPostCount()                    <span class="cm">// denormalised counter</span>
+       5  fanoutService.distribute(post, author)
+            ├─ socialGraphService.getFollowers(authorId)
+            ├─ HybridFanoutStrategy.distribute(...)
+            │     ├─ if isCelebrity → FanoutOnReadStrategy  (no-op)
+            │     └─ else          → FanoutOnWriteStrategy
+            │                        for each: cache.addToTimeline(f, postId, ts)
+            └─ notificationService.notifyNewPost(followerIds, post)
+  └─ return Post   <span class="cm">// 201 to client (~60 ms sync)</span></pre>
+      </div>
+    </div>
+
+    <div class="collapsible open">
+      <div class="c-head"><h3>GET /feed/{userId} &nbsp;→&nbsp; read the feed</h3></div>
+      <div class="c-body">
+        <pre class="code"><span class="cm">FeedController.handleGetFeed(userId, cursor)</span>
+  └─ FeedService.getFeed(userId, cursor)   <span class="cm">// «Facade»</span>
+       <b>1</b>  timelineService.getTimeline(userId, cursor)
+             └─ timelineCache.getTimeline(...) → postIds
+             └─ postRepository.findByIds(postIds)      <span class="cm">// hydrate</span>
+           wrap each Post → FeedItem(TIMELINE_CACHE)
+       <b>2</b>  socialGraphService.getFollowing(userId)
+           for each followedId:
+             user = userRepository.findById(followedId)
+             <span class="kw">if</span> (user.isCelebrity()):                    <span class="cm">// &gt;10_000</span>
+               postRepository.findRecentByAuthorId(id, 10)
+               wrap each Post → FeedItem(PULLED_ON_READ)
+       <b>3</b>  de-dupe by postId (HashSet)
+       <b>4</b>  rankingService.rank(items, viewer)
+             └─ AlgorithmicRankingStrategy.rank(...)
+                  for each item: setScore(computeScore(item, viewer))
+                  ranked.sort(<span class="kw">null</span>)                        <span class="cm">// FeedItem: Comparable DESC</span>
+                  setPosition(i+1)
+       <b>5</b>  applyPagination(ranked, cursor)
+             ├─ if firstPage: subList(0, pageSize)
+             └─ else: skip until lastPostId, then take pageSize
+  └─ return List&lt;FeedItem&gt;   <span class="cm">// 200 to client</span></pre>
+      </div>
+    </div>
+
+    <div class="collapsible">
+      <div class="c-head"><h3>POST /posts/{id}/likes &nbsp;→&nbsp; like &amp; feed the ranker</h3></div>
+      <div class="c-body">
+        <pre class="code"><span class="cm">FeedController.handleLike(userId, postId)</span>
+  └─ EngagementService.likePost(userId, postId)
+       1  <span class="kw">if</span> engagementRepository.hasLiked(u, p): <span class="kw">return</span>  <span class="cm">// idempotent</span>
+       2  engagementRepository.saveLike(new Like(u, p))
+       3  post.incrementLikes()                             <span class="cm">// AtomicInteger</span>
+       4  <b>algorithmicRanking.recordInteraction(u, post.getAuthorId())</b>
+          <span class="cm">// affinityScore for (u → author) grows by +0.1, cap 2.0</span>
+          <span class="cm">// → the ranker will boost author's future posts for u</span>
+       5  notificationService.notifyLike(post.getAuthorId(), u.name)</pre>
+        <p class="muted">Step 4 is the loop that closes ranking: every engagement <i>trains</i> the affinity map used on the next feed read. Shares are the same shape (strongest signal), comments too.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- F · DESIGN PATTERNS -->
+  <section>
+    <div class="sec-h"><span class="n">F</span><h2>Design patterns used</h2><span class="tag">GoF-categorised</span></div>
+    <div class="grid g3">
+      <div class="card">
+        <div class="kicker">Behavioral</div>
+        <ul class="tight">
+          <li><b>Strategy × 2</b> — <code>FanoutStrategy</code> (Write / Read / Hybrid) and <code>RankingStrategy</code> (Algorithmic / Chronological). Two independent axes; both injected in <code>AppConfig</code>.</li>
+          <li><b>Iterator</b> — <code>FeedCursor</code> (lastPostId + lastTimestamp + pageSize) drives cursor-based infinite scroll.</li>
+          <li><b>Observer (conceptual)</b> — <code>NotificationService</code> observes post/like/comment events fired by services.</li>
+        </ul>
+      </div>
+      <div class="card">
+        <div class="kicker">Structural</div>
+        <ul class="tight">
+          <li><b>Composite</b> — <code>HybridFanoutStrategy</code> composes both write &amp; read strategies behind one interface.</li>
+          <li><b>Facade</b> — <code>FeedService.getFeed</code> hides 5 collaborators (TimelineService, SocialGraphService, RankingService, PostRepository, UserRepository) behind one call.</li>
+          <li><b>Repository</b> — 4 interfaces (User / Post / Follow / Engagement) → InMemory impls. Swap to Cassandra / PG for prod.</li>
+        </ul>
+      </div>
+      <div class="card">
+        <div class="kicker">Creational</div>
+        <ul class="tight">
+          <li><b>Builder</b> — <code>Post.Builder</code> for the multi-field immutable Post (id, content, type, media, timestamp).</li>
+          <li><b>Factory</b> — <code>AppConfig</code> is the composition root; the one place <code>new</code> appears. Replace with Spring @Configuration / Guice in production.</li>
+        </ul>
+      </div>
+    </div>
+    <div class="callout"><b>Why they cluster:</b> Strategy × 2 + Composite + Facade + Repository together enforce the Open-Closed Principle across every dimension the system varies on — fan-out mode, ranking algorithm, storage backend. New content-type weights, a new "ForYou" ranker, a Cassandra repository — all are <i>additions</i>, never edits to service code. <span class="run">→ CAP / consistency deep-dive on canvas 3</span></div>
+  </section>
+
+  <!-- RUN IT -->
+  <section>
+    <div class="sec-h"><span class="n">▶</span><h2>Run it — repo file map</h2><span class="tag">concept → actual Java class</span></div>
+    <table>
+      <thead><tr><th>Concept above</th><th>File in <code>12-news-feed/src/main/java/com/systemdesign/newsfeed/</code></th></tr></thead>
+      <tbody>
+        <tr><td>Composition root / wiring</td><td><code>config/AppConfig.java</code></td></tr>
+        <tr><td>REST endpoints</td><td><code>controller/FeedController.java</code></td></tr>
+        <tr><td>Write path</td><td><code>service/PostService.java</code></td></tr>
+        <tr><td>Read path (Facade)</td><td><code>service/FeedService.java</code></td></tr>
+        <tr><td>Fan-out orchestrator</td><td><code>service/FanoutService.java</code></td></tr>
+        <tr><td>Timeline (hydrate)</td><td><code>service/TimelineService.java</code></td></tr>
+        <tr><td>Ranking dispatcher</td><td><code>service/RankingService.java</code></td></tr>
+        <tr><td>Social graph + celebrity check</td><td><code>service/SocialGraphService.java</code></td></tr>
+        <tr><td>Engagement + affinity update</td><td><code>service/EngagementService.java</code></td></tr>
+        <tr><td>Fan-out strategies (§C)</td><td><code>strategy/fanout/FanoutStrategy.java</code> · <code>FanoutOnWriteStrategy.java</code> · <code>FanoutOnReadStrategy.java</code> · <code>HybridFanoutStrategy.java</code></td></tr>
+        <tr><td>Ranking strategies (§B)</td><td><code>strategy/ranking/RankingStrategy.java</code> · <code>AlgorithmicRankingStrategy.java</code> · <code>ChronologicalRankingStrategy.java</code></td></tr>
+        <tr><td>Timeline cache (§D)</td><td><code>store/TimelineCache.java</code> · <code>store/InMemoryTimelineCache.java</code></td></tr>
+        <tr><td>Repositories</td><td><code>repository/{User,Post,Follow,Engagement}Repository.java</code> · <code>InMemory*.java</code></td></tr>
+        <tr><td>Domain models</td><td><code>model/Post.java</code> · <code>User.java</code> · <code>Follow.java</code> · <code>Like.java</code> · <code>Comment.java</code> · <code>FeedItem.java</code> · <code>FeedCursor.java</code> · <code>ContentType.java</code></td></tr>
+        <tr><td>Exceptions</td><td><code>exception/FeedException.java</code> · <code>UserNotFoundException.java</code> · <code>PostNotFoundException.java</code></td></tr>
+        <tr><td>Runnable demo (main)</td><td><code>NewsFeedApp.java</code></td></tr>
+      </tbody>
+    </table>
+    <div class="callout tip"><b>Run the demo</b> (Gradle <code>application</code> plugin, mainClass <code>NewsFeedApp</code>, no framework):<br><pre class="code">./gradlew :12-news-feed:run</pre>Seeds 5 normals + 3 celebrities (elon 50 K, taylor 100 K, cristiano 200 K), publishes posts through the hybrid pipeline (watch <code>[FanoutOnWrite]</code> vs <code>[FanoutOnRead]</code> log lines), exercises likes/comments/shares (which train affinity), then prints ranked feeds via <code>FeedStatsDisplay</code>.</div>
+  </section>
+
+  <!-- GLOSSARY -->
+  <section>
+    <div class="sec-h"><span class="n">§</span><h2>Glossary — one-liners</h2><span class="tag">terms used above</span></div>
+    <div class="grid g2">
+      <div class="card"><table><tbody>
+        <tr><td><b>Strategy pattern</b></td><td>family of interchangeable algorithms behind one interface, chosen at runtime</td></tr>
+        <tr><td><b>Composite pattern</b></td><td>an object that wraps a family of the same interface and delegates (HybridFanout)</td></tr>
+        <tr><td><b>Facade</b></td><td>one call (<code>getFeed</code>) hides an orchestration over multiple collaborators</td></tr>
+        <tr><td><b>Repository pattern</b></td><td>interface over data access so storage swaps without touching services</td></tr>
+        <tr><td><b>Composition root</b></td><td>the single place (AppConfig) where the object graph is wired</td></tr>
+      </tbody></table></div>
+      <div class="card"><table><tbody>
+        <tr><td><b>Affinity</b></td><td>viewer→author interaction score; +0.1 per like/comment/share, cap 2.0</td></tr>
+        <tr><td><b>Recency decay</b></td><td><code>exp(-0.05 × hoursAge)</code> — 24 h old ≈ 0.30, 72 h ≈ 0.03</td></tr>
+        <tr><td><b>Engagement boost</b></td><td><code>1 + log(1 + likes + comments·2 + shares·3)/10</code></td></tr>
+        <tr><td><b>Hydration</b></td><td>convert cached postIds to full <code>Post</code> objects at read time</td></tr>
+        <tr><td><b>FeedCursor</b></td><td>immutable {lastPostId, lastTimestamp, pageSize} — Iterator over the ranked feed</td></tr>
+      </tbody></table></div>
+    </div>
+  </section>
+
+  <footer>
+    <p>Use case 12 · News Feed — Canvas 2 of 3 (LLD). Grounded in <code>12-news-feed/docs/lld/</code>, <code>docs/patterns/</code>, and the Java under <code>src/main/java/com/systemdesign/newsfeed/</code>.</p>
+    <p class="run">This use case: <a href="hld.html">Canvas 1 · HLD</a> · LLD · <a href="deepdive.html">Canvas 3 · Deep-dive &amp; Trade-offs</a> &nbsp;|&nbsp; Next → <a href="deepdive.html">Canvas 3 · Deep-dive &amp; Trade-offs</a> &nbsp;|&nbsp; <a href="../index.html">Hub</a></p>
+  </footer>
+
+</div>
+<script src="../assets/canvas.js"></script>
+</body>
+</html>

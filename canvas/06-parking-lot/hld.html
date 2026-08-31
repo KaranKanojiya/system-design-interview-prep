@@ -1,0 +1,238 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>06 · Parking Lot — HLD</title>
+<link rel="stylesheet" href="../assets/canvas.css">
+</head>
+<body>
+<div class="wrap">
+
+  <header class="hero">
+    <h1>Parking Lot — High-Level Design</h1>
+    <div class="sub">Use case 06 · Canvas 1 of 3. The big picture: requirements, back-of-envelope numbers, and an <b>interactive architecture diagram</b> — click a component to see its role, then step through the entry (write) and availability (read) flows. This is primarily an <b>LLD</b> problem; the class design lives on canvas 2.</div>
+    <div class="badges">
+      <span class="badge lvl">Use case 06 · HLD</span>
+      <span class="badge">Canvas 1 of 3</span>
+      <span class="badge">interactive</span>
+      <span class="badge">CP · no double-booking</span>
+    </div>
+    <div class="legend">
+      <span><i class="dot" style="background:var(--eden)"></i> click a component</span>
+      <span><i class="dot" style="background:var(--survivor)"></i> write path (entry)</span>
+      <span><i class="dot" style="background:var(--eden)"></i> current step</span>
+      <span><i class="dot" style="background:var(--old)"></i> data stores</span>
+      <span><i class="dot" style="background:var(--warn)"></i> async / external</span>
+    </div>
+  </header>
+
+  <!-- A · PROBLEM & REQUIREMENTS -->
+  <section>
+    <div class="sec-h"><span class="n">A</span><h2>Problem &amp; requirements</h2><span class="tag">clarify first</span></div>
+    <div class="grid g2">
+      <div class="card">
+        <div class="kicker">functional</div>
+        <ul class="tight">
+          <li>Assign the <b>nearest free spot</b> by vehicle type (Motorcycle / Car / Bus-Truck); deny entry if that type is full.</li>
+          <li>Issue a <b>ticket</b> on entry (ticket ID, vehicle, spot, entry time); free the spot on exit.</li>
+          <li>Calculate fee by <b>duration × per-hour rate</b> (rounded up); take payment (cash / card) at exit before the barrier opens.</li>
+          <li>Show <b>real-time availability</b> per floor &amp; per type on display boards and via API.</li>
+        </ul>
+      </div>
+      <div class="card">
+        <div class="kicker">non-functional</div>
+        <ul class="tight">
+          <li><b>Thread safety</b> — two gates must never double-book the same spot (the core NFR).</li>
+          <li><b>Latency</b> — ticket issuance &lt; 100 ms so the gate opens quickly.</li>
+          <li><b>Data integrity</b> — ACID for payment; money must not be lost or double-charged.</li>
+          <li><b>Availability</b> 99.9%; availability display refresh &lt; 1 s. Consistency &gt; availability → <b>CP</b>.</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <!-- B · ESTIMATION -->
+  <section>
+    <div class="sec-h"><span class="n">B</span><h2>Back-of-envelope estimation</h2><span class="tag">single lot · 850 spots</span></div>
+    <div class="chips">
+      <div class="chip"><span class="k">Total spots</span><span class="v">850</span></div>
+      <div class="chip"><span class="k">Floors</span><span class="v">5</span></div>
+      <div class="chip"><span class="k">Vehicles / day</span><span class="v">~2,000</span></div>
+      <div class="chip"><span class="k">Peak entry</span><span class="v">~5 / min</span></div>
+      <div class="chip"><span class="k">Write QPS (entry+exit)</span><span class="v">&lt;1 / s</span></div>
+      <div class="chip"><span class="k">Avail reads</span><span class="v">~5 / s</span></div>
+      <div class="chip"><span class="k">Avg stay</span><span class="v">3 hrs</span></div>
+      <div class="chip"><span class="k">Storage / 5 yr</span><span class="v">&lt;500 MB</span></div>
+    </div>
+    <div class="callout tip"><b>Derivation:</b> 850 spots (5 floors × 170) · 2,000 vehicles/day ÷ 86,400 s ≈ 0.02 writes/s, peak 5/min ≈ 0.08/s — trivial load. Display boards poll every 1 s → a handful of read/s. Storage = ~2,000 tickets/day × 365 ≈ 730K rows/yr × ~300 B ≈ 220 MB/yr → &lt;500 MB over 5 yr, so <b>one PostgreSQL node</b> is plenty — the interest is correctness under concurrency, not scale. <span class="run">→ full math on canvas 3 &amp; F3 · Estimation</span></div>
+  </section>
+
+  <!-- C · INTERACTIVE ARCHITECTURE -->
+  <section data-flowscope>
+    <div class="sec-h"><span class="n">C</span><h2>Architecture — click components, then step the flows</h2><span class="tag">the design, from the diagram</span></div>
+    <div>
+      <div class="arch">
+        <svg viewBox="0 0 860 400" width="100%" style="max-width:860px" role="img" aria-label="Parking lot architecture">
+          <defs>
+            <marker id="ah" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" fill="var(--muted)"></path></marker>
+          </defs>
+
+          <!-- arrows (drawn first, under the boxes) -->
+          <line class="arrow" x1="116" y1="196" x2="144" y2="196" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"
+                data-flow="write read" data-write="1" data-read="1"
+                data-desc-write="Vehicle at the entry gate; the panel POSTs vehicle type + license plate to POST /api/entry." data-desc-read="A display board or the mobile app calls GET /api/availability."></line>
+          <line class="arrow" x1="244" y1="196" x2="272" y2="196" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"
+                data-flow="write read" data-write="2" data-read="2"
+                data-desc-write="Gateway validates and routes the request to the Parking Service." data-desc-read="Gateway routes the read to the Parking Service's availability endpoint."></line>
+          <line class="arrow" x1="396" y1="196" x2="468" y2="196" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"
+                data-flow="write" data-write="3"
+                data-desc-write="SELECT … FOR UPDATE takes a pessimistic row lock on the nearest free spot, then inserts the ticket &amp; marks the spot occupied — one ACID transaction, no double-booking."></line>
+          <line class="arrow" x1="390" y1="170" x2="478" y2="108" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"
+                data-flow="write read" data-write="4" data-read="3"
+                data-desc-write="Decrement the in-memory availability counter for that floor + spot type." data-desc-read="Read live counts straight from the counter / Redis — sub-second, no DB scan."></line>
+          <line class="arrow" x1="542" y1="108" x2="542" y2="168" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"
+                data-flow="read" data-read="4"
+                data-desc-read="Cold start or counter drift → reconcile against PostgreSQL, the source of truth, and refill the counter."></line>
+          <line class="arrow" x1="390" y1="222" x2="478" y2="300" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"
+                data-flow="write" data-write="5"
+                data-desc-write="Publish a 'spot occupied' event to the bus; display boards subscribe (Observer) and refresh."></line>
+          <path class="arrow" d="M262,178 C 190,120 118,120 66,166" fill="none" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"
+                data-flow="write read" data-write="6" data-read="5"
+                data-desc-write="Return 201 with the ticket + assigned spot; the barrier opens (&lt;100 ms)." data-desc-read="Return per-floor, per-type counts; the display board refreshes (&lt;1 s)."></path>
+
+          <!-- exit / payment (static, off the two stepper paths) -->
+          <path class="arrow" d="M334,168 L334,30 L748,30 L748,52" fill="none" stroke="var(--muted)" stroke-width="2" stroke-dasharray="4 3" marker-end="url(#ah)"></path>
+          <text x="360" y="24" fill="var(--faint)" font-size="9">exit → charge fee</text>
+          <line x1="616" y1="328" x2="668" y2="328" stroke="var(--muted)" stroke-width="2" stroke-dasharray="4 3" marker-end="url(#ah)"></line>
+          <text x="472" y="376" fill="var(--faint)" font-size="9">async push to boards</text>
+
+          <!-- nodes -->
+          <g data-node style="cursor:pointer" data-title="Gates &amp; Panels" data-detail="<b>Role:</b> physical edge — entry/exit gates with kiosks, an ALPR camera / manual input, the barrier, plus display boards and (in a chain) a mobile app.<br><b>Calls:</b> POST /api/entry, POST /api/exit, GET /api/availability."><rect x="16" y="168" width="100" height="56" rx="9" fill="var(--panel-2)" stroke="var(--eden)"></rect><text x="66" y="192" text-anchor="middle" fill="var(--eden)" font-size="12" font-weight="600">Gates &amp;</text><text x="66" y="208" text-anchor="middle" fill="var(--eden)" font-size="12" font-weight="600">Panels</text></g>
+          <g data-node style="cursor:pointer" data-title="API Gateway / LB" data-detail="<b>Role:</b> single entry point — request validation, routing, rate limiting.<br><b>Single lot:</b> a thin reverse proxy (Nginx) is enough; there is no scale pressure.<br><b>Chain:</b> a managed API gateway fronts a mobile app + central dashboard."><rect x="144" y="168" width="100" height="56" rx="9" fill="var(--panel-2)" stroke="var(--border)"></rect><text x="194" y="192" text-anchor="middle" fill="var(--text)" font-size="12" font-weight="600">API GW</text><text x="194" y="208" text-anchor="middle" fill="var(--faint)" font-size="10">/ LB</text></g>
+          <g data-node style="cursor:pointer" data-title="Parking Service (core)" data-detail="<b>Role:</b> the orchestrator (a Facade). Spot assignment via a <b>Strategy</b>, ticket issuance, fee calc, spot release.<br><b>Deployment:</b> a single monolith — one lot needs no service boundaries. Spring Boot container.<br><b>Critical section:</b> the assign-spot transaction (see DB)."><rect x="272" y="168" width="124" height="56" rx="9" fill="var(--panel-2)" stroke="var(--border)"></rect><text x="334" y="192" text-anchor="middle" fill="var(--text)" font-size="12" font-weight="600">Parking Service</text><text x="334" y="208" text-anchor="middle" fill="var(--faint)" font-size="10">Facade · Strategy</text></g>
+          <g data-node style="cursor:pointer" data-title="Availability counter" data-detail="<b>Pattern:</b> in-memory ConcurrentHashMap&lt;SpotType, AtomicInteger&gt; per floor (or Redis for a chain).<br><b>Why:</b> display boards poll every second — serving counts from memory keeps reads off the DB and refresh &lt;1 s.<br><b>Drift:</b> periodically reconciled against PostgreSQL, the source of truth."><rect x="468" y="52" width="148" height="56" rx="9" fill="var(--panel-2)" stroke="var(--old)"></rect><text x="542" y="76" text-anchor="middle" fill="var(--old)" font-size="12" font-weight="600">Availability counter</text><text x="542" y="92" text-anchor="middle" fill="var(--faint)" font-size="10">in-memory / Redis</text></g>
+          <g data-node style="cursor:pointer" data-title="Payment Gateway" data-detail="<b>Role:</b> external processor (Stripe / Square) charged at exit before the barrier opens.<br><b>Safety:</b> ACID ticket update + an <b>idempotency key</b> so a retry never double-charges; on timeout, retry or fall back to cash.<br><b>Off the two stepper paths</b> — it belongs to the exit flow."><rect x="668" y="52" width="160" height="56" rx="9" fill="var(--panel-2)" stroke="var(--warn)"></rect><text x="748" y="76" text-anchor="middle" fill="var(--warn)" font-size="12" font-weight="600">Payment Gateway</text><text x="748" y="92" text-anchor="middle" fill="var(--faint)" font-size="10">Stripe / Square</text></g>
+          <g data-node style="cursor:pointer" data-title="PostgreSQL" data-detail="<b>Role:</b> source of truth — vehicle, parking_spot, parking_ticket, payment.<br><b>Why RDBMS:</b> data is relational (ticket→spot→vehicle), payment needs ACID, and <code>SELECT … FOR UPDATE</code> gives row-level locking to stop double-booking.<br><b>Index:</b> partial index on free spots for fast nearest-spot lookup."><rect x="468" y="168" width="148" height="56" rx="9" fill="var(--panel-2)" stroke="var(--old)"></rect><text x="542" y="192" text-anchor="middle" fill="var(--old)" font-size="12" font-weight="600">PostgreSQL</text><text x="542" y="208" text-anchor="middle" fill="var(--faint)" font-size="10">ACID · row locks</text></g>
+          <g data-node style="cursor:pointer" data-title="Event bus" data-detail="<b>Role:</b> decouples display updates from the entry/exit hot path. Parking Service publishes 'spot occupied / freed' events.<br><b>Pattern:</b> Observer — display boards subscribe and refresh.<br><b>Tech:</b> SNS / Pub-Sub / MQTT (single lot can just push in-process)."><rect x="468" y="300" width="148" height="56" rx="9" fill="var(--panel-2)" stroke="var(--warn)"></rect><text x="542" y="324" text-anchor="middle" fill="var(--warn)" font-size="12" font-weight="600">Event bus</text><text x="542" y="340" text-anchor="middle" fill="var(--faint)" font-size="10">Observer · MQTT</text></g>
+          <g data-node style="cursor:pointer" data-title="Display boards" data-detail="<b>Role:</b> show available spots per floor and per vehicle type at the entrance and each floor.<br><b>Update:</b> poll GET /api/availability every ~1 s, or receive pushed events from the bus. 'FULL' shown when a type hits zero."><rect x="668" y="300" width="160" height="56" rx="9" fill="var(--panel-2)" stroke="var(--border)"></rect><text x="748" y="324" text-anchor="middle" fill="var(--text)" font-size="12" font-weight="600">Display boards</text><text x="748" y="340" text-anchor="middle" fill="var(--faint)" font-size="10">per floor / type</text></g>
+        </svg>
+      </div>
+      <div class="node-detail"><span class="nd-title">Click any component</span><div class="nd-body">Its role, tech choice, and concurrency note appear here. Then use the buttons below to step through a request flow.</div></div>
+
+      <div class="flowctl" data-flowctl>
+        <button class="btn" data-flow="write">Write path (entry)</button>
+        <button class="btn" data-flow="read">Read path (availability)</button>
+        <span style="flex:1"></span>
+        <button class="btn" data-flowstep="prev">◀ Prev</button>
+        <button class="btn" data-flowstep="next">Next ▶</button>
+      </div>
+      <div class="flowlabel" data-flowlabel>Pick <b>Write</b> (a vehicle parking) or <b>Read</b> (a display board refreshing), then press “Next ▶” to walk the numbered flow one hop at a time. The dashed <i>exit → charge fee</i> arrow is the separate payment flow.</div>
+
+      <div class="cloudmap">
+        <div class="kicker" style="margin-top:4px">Managed-service mapping — the same components on each cloud (a chain deployment; a single lot can run on a Raspberry Pi + local Postgres)</div>
+        <table class="cloudtable">
+          <thead><tr>
+            <th>Component</th>
+            <th><span class="hdrlogo"><span class="logochip"><img src="../assets/logos/aws.svg" alt="AWS"></span>AWS</span></th>
+            <th><span class="hdrlogo"><span class="logochip"><img src="../assets/logos/gcp.svg" alt="GCP"></span>GCP</span></th>
+            <th><span class="hdrlogo"><span class="logochip"><img src="../assets/logos/azure.svg" alt="Azure"></span>Azure</span></th>
+          </tr></thead>
+          <tbody>
+            <tr><td>API Gateway</td><td><img class="svcicon" src="../assets/logos/services/aws-apigw.svg" alt="">API Gateway</td><td><img class="svcicon" src="../assets/logos/services/gcp-apigw.svg" alt="">Cloud Endpoints</td><td><img class="svcicon" src="../assets/logos/services/azure-apim.svg" alt="">API Management</td></tr>
+            <tr><td>Parking Service (compute)</td><td><img class="svcicon" src="../assets/logos/services/aws-ecs.svg" alt="">ECS Fargate / Lambda</td><td><img class="svcicon" src="../assets/logos/services/gcp-run.svg" alt="">Cloud Run</td><td><img class="svcicon" src="../assets/logos/services/azure-aks.svg" alt="">Container Apps / AKS</td></tr>
+            <tr><td>Database</td><td><img class="svcicon" src="../assets/logos/services/aws-rds.svg" alt="">RDS (PostgreSQL)</td><td><img class="svcicon" src="../assets/logos/services/gcp-cloudsql.svg" alt="">Cloud SQL</td><td><img class="svcicon" src="../assets/logos/services/azure-sql.svg" alt="">Azure DB for PostgreSQL</td></tr>
+            <tr><td>Availability counter</td><td><img class="svcicon" src="../assets/logos/services/aws-elasticache.svg" alt="">ElastiCache</td><td><img class="svcicon" src="../assets/logos/services/gcp-memorystore.svg" alt="">Memorystore</td><td><img class="svcicon" src="../assets/logos/services/azure-redis.svg" alt="">Cache for Redis</td></tr>
+            <tr><td>Event bus (display push)</td><td><img class="svcicon" src="../assets/logos/services/aws-sns.svg" alt="">SNS / IoT Core</td><td><img class="svcicon" src="../assets/logos/services/gcp-pubsub.svg" alt="">Pub/Sub</td><td><img class="svcicon" src="../assets/logos/services/azure-servicebus.svg" alt="">Service Bus</td></tr>
+            <tr><td>Payment gateway</td><td>Stripe / Square (3rd-party)</td><td>Stripe / Square (3rd-party)</td><td>Stripe / Square (3rd-party)</td></tr>
+            <tr><td>Central dashboard (chain)</td><td><img class="svcicon" src="../assets/logos/services/aws-cloudfront.svg" alt="">S3 + CloudFront</td><td><img class="svcicon" src="../assets/logos/services/gcp-cloudcdn.svg" alt="">Cloud Storage + CDN</td><td><img class="svcicon" src="../assets/logos/services/azure-cdn.svg" alt="">Blob + CDN</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+
+  <!-- D · API -->
+  <section>
+    <div class="sec-h"><span class="n">D</span><h2>API design</h2><span class="tag">thin &amp; RESTful</span></div>
+    <table>
+      <thead><tr><th>Endpoint</th><th>Purpose</th><th>Response</th></tr></thead>
+      <tbody>
+        <tr><td><code>POST /api/entry</code></td><td>enter — assign nearest spot &amp; issue ticket (body: vehicleType, licensePlate)</td><td>201 + ticket &amp; assigned spot / <b>409</b> NO_SPOT_AVAILABLE</td></tr>
+        <tr><td><code>POST /api/exit</code></td><td>exit — calc fee, take payment, release spot (body: ticketId, paymentMethod)</td><td>200 + receipt (duration, amount, PAID)</td></tr>
+        <tr><td><code>GET /api/availability</code></td><td>real-time counts (the read hot path)</td><td>200 + per-floor / per-type totals &amp; available</td></tr>
+        <tr><td><code>GET /api/ticket/{id}</code></td><td>look up a ticket (also handles lost tickets by plate)</td><td>200 + ticket details / 404</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <!-- E · DATA MODEL -->
+  <section>
+    <div class="sec-h"><span class="n">E</span><h2>Data model</h2><span class="tag">relational · ACID</span></div>
+    <div class="grid g2">
+      <div class="card">
+        <div class="kicker">parking_spot (hot lookup)</div>
+        <pre class="code">spot_id     VARCHAR(20) <span class="cm">// PK e.g. S-2-045</span>
+floor       INT         <span class="cm">// 1–5</span>
+spot_number INT
+spot_type   ENUM        <span class="cm">// MOTORCYCLE/CAR/LARGE</span>
+is_occupied BOOLEAN     <span class="cm">// default false</span>
+vehicle_id  VARCHAR(20) <span class="cm">// FK, nullable</span></pre>
+        <p class="muted">Partial index on <code>(spot_type, floor, spot_number) WHERE is_occupied=false</code> makes nearest-spot lookup instant. The row lock lives here.</p>
+      </div>
+      <div class="card">
+        <div class="kicker">parking_ticket + payment</div>
+        <pre class="code">ticket_id  VARCHAR(30) <span class="cm">// PK, date-based</span>
+vehicle_id VARCHAR(20) <span class="cm">// FK</span>
+spot_id    VARCHAR(20) <span class="cm">// FK</span>
+entry_time TIMESTAMP
+exit_time  TIMESTAMP   <span class="cm">// null until exit</span>
+amount     DECIMAL(8,2)
+is_paid    BOOLEAN
+<span class="cm">// payment: id, ticket_id (UNIQUE),</span>
+<span class="cm">//   amount, method, status, timestamp</span></pre>
+        <p class="muted">One <code>payment</code> per ticket (UNIQUE FK). Entry + exit each run inside a single ACID transaction. Ticket IDs are date-based → human-readable &amp; time-sortable.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- F · KEY CHOICES -->
+  <section>
+    <div class="sec-h"><span class="n">F</span><h2>Key design choices (deep-dived on canvas 3)</h2><span class="tag">defend these</span></div>
+    <div class="grid g3">
+      <div class="card"><div class="kicker">concurrency</div><h3>Pessimistic lock</h3><p class="muted"><code>SELECT … FOR UPDATE</code> serialises the assign-spot transaction — simplest correct fix for double-booking at low contention. Optimistic/CAS if throughput ever demands it. <span class="run">→ canvas 3</span></p></div>
+      <div class="card"><div class="kicker">storage</div><h3>PostgreSQL (RDBMS)</h3><p class="muted">Relational entities, ACID for payments, foreign keys, row locking. NoSQL adds nothing at 850 spots — CP over AP.</p></div>
+      <div class="card"><div class="kicker">extensibility</div><h3>Strategy ×3</h3><p class="muted">Spot assignment, pricing, and payment each vary on an independent axis — swap without touching the others. The OOP heart of this problem. <span class="run">→ canvas 2 · LLD</span></p></div>
+    </div>
+  </section>
+
+  <!-- GLOSSARY -->
+  <section>
+    <div class="sec-h"><span class="n">§</span><h2>Glossary — one-liners</h2><span class="tag">terms used above</span></div>
+    <div class="grid g2">
+      <div class="card"><table><tbody>
+        <tr><td><b>Double-booking</b></td><td>two gates assign the same spot to two vehicles — the race this system must prevent</td></tr>
+        <tr><td><b>SELECT … FOR UPDATE</b></td><td>takes an exclusive row lock so a second transaction blocks until the first commits</td></tr>
+        <tr><td><b>Pessimistic locking</b></td><td>lock the row before acting; assumes conflicts happen</td></tr>
+        <tr><td><b>ACID</b></td><td>Atomic-Consistent-Isolated-Durable transactions — required for payment</td></tr>
+        <tr><td><b>Strategy pattern</b></td><td>swap an algorithm (spot choice, pricing) behind an interface at runtime</td></tr>
+      </tbody></table></div>
+      <div class="card"><table><tbody>
+        <tr><td><b>CP (CAP)</b></td><td>favour Consistency + Partition-tolerance — a stale/duplicate spot is unacceptable</td></tr>
+        <tr><td><b>Facade</b></td><td>Parking Service hides orchestration behind one park / unpark call</td></tr>
+        <tr><td><b>Observer</b></td><td>display boards subscribe to spot-change events and refresh</td></tr>
+        <tr><td><b>ALPR</b></td><td>Automatic License-Plate Recognition — the entry camera</td></tr>
+        <tr><td><b>Idempotency key</b></td><td>tags a payment so a retry never charges twice</td></tr>
+      </tbody></table></div>
+    </div>
+  </section>
+
+  <footer>
+    <p>Use case 06 · Parking Lot — Canvas 1 of 3 (HLD). Grounded in <code>06-parking-lot/docs/hld/</code>.</p>
+    <p class="run">This use case: HLD · <a href="lld.html">Canvas 2 · LLD</a> · <a href="deepdive.html">Canvas 3 · Deep-dive &amp; Trade-offs</a> &nbsp;|&nbsp; Next → <a href="lld.html">02 · LLD</a> &nbsp;|&nbsp; <a href="../index.html">Hub</a></p>
+  </footer>
+
+</div>
+<script src="../assets/canvas.js"></script>
+</body>
+</html>

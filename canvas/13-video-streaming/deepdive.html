@@ -1,0 +1,364 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>13 · Video Streaming — Deep-dive &amp; Trade-offs</title>
+<link rel="stylesheet" href="../assets/canvas.css">
+</head>
+<body>
+<div class="wrap">
+
+  <header class="hero">
+    <h1>Video Streaming — Deep-dive &amp; Trade-offs</h1>
+    <div class="sub">Use case 13 · Canvas 3 of 3. The hard parts: how to <b>scale</b> each tier (CDN is THE cache), the <b>caching</b> details that decide 5 ms edge vs 100 ms origin, the <b>bottlenecks</b> that break the design (and their fixes), why streaming is <b>AP</b> while upload/transcode/billing are <b>CP</b>, and a phase-by-phase <b>interview walkthrough</b>. <b>Switch the partition tabs</b> and <b>open the bottleneck cards</b> to explore.</div>
+    <div class="badges">
+      <span class="badge lvl">Use case 13 · Deep-dive</span>
+      <span class="badge">Canvas 3 of 3</span>
+      <span class="badge">interactive</span>
+      <span class="badge">AP stream · CP upload/state/billing</span>
+    </div>
+    <div class="legend">
+      <span><i class="dot" style="background:var(--eden)"></i> switch a tab</span>
+      <span><i class="dot" style="background:var(--old)"></i> open a bottleneck</span>
+      <span><i class="dot" style="background:var(--survivor)"></i> chosen option</span>
+      <span><i class="dot" style="background:var(--warn)"></i> failure / risk</span>
+      <span><i class="dot" style="background:var(--gc)"></i> fix / mitigation</span>
+    </div>
+  </header>
+
+  <!-- A · SCALING STRATEGY -->
+  <section>
+    <div class="sec-h"><span class="n">A</span><h2>Scaling strategy</h2><span class="tag">what to shard &amp; how</span></div>
+    <div class="grid g3">
+      <div class="card"><div class="kicker">delivery tier</div><h3>CDN does the heavy lifting</h3><p class="muted">95% of <b>bytes</b> are video segments served from edge PoPs. Scaling playback = scaling the CDN (edge → regional shield → S3), not app servers. The origin only sees ~1% of segment requests.</p></div>
+      <div class="card"><div class="kicker">app tier</div><h3>Stateless → horizontal</h3><p class="muted">Streaming / upload / metadata services are stateless behind the LB — any instance serves any request. Auto-scale independently; transcoding workers scale on queue depth, not request rate.</p></div>
+      <div class="card"><div class="kicker">metadata DB</div><h3>Shard + read replicas</h3><p class="muted">PostgreSQL/Vitess sharded by <code>video_id</code>; read replicas absorb metadata reads (title, duration, manifest URL). Analytics runs off Redshift/BigQuery so aggregations never touch the playback path.</p></div>
+    </div>
+
+    <div data-tabscope style="margin-top:16px">
+      <div class="kicker">metadata sharding — pick a partition strategy</div>
+      <div class="tabs">
+        <button class="tab active" data-tab="hash">Hash on video_id</button>
+        <button class="tab" data-tab="range">Range by upload time</button>
+        <button class="tab" data-tab="user">By uploader / channel</button>
+      </div>
+
+      <div class="tabpanel active" data-panel="hash">
+        <div class="grid g2">
+          <div class="card">
+            <h3>Hash-based partitioning <span class="run">← chosen for metadata</span></h3>
+            <p class="muted">Route each row by <code>hash(video_id) % N</code>. Reads and writes are point lookups by <code>video_id</code> (from the manifest URL), so a random hash spreads load evenly — no hot shard even when one video goes viral, because viral reads hit the <b>CDN</b>, not the DB.</p>
+            <pre class="code">shard = <span class="ty">hash</span>(video_id) % N   <span class="cm">// even spread, point lookups</span></pre>
+          </div>
+          <div class="card">
+            <div class="kicker">verdict</div>
+            <ul class="tight">
+              <li><b>Even load</b> — natural fit for key-value metadata lookup by <code>video_id</code>.</li>
+              <li>Viral videos don't create a hot shard: playback is a CDN read, DB sees only the first cache-miss.</li>
+              <li><span style="color:var(--warn)">Resharding pain:</span> changing <code>N</code> remaps most keys → Vitess resharding / consistent hashing avoids it.</li>
+            </ul>
+          </div>
+        </div>
+      </div>
+
+      <div class="tabpanel" data-panel="range">
+        <div class="grid g2">
+          <div class="card">
+            <h3>Range by upload time</h3>
+            <p class="muted">Assign contiguous <code>uploaded_at</code> ranges to shards (this month → shard N, last month → shard N-1). Great for "recent uploads" scans and time-window analytics.</p>
+            <pre class="code">2026-07 → shard 12
+2026-08 → shard 13   <span class="cm">// newest shard is always hottest</span></pre>
+          </div>
+          <div class="card">
+            <div class="kicker">verdict — avoid for metadata</div>
+            <ul class="tight">
+              <li><span style="color:var(--warn)">Hot partition:</span> the newest shard takes 100% of fresh uploads and their early (highest) view traffic.</li>
+              <li>Useful only for the <b>watch-history / analytics</b> time-series store (Cassandra), not video metadata.</li>
+              <li>The interview red flag: "range-on-time causes a hot tail shard."</li>
+            </ul>
+          </div>
+        </div>
+      </div>
+
+      <div class="tabpanel" data-panel="user">
+        <div class="grid g2">
+          <div class="card">
+            <h3>Shard by uploader / channel</h3>
+            <p class="muted">Co-locate all of a channel's videos on one shard. Cheap "list my channel's videos" and per-creator analytics without scatter-gather.</p>
+            <pre class="code">shard = <span class="ty">hash</span>(channel_id) % N   <span class="cm">// creator locality</span></pre>
+          </div>
+          <div class="card">
+            <div class="kicker">verdict — niche</div>
+            <ul class="tight">
+              <li><span style="color:var(--warn)">Celebrity skew:</span> a channel with millions of videos + views overloads its shard.</li>
+              <li>Good for <b>Creator Studio</b> queries; pair it with hash-on-video_id for the playback path.</li>
+              <li>Watch-history is separately sharded by <code>user_id</code> in Cassandra (time-series writes).</li>
+            </ul>
+          </div>
+        </div>
+      </div>
+
+      <div class="callout tip"><b>Replicas &amp; read-your-writes:</b> metadata reads fan out to replicas, but right after an upload the creator is pinned to the <b>primary</b> (or a sync replica) so they always see their just-uploaded video — replication lag would otherwise show "video not found". View counts live in Redis (<code>INCR</code>), not the DB, so they never hit the sharding hot path.</div>
+    </div>
+  </section>
+
+  <!-- B · CACHING DEEP-DIVE -->
+  <section>
+    <div class="sec-h"><span class="n">B</span><h2>Caching deep-dive</h2><span class="tag">CDN is THE cache</span></div>
+    <div class="grid g2">
+      <div class="card">
+        <div class="kicker">multi-tier CDN — the segment read path</div>
+        <pre class="code"><span class="kw">GET</span> /{videoId}/{res}_{codec}/segment_{N}.ts
+  ├─ EDGE PoP  → HIT  → serve      <span class="cm">// &lt;5ms · ~95%</span>
+  │             MISS ↓
+  ├─ REGIONAL SHIELD → HIT → serve <span class="cm">// &lt;30ms · +4%</span>
+  │             MISS ↓
+  └─ ORIGIN (S3) → serve + backfill<span class="cm">// &lt;100ms · ~1%</span></pre>
+        <p class="muted"><b>Zipf:</b> 10% of videos = 90% of views, so a modest edge cache serves nearly all traffic. Segments are <b>immutable</b> → 1-year TTL, never invalidated. The origin shield collapses N edge misses into <b>one</b> origin pull (thundering-herd protection).</p>
+      </div>
+      <div class="card">
+        <div class="kicker">TTL policy by content type</div>
+        <pre class="code">video segments (VOD) → 1 year   <span class="cm">// immutable</span>
+HLS/DASH manifest VOD→ 5 min    <span class="cm">// rare re-package</span>
+HLS manifest (live)  → 2 sec    <span class="cm">// &lt; segment duration</span>
+thumbnails           → 24 h     <span class="cm">// versioned ?v=2 busts</span>
+player JS/CSS        → 1 year   <span class="cm">// versioned filenames</span>
+API metadata         → no CDN   <span class="cm">// served from Redis</span></pre>
+        <p class="muted"><b>Live gotcha:</b> manifest TTL <b>must be shorter than segment duration</b>. 2 s TTL for 4 s segments — a longer TTL makes the player stall on a segment that "doesn't exist yet" at the edge.</p>
+      </div>
+    </div>
+
+    <div class="grid g3" style="margin-top:14px">
+      <div class="card">
+        <div class="kicker">metadata cache — Redis, cache-aside</div>
+        <h3>meta:{videoId} · 5-min TTL</h3>
+        <p class="muted">Video page load does one <code>HGETALL</code> round-trip. Miss → read PostgreSQL → <code>HSET</code> + <code>EXPIRE 300</code>. On edit → <code>DEL meta:{videoId}</code> and let the next read repopulate. View count is <b>not</b> in this hash — it has its own counter.</p>
+        <pre class="code">HGETALL meta:vid-42        <span class="cm">// &lt;1ms hit</span>
+  miss → SELECT ... FROM videos
+       → HSET meta:vid-42 ...
+       → EXPIRE meta:vid-42 <span class="st">300</span></pre>
+      </div>
+      <div class="card">
+        <div class="kicker">view counts — write-behind</div>
+        <h3>Redis INCR + 30 s flush</h3>
+        <p class="muted">A viral video does 50K+ views/s. Every view is an O(1) <code>INCR</code> plus a dirty-set mark; a background job flushes deltas to the DB every 30 s with atomic <code>GETSET</code>. Turns 50K writes/s into <b>one</b> UPDATE per video. Staleness ≤ 30 s — invisible at "1.2M views".</p>
+        <pre class="code">INCR viewcount:vid-42
+SADD viewcount:flush:pending vid-42
+<span class="cm">// every 30s:</span>
+delta = GETSET viewcount:vid-42 <span class="st">0</span>
+UPDATE videos SET view_count += delta</pre>
+      </div>
+      <div class="card">
+        <div class="kicker">cache warming — beat the herd</div>
+        <h3>Pre-push viral segments</h3>
+        <p class="muted">On a big-creator upload, push the first ~10 segments of each rendition to the top ~50 PoPs before the first viewer arrives. Predictive warming fires when view-velocity &gt; 100/min and accelerating. Recommendations are pre-warmed per DAU before peak hours.</p>
+        <pre class="code"><span class="cm">// trending detected → warm edges</span>
+push seg_000..009 → top 50 PoPs
+warm recs:{userId} before 7AM peak</pre>
+      </div>
+    </div>
+    <div class="callout tip"><b>Cold storage tiering:</b> S3 Standard → Standard-IA (30 d idle) → Glacier IR (90 d, &lt;100 ms) → Glacier Deep (365 d). ~72% storage savings; Glacier IR serves fast enough that users never notice, and first-access re-tiers the object back to Standard. <span class="run">→ full cache layering on canvas 1 · HLD</span></div>
+  </section>
+
+  <!-- C · BOTTLENECKS & SOLUTIONS -->
+  <section>
+    <div class="sec-h"><span class="n">C</span><h2>Bottlenecks &amp; solutions</h2><span class="tag">click a card to open</span></div>
+    <div class="grid" style="gap:10px">
+
+      <div class="card collapsible open">
+        <div class="c-head"><h3>Thundering herd on origin (viral cold start)</h3></div>
+        <div class="c-body">
+          <p><b style="color:var(--warn)">Impact:</b> a video shared to millions at once — every one of 400+ edge PoPs cache-misses simultaneously and hits S3 with 400× the load, saturating the origin and causing rebuffering on the first segment.</p>
+          <p><b style="color:var(--gc)">Fix:</b> a <b>regional origin shield</b> collapses all edge misses in a region into one origin pull; the first viewers absorb a 100 ms miss, then every edge is served from the shield. Combine with <b>cache warming</b> (pre-push first 10 segments to top 50 PoPs) so the herd never reaches S3.</p>
+        </div>
+      </div>
+
+      <div class="card collapsible">
+        <div class="c-head"><h3>Transcoding is the write-path bottleneck</h3></div>
+        <div class="c-body">
+          <p><b style="color:var(--warn)">Impact:</b> one uploaded video becomes 20 renditions (5 resolutions × 4 codecs); a 15-min sequential transcode makes users wait far too long and pins compute. YouTube ingests 500 hours/minute — sequential is a non-starter.</p>
+          <p><b style="color:var(--gc)">Fix:</b> a <b>parallel DAG</b> (Step Functions Map / Kafka-fed FFmpeg workers) — wall-clock = the slowest single job (~15 min), not the sum (~120 min). <b>Priority transcoding</b> produces 720p/1080p H.264 first (3–5 min → playable), the rest complete in the background. 90% of videos get fewer views than the AV1/4K break-even, so those renditions are lazily triggered by a view threshold.</p>
+        </div>
+      </div>
+
+      <div class="card collapsible">
+        <div class="c-head"><h3>Duplicate transcoding jobs (race)</h3></div>
+        <div class="c-body">
+          <p><b style="color:var(--warn)">Impact:</b> two workers both read state <code>UPLOADED</code> and both start transcoding the same video — double compute cost and conflicting writes to the manifest.</p>
+          <p><b style="color:var(--gc)">Fix:</b> <b>optimistic locking</b> on the state machine — <code>UPDATE videos SET status='TRANSCODING', version=version+1 WHERE video_id=? AND status='UPLOADED' AND version=?</code>; only one worker gets <code>rows=1</code>, the loser gets 0 and backs off (guarded by <code>Video.startTranscoding</code>). A Redis <code>SET lock:transcode:{videoId} NX EX 600</code> dedupes concurrent starts, and deterministic S3 output paths make duplicate work idempotent.</p>
+        </div>
+      </div>
+
+      <div class="card collapsible">
+        <div class="c-head"><h3>View-count write storm</h3></div>
+        <div class="c-body">
+          <p><b style="color:var(--warn)">Impact:</b> incrementing a DB row on every view (<code>SELECT ... FOR UPDATE</code>) means 50K row-locks/second on a single "Despacito" row — the DB becomes the bottleneck and latency cascades.</p>
+          <p><b style="color:var(--gc)">Fix:</b> <b>write-behind</b> — Redis <code>INCR</code> on the hot path (O(1)), atomic <code>GETSET</code> flush to the DB every 30 s. 50K writes/s collapse into one batched UPDATE; staleness ≤ 30 s is invisible.</p>
+        </div>
+      </div>
+
+      <div class="card collapsible">
+        <div class="c-head"><h3>Live-stream manifest staleness</h3></div>
+        <div class="c-body">
+          <p><b style="color:var(--warn)">Impact:</b> if the live media-playlist TTL exceeds the segment duration, the edge serves a manifest missing the newest segment — the player stalls waiting for a segment that "doesn't exist yet," and rebuffers.</p>
+          <p><b style="color:var(--gc)">Fix:</b> set manifest TTL to ~half the segment duration (2 s TTL for 4 s segments) so the newest segment is always listed, backed by an origin shield to avoid hammering origin with per-PoP refreshes. Glass-to-glass latency ≈ segment_duration + manifest_TTL.</p>
+        </div>
+      </div>
+
+      <div class="card collapsible">
+        <div class="c-head"><h3>Uploader sees "video not found" (replica lag)</h3></div>
+        <div class="c-body">
+          <p><b style="color:var(--warn)">Impact:</b> creator uploads, metadata lands on the primary, they refresh and hit a read replica that hasn't replicated yet → their own video appears missing.</p>
+          <p><b style="color:var(--gc)">Fix:</b> <b>read-your-writes</b> — tag the session with an upload timestamp; while it's within the replication-lag window, route that user's reads to the primary; after the window, fall back to replicas. Other viewers stay on eventual consistency (fine).</p>
+        </div>
+      </div>
+
+      <div class="card collapsible">
+        <div class="c-head"><h3>CDN bandwidth cost explosion</h3></div>
+        <div class="c-body">
+          <p><b style="color:var(--warn)">Impact:</b> egress is the #1 cost — 1M viewers × 30-min sessions ≈ 900 TB/day. At commercial CDN rates that's hundreds of thousands per month, billions/year at Netflix scale.</p>
+          <p><b style="color:var(--gc)">Fix:</b> better codecs cut per-view bytes (AV1 ≈ 60% smaller than H.264 for popular videos), aggressive edge caching keeps bytes off origin, and above ~100M DAU a <b>custom ISP-embedded CDN</b> (Netflix Open Connect) eliminates vendor markup.</p>
+        </div>
+      </div>
+
+      <div class="card collapsible">
+        <div class="c-head"><h3>Origin / region failure mid-playback</h3></div>
+        <div class="c-body">
+          <p><b style="color:var(--warn)">Impact:</b> S3 origin or a whole region drops offline while millions are watching.</p>
+          <p><b style="color:var(--gc)">Fix:</b> AP delivery — a <b>circuit breaker</b> at the shield serves stale-but-cached segments (immutable, so "stale" = correct) during an origin outage; S3 is 11-nines durable and cross-region replicated. Because segments never change, the CDN can keep serving indefinitely without the control plane.</p>
+        </div>
+      </div>
+
+    </div>
+  </section>
+
+  <!-- D · CAP & CONSISTENCY -->
+  <section>
+    <div class="sec-h"><span class="n">D</span><h2>CAP &amp; consistency — AP stream, CP where it counts</h2><span class="tag">pick two; P is not optional</span></div>
+    <div class="grid g2">
+      <div class="card">
+        <div class="kicker">the choice</div>
+        <p class="muted"><b>P is mandatory</b> in any distributed deployment, so the real decision is A vs C during a partition. <b>Playback must always work</b> — a buffering spinner or "video unavailable" is worse than a view count that's 30 s stale, and every failed play is lost watch-time and ad revenue. So streaming + metadata are <b>AP</b>. But a handful of operations cannot tolerate a stale read and go <b>CP</b>.</p>
+        <ul class="tight">
+          <li><b>AP:</b> segments, metadata, view/like counts, search, recommendations, watch history.</li>
+          <li><b>CP:</b> upload-chunk tracking, transcoding state machine, subscription/billing.</li>
+          <li><b>PACELC → PA/EL</b> for playback: partition → Availability; else → Latency. Netflix loses engagement per 100 ms.</li>
+        </ul>
+      </div>
+      <div class="card">
+        <div class="kicker">CP corner — exactly-once via idempotency</div>
+        <pre class="code"><span class="cm">// upload chunks: no lost/duplicate chunk</span>
+INSERT INTO upload_chunks(video_id,chunk_no,status)
+resume: SELECT MAX(chunk_no) ... status='RECEIVED'
+
+<span class="cm">// state machine: optimistic lock (one winner)</span>
+UPDATE videos SET status=?, version=version+<span class="st">1</span>
+  WHERE video_id=? AND status=? AND version=?
+
+<span class="cm">// transcode: at-least-once + idempotent output</span>
+SET lock:transcode:{vid} NX EX <span class="st">600</span>   <span class="cm">// dedupe</span></pre>
+        <p class="muted">Exactly-once is impossible in a distributed system (FLP), so transcoding is <b>at-least-once with idempotent output</b>: deterministic S3 paths mean a duplicate job overwrites with identical bytes — last-writer-wins, no corruption. A Redis lock keeps it at-most-one active worker → effectively exactly-once.</p>
+      </div>
+    </div>
+    <div class="callout tip"><b>Saga for upload→ready:</b> create record → upload chunks → assemble → transcode → READY, each step with a compensating action (delete record, delete S3 objects, revert status). If any step fails, compensations run in reverse and the video lands in a retryable <code>FAILED</code> state — never a half-published video.</div>
+    <table style="margin-top:12px">
+      <thead><tr><th>Operation</th><th>CAP choice</th><th>Reasoning</th></tr></thead>
+      <tbody>
+        <tr><td>Segment delivery / playback</td><td>AP</td><td>Serve from CDN cache even if origin is down; stale = correct (immutable)</td></tr>
+        <tr><td>Video metadata (title, desc)</td><td>AP</td><td>5-min Redis TTL; a 2 s-stale title is fine</td></tr>
+        <tr><td>View / like counts</td><td>AP</td><td>Redis INCR + 30 s flush; "1.2M views" approximate is fine</td></tr>
+        <tr><td>Upload chunk tracking</td><td><b>CP</b></td><td>Lost chunk = corrupted video → sync-replicated PostgreSQL</td></tr>
+        <tr><td>Transcoding state machine</td><td><b>CP</b></td><td>Duplicate/lost transition → optimistic locking on <code>version</code></td></tr>
+        <tr><td>Subscription / billing</td><td><b>CP</b></td><td>Paying user must have immediate access; no double-charge</td></tr>
+        <tr><td>Transcoding jobs</td><td>at-least-once</td><td>Redis lock + idempotent S3 output → effectively exactly-once</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <!-- E · TRADE-OFFS SUMMARY -->
+  <section>
+    <div class="sec-h"><span class="n">E</span><h2>Trade-offs summary</h2><span class="tag">decision · chosen · alternative · why</span></div>
+    <table>
+      <thead><tr><th>Decision</th><th>Chosen</th><th>Alternative</th><th>Why this choice</th></tr></thead>
+      <tbody>
+        <tr><td>Consistency model</td><td><b style="color:var(--survivor)">AP stream · CP upload/state/billing</b></td><td>uniform CP</td><td>Playback must never fail; upload/state can't be stale</td></tr>
+        <tr><td>Primary cache</td><td><b style="color:var(--survivor)">CDN edge (multi-tier)</b></td><td>Redis-only</td><td>95% of bytes are segments — Redis caches microseconds, CDN caches terabytes</td></tr>
+        <tr><td>Metadata store</td><td><b style="color:var(--survivor)">PostgreSQL / Vitess</b></td><td>pure NoSQL</td><td>ACID for upload/transcode state; shardable via Vitess</td></tr>
+        <tr><td>Watch history</td><td><b style="color:var(--survivor)">Cassandra</b></td><td>PostgreSQL</td><td>Time-series writes, eventual consistency OK</td></tr>
+        <tr><td>View counts</td><td><b style="color:var(--survivor)">Redis INCR + 30 s flush</b></td><td>DB row per view</td><td>50K/s → 1 UPDATE; avoids single-row lock storm</td></tr>
+        <tr><td>Transcoding</td><td><b style="color:var(--survivor)">Parallel DAG + priority</b></td><td>sequential, eager-all</td><td>Playable in 3–5 min; wall-clock = slowest job, not sum</td></tr>
+        <tr><td>Codec strategy</td><td><b style="color:var(--survivor)">H.264 now, AV1/VP9 lazily</b></td><td>single codec / all upfront</td><td>60% bandwidth savings only where views justify encode cost</td></tr>
+        <tr><td>Streaming protocol</td><td><b style="color:var(--survivor)">HLS + DASH from CMAF</b></td><td>one protocol</td><td>iOS mandates HLS; same fMP4 segments, two thin manifests</td></tr>
+        <tr><td>ABR algorithm</td><td><b style="color:var(--survivor)">Hybrid (buffer overrides throughput)</b></td><td>throughput-only</td><td>Buffer floor prevents all rebuffers; ~0.5% rebuffer rate</td></tr>
+        <tr><td>Storage</td><td><b style="color:var(--survivor)">S3 tiered → Glacier</b></td><td>all Standard</td><td>~72% storage savings; Glacier IR &lt;100 ms on access</td></tr>
+        <tr><td>CDN at scale</td><td><b style="color:var(--survivor)">Managed now, Open Connect &gt;100M DAU</b></td><td>always managed</td><td>Bandwidth is #1 cost; custom CDN only pays off at huge scale</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <!-- F · INTERVIEW WALKTHROUGH -->
+  <section>
+    <div class="sec-h"><span class="n">F</span><h2>Interview walkthrough — timing strip</h2><span class="tag">~35 min answer</span></div>
+    <div class="flow">
+      <div class="step eden"><div class="box">Clarify</div><small>P1 · 2–3 min<br>scale · VOD vs live · codecs · DRM</small></div>
+      <div class="step surv"><div class="box">Architecture</div><small>P2 · 5–7 min<br>2 pipelines: upload &amp; stream</small></div>
+      <div class="step old"><div class="box">Transcoding</div><small>P3 · 8–10 min · STAR<br>ladder · codecs · parallel DAG</small></div>
+      <div class="step old"><div class="box">ABR &amp; CDN</div><small>P4 · 5–7 min<br>HLS/DASH · hybrid ABR · Zipf</small></div>
+      <div class="step surv"><div class="box">Scale &amp; edges</div><small>P5 · 5–8 min<br>viral · live · tiering</small></div>
+      <div class="step dead"><div class="box">Trade-offs</div><small>P6 · 3–5 min<br>CDN · eager/lazy · CAP</small></div>
+    </div>
+    <div class="grid g2" style="margin-top:14px">
+      <div class="card">
+        <div class="kicker">phase-by-phase</div>
+        <ul class="tight">
+          <li><b>P1 Clarify (2–3):</b> scale (1M vs 500M DAU → managed vs custom CDN), VOD vs live (different pipelines), max length/size, DRM, device coverage (codecs), recommendations in scope?</li>
+          <li><b>P2 Architecture (5–7):</b> two pipelines — upload (presigned S3 chunks bypass the API) and stream (multi-tier CDN). Name AP-stream / CP-upload up front.</li>
+          <li><b>P3 Transcoding (8–10 · STAR):</b> resolution ladder (240p@300K → 4K@15M, never upscale), multi-codec trade-off (AV1 60% smaller, 10× encode), <b>parallel DAG</b> (wall-clock = slowest job), priority transcoding for 3–5 min playable.</li>
+        </ul>
+      </div>
+      <div class="card">
+        <div class="kicker">…and finish strong</div>
+        <ul class="tight">
+          <li><b>P4 ABR &amp; CDN (5–7):</b> HLS/DASH manifest → segments; three ABR algorithms, recommend <b>hybrid</b> (buffer floor overrides throughput); multi-tier CDN edge→shield→S3; Zipf 10%→90%; origin shield kills the thundering herd.</li>
+          <li><b>P5 Scale/edges (5–8):</b> viral 0→10M/hr timeline, live vs VOD, storage tiering S3→Glacier, content dedup.</li>
+          <li><b>P6 Trade-offs (3–5):</b> managed vs Open Connect CDN, eager vs lazy transcoding, HLS vs DASH, AP vs CP map.</li>
+          <li><b>30-sec pitch:</b> chunked presigned upload · parallel transcode DAG · hybrid ABR · multi-tier CDN · Zipf caching · Open Connect · tiered storage · AP stream / CP upload.</li>
+        </ul>
+      </div>
+    </div>
+    <div class="callout tip"><b>Green flags:</b> lead with two pipelines · presigned-URL chunked upload · concrete resolution ladder · multi-codec trade-off · three ABR algorithms · edge→shield→S3 with Zipf · Open Connect mention · storage tiering · AP-stream/CP-upload. <b>Red flags:</b> upload full file through the API · sequential transcoding · single codec · no CDN · "always serve 1080p" · ignoring storage cost · polling for upload status.</div>
+  </section>
+
+  <!-- GLOSSARY -->
+  <section>
+    <div class="sec-h"><span class="n">§</span><h2>Glossary — one-liners</h2><span class="tag">terms used above</span></div>
+    <div class="grid g2">
+      <div class="card"><table><tbody>
+        <tr><td><b>AP (CAP)</b></td><td>favour Availability + Partition-tolerance over strong Consistency — used for playback</td></tr>
+        <tr><td><b>CP (CAP)</b></td><td>strong Consistency + Partition-tolerance — upload chunks, state machine, billing</td></tr>
+        <tr><td><b>PACELC</b></td><td>on Partition pick A/C; Else pick Latency/Consistency — playback is PA/EL</td></tr>
+        <tr><td><b>Zipf distribution</b></td><td>power law: ~10% of videos draw ~90% of views → edge caching is very effective</td></tr>
+        <tr><td><b>Origin shield</b></td><td>regional mid-tier cache that collapses many edge misses into one origin pull</td></tr>
+        <tr><td><b>Optimistic locking</b></td><td><code>UPDATE ... WHERE version=?</code> — only one racer wins a state transition</td></tr>
+      </tbody></table></div>
+      <div class="card"><table><tbody>
+        <tr><td><b>Write-behind</b></td><td>update cache now (Redis INCR), batch-flush to DB later (30 s) — view counts</td></tr>
+        <tr><td><b>Idempotent output</b></td><td>deterministic S3 paths so a duplicate transcode overwrites identical bytes</td></tr>
+        <tr><td><b>At-least-once</b></td><td>jobs may run twice; idempotency + a lock make it effectively exactly-once</td></tr>
+        <tr><td><b>ABR</b></td><td>adaptive bitrate — player switches quality per segment based on bandwidth/buffer</td></tr>
+        <tr><td><b>HLS / DASH</b></td><td>segment + manifest streaming standards (.m3u8 / .mpd), packaged from CMAF fMP4</td></tr>
+        <tr><td><b>Read-your-writes</b></td><td>route a just-written user to the primary until replicas catch up</td></tr>
+      </tbody></table></div>
+    </div>
+  </section>
+
+  <footer>
+    <p>Use case 13 · Video Streaming — Canvas 3 of 3 (Deep-dive &amp; Trade-offs). Grounded in <code>13-video-streaming/docs/tradeoffs · caching · tech</code> and <code>revision/INTERVIEW_WALKTHROUGH.md</code>.</p>
+    <p class="run">This use case: <a href="hld.html">13a · HLD</a> · <a href="lld.html">13b · LLD</a> · Deep-dive &nbsp;|&nbsp; Next → <a href="../index.html">Hub</a></p>
+  </footer>
+
+</div>
+<script src="../assets/canvas.js"></script>
+</body>
+</html>

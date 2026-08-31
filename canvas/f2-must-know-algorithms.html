@@ -1,0 +1,325 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>F2 · Must-Know Algorithms</title>
+<link rel="stylesheet" href="assets/canvas.css">
+</head>
+<body>
+<div class="wrap">
+
+  <header class="hero">
+    <h1>Must-Know Algorithms</h1>
+    <div class="sub">Foundation reference — the dozen-odd algorithms that show up again and again in distributed-systems interviews. For each one: a one-line <b>what</b>, a <b>why/when</b>, and which repo use-case leans on it. Start with the clickable map, then drill into the grouped cards.</div>
+    <div class="badges">
+      <span class="badge lvl">Foundation · F2 of 3</span>
+      <span class="badge">System Design Basics</span>
+      <span class="badge">interactive</span>
+      <span class="badge">the toolbox</span>
+    </div>
+    <div class="legend">
+      <span><i class="dot" style="background:var(--eden)"></i> hashing &amp; partitioning</span>
+      <span><i class="dot" style="background:var(--survivor)"></i> consensus &amp; coordination</span>
+      <span><i class="dot" style="background:var(--old)"></i> probabilistic structures</span>
+      <span><i class="dot" style="background:var(--gc)"></i> caching &amp; rate limiting</span>
+      <span><i class="dot" style="background:var(--warn)"></i> ordering, IDs &amp; geo</span>
+    </div>
+  </header>
+
+  <!-- A · THE ALGORITHM MAP -->
+  <section>
+    <div class="sec-h"><span class="n">A</span><h2>The algorithm map — click a tile</h2><span class="tag">interactive</span></div>
+    <p class="muted">Every tile is one algorithm. Click it to see the one-line <b>what</b>, the <b>why/when</b>, and the repo use-case that relies on it. Colours match the legend groups above.</p>
+    <div class="arch grid g3">
+      <div class="chip" data-node style="cursor:pointer;border-color:var(--eden)" data-title="Consistent Hashing" data-detail="<b>What:</b> maps keys and nodes onto a hash ring; a key belongs to the first node clockwise from it.<br><b>Why/when:</b> adding/removing a node moves only ~1/N of keys, vs ~100% with hash(key)%N. The default for distributing keys across a changing set of nodes.<br><b>Used in:</b> P07 distributed cache (with vnodes), P19 API gateway LB (session affinity)."><span class="k" style="color:var(--eden)">hashing</span><span class="v" style="font-size:13.5px">Consistent Hashing</span></div>
+      <div class="chip" data-node style="cursor:pointer;border-color:var(--eden)" data-title="Rendezvous (HRW) Hashing" data-detail="<b>What:</b> for a key, compute hash(key,node) for every node and pick the node with the highest score.<br><b>Why/when:</b> like consistent hashing (minimal movement on membership change) but needs no ring or vnode bookkeeping — great when the node set is small.<br><b>Used in:</b> cache/shard placement (P07-style), CDN edge selection."><span class="k" style="color:var(--eden)">hashing</span><span class="v" style="font-size:13.5px">Rendezvous Hashing</span></div>
+      <div class="chip" data-node style="cursor:pointer;border-color:var(--survivor)" data-title="Leader Election (Raft / Bully)" data-detail="<b>What:</b> elects a single coordinator; Raft uses randomized election timeouts + majority votes per term.<br><b>Why/when:</b> exactly one node must own writes/decisions (replication leader, scheduler master).<br><b>Used in:</b> P17 task scheduler (Bully), P19 service discovery (Consul/Raft)."><span class="k" style="color:var(--survivor)">consensus</span><span class="v" style="font-size:13.5px">Leader Election</span></div>
+      <div class="chip" data-node style="cursor:pointer;border-color:var(--survivor)" data-title="Quorum (W + R > N)" data-detail="<b>What:</b> require W acks on write and R responses on read so the two sets always overlap on ≥1 up-to-date replica.<br><b>Why/when:</b> tunable consistency vs availability in leaderless stores without a single leader.<br><b>Used in:</b> P07 distributed cache (tunable consistency)."><span class="k" style="color:var(--survivor)">consensus</span><span class="v" style="font-size:13.5px">Quorum W+R&gt;N</span></div>
+      <div class="chip" data-node style="cursor:pointer;border-color:var(--survivor)" data-title="Gossip / SWIM" data-detail="<b>What:</b> each node periodically exchanges state with a random peer; info spreads epidemically in O(log N) rounds.<br><b>Why/when:</b> decentralized membership &amp; failure detection at scale with no central registry.<br><b>Used in:</b> Cassandra/Consul-style membership; P18 observability agent health, P19 backend health."><span class="k" style="color:var(--survivor)">consensus</span><span class="v" style="font-size:13.5px">Gossip / SWIM</span></div>
+      <div class="chip" data-node style="cursor:pointer;border-color:var(--old)" data-title="Bloom Filter" data-detail="<b>What:</b> probabilistic set — 'definitely not present' or 'probably present' (small false-positive rate, never false negatives).<br><b>Why/when:</b> skip an expensive lookup (DB/disk) for the common 'not seen' case.<br><b>Used in:</b> P01 URL shortener (short-code collision check), dedup first-pass."><span class="k" style="color:var(--old)">probabilistic</span><span class="v" style="font-size:13.5px">Bloom Filter</span></div>
+      <div class="chip" data-node style="cursor:pointer;border-color:var(--old)" data-title="HyperLogLog" data-detail="<b>What:</b> estimates cardinality (count of distinct items) in ~1.5 KB with ~2% error, regardless of set size.<br><b>Why/when:</b> 'how many unique X' at massive scale where storing every id is too expensive.<br><b>Used in:</b> P18 observability (unique users/IPs), P05/P12 feed reach metrics."><span class="k" style="color:var(--old)">probabilistic</span><span class="v" style="font-size:13.5px">HyperLogLog</span></div>
+      <div class="chip" data-node style="cursor:pointer;border-color:var(--old)" data-title="Count-Min Sketch" data-detail="<b>What:</b> estimates per-item frequency in sublinear space (over-counts, never under-counts).<br><b>Why/when:</b> heavy-hitter / top-K detection in a stream without keeping a counter per key.<br><b>Used in:</b> P18 observability (hot endpoints), P02/P19 hot-key rate limiting, trending detection."><span class="k" style="color:var(--old)">probabilistic</span><span class="v" style="font-size:13.5px">Count-Min Sketch</span></div>
+      <div class="chip" data-node style="cursor:pointer;border-color:var(--gc)" data-title="LRU / LFU Eviction" data-detail="<b>What:</b> LRU evicts the least-recently-used entry; LFU evicts the least-frequently-used.<br><b>Why/when:</b> caches are bounded — LRU favours recency (bursty access), LFU favours long-run popularity.<br><b>Used in:</b> P07 distributed cache (EvictionStrategy: LRU/LFU/TTL)."><span class="k" style="color:var(--gc)">caching</span><span class="v" style="font-size:13.5px">LRU / LFU</span></div>
+      <div class="chip" data-node style="cursor:pointer;border-color:var(--gc)" data-title="Rate Limiting" data-detail="<b>What:</b> token bucket (allows bursts), leaky bucket (smooths output), sliding window (accurate rolling count).<br><b>Why/when:</b> protect a service from overload / enforce per-client quotas.<br><b>Used in:</b> P02 rate limiter (5 algorithms), P19 API gateway."><span class="k" style="color:var(--gc)">rate limit</span><span class="v" style="font-size:13.5px">Rate Limiting</span></div>
+      <div class="chip" data-node style="cursor:pointer;border-color:var(--warn)" data-title="Logical Clocks (Lamport / Vector)" data-detail="<b>What:</b> Lamport = single counter giving a total order; vector clocks = per-node counters that also detect concurrency.<br><b>Why/when:</b> order events with no synchronized wall clock; vector clocks flag conflicting concurrent writes.<br><b>Used in:</b> P14 real-time collaboration, P04 chat ordering, Dynamo-style conflict detection."><span class="k" style="color:var(--warn)">ordering</span><span class="v" style="font-size:13.5px">Lamport / Vector Clocks</span></div>
+      <div class="chip" data-node style="cursor:pointer;border-color:var(--warn)" data-title="Snowflake IDs" data-detail="<b>What:</b> 64-bit ID = timestamp | machine-id | sequence — sortable, unique, no central coordination.<br><b>Why/when:</b> need globally unique, roughly time-ordered IDs across many servers without a DB round-trip.<br><b>Used in:</b> P01 URL shortener (distributed ID generation), P04/P16 event/order IDs."><span class="k" style="color:var(--warn)">IDs</span><span class="v" style="font-size:13.5px">Snowflake IDs</span></div>
+      <div class="chip" data-node style="cursor:pointer;border-color:var(--warn)" data-title="Geohash / QuadTree" data-detail="<b>What:</b> encode 2-D lat/long into a 1-D sortable string (geohash) or a recursively subdivided spatial tree (quadtree).<br><b>Why/when:</b> 'find things near me' / range queries on geography.<br><b>Used in:</b> P08 ride sharing (driver-rider proximity matching)."><span class="k" style="color:var(--warn)">geo</span><span class="v" style="font-size:13.5px">Geohash / QuadTree</span></div>
+      <div class="chip" data-node style="cursor:pointer;border-color:var(--warn)" data-title="Merkle Trees" data-detail="<b>What:</b> tree of hashes where the root summarizes all data; compare roots, then drill down to find differences in O(log N).<br><b>Why/when:</b> anti-entropy — cheaply find which ranges diverge between replicas and sync only those.<br><b>Used in:</b> Cassandra/DynamoDB-style repair; P15 file storage (content verification/dedup)."><span class="k" style="color:var(--warn)">anti-entropy</span><span class="v" style="font-size:13.5px">Merkle Trees</span></div>
+    </div>
+    <div class="node-detail"><span class="nd-title">Pick a tile above</span><div class="nd-body">Each algorithm's what / why-when / repo use-case shows here.</div></div>
+    <div class="callout tip"><b>How to use this in an interview:</b> when a requirement appears ("distribute keys", "count uniques cheaply", "order events", "find nearby"), name the algorithm, state the one-line reason, and move on. The grouped sections below give you the mechanism to defend it.</div>
+  </section>
+
+  <!-- B · HASHING & PARTITIONING -->
+  <section>
+    <div class="sec-h"><span class="n">B</span><h2>Hashing &amp; partitioning</h2><span class="tag">where does this key live?</span></div>
+    <div class="grid g2">
+      <div class="card">
+        <div class="kicker">consistent hashing — mechanism</div>
+        <p class="muted">Place both nodes and keys on a ring of hash values (0 … 2³²−1). A key is owned by the first node found walking <b>clockwise</b>. Add or remove a node and only the keys in that one arc move.</p>
+        <pre class="code"><span class="cm"># naive: rebalances almost everything</span>
+partition = hash(key) % N   <span class="cm"># N changes → ~100% remap</span>
+
+<span class="cm"># consistent hashing: only ~1/N keys move</span>
+owner = first_node_clockwise( hash(key) )</pre>
+        <p class="muted"><b>Virtual nodes:</b> give each physical node 100–200 points on the ring so load is even and rebalancing is smooth.</p>
+        <div class="callout"><b>Used in:</b> P07 distributed cache (consistent hash + vnodes), P19 API gateway load balancing (same key → same backend), P01 URL shortener (which shard stores the mapping).</div>
+      </div>
+      <div class="card">
+        <div class="kicker">the ring — click a marker</div>
+        <p class="muted">Key <b>k</b> hashes to position 500. Walk clockwise → it lands on the next node. Click the nodes and the key to see what happens.</p>
+        <div class="arch" style="display:flex;justify-content:center;padding:6px 0">
+          <svg viewBox="0 0 240 240" width="230" height="230" role="img" aria-label="consistent hashing ring">
+            <circle cx="120" cy="120" r="86" fill="none" stroke="var(--border)" stroke-width="2"></circle>
+            <text x="120" y="18" text-anchor="middle" fill="var(--faint)" font-size="9">0 / 2³²</text>
+            <!-- Node A top (pos 100) -->
+            <g data-node style="cursor:pointer" data-title="Node A (pos ≈ 100)" data-detail="Owns the arc from the previous node clockwise up to 100. A key hashing to e.g. 30 lands here."><circle cx="120" cy="34" r="11" fill="var(--eden)"></circle><text x="120" y="38" text-anchor="middle" fill="#04201d" font-size="11" font-weight="700">A</text></g>
+            <!-- Node B right (pos 800) -->
+            <g data-node style="cursor:pointer" data-title="Node B (pos ≈ 800)" data-detail="Key k hashes to 500 → walking clockwise, the first node reached is B, so B owns k. Add a node E between k and B and only keys in (prev,E] move — nothing else."><circle cx="206" cy="120" r="11" fill="var(--eden)"></circle><text x="206" y="124" text-anchor="middle" fill="#04201d" font-size="11" font-weight="700">B</text></g>
+            <!-- Node C bottom (pos 1500) -->
+            <g data-node style="cursor:pointer" data-title="Node C (pos ≈ 1500)" data-detail="Owns the arc from B (800) up to 1500. A key hashing to 900 walks clockwise past B's boundary and lands on C."><circle cx="120" cy="206" r="11" fill="var(--eden)"></circle><text x="120" y="210" text-anchor="middle" fill="#04201d" font-size="11" font-weight="700">C</text></g>
+            <!-- Node D left (pos 3000) -->
+            <g data-node style="cursor:pointer" data-title="Node D (pos ≈ 3000)" data-detail="Owns the arc from C up to 3000. If D fails, only D's arc is reassigned to the next clockwise node — every other key stays put. That is the whole point."><circle cx="34" cy="120" r="11" fill="var(--eden)"></circle><text x="34" y="124" text-anchor="middle" fill="#04201d" font-size="11" font-weight="700">D</text></g>
+            <!-- Key marker (pos 500, upper-right between A and B) -->
+            <g data-node style="cursor:pointer" data-title="Key k (hash ≈ 500)" data-detail="k sits between A (100) and B (800). Walk CLOCKWISE from k → first node hit is B. So B stores k. Change the node set and k only moves if a new node lands in the arc (prevNode, k]."><circle cx="181" cy="59" r="8" fill="var(--survivor)"></circle><text x="181" y="45" text-anchor="middle" fill="var(--survivor)" font-size="9" font-weight="700">k</text></g>
+            <path d="M120 34 A 86 86 0 0 1 206 120" fill="none" stroke="var(--survivor)" stroke-width="2" stroke-dasharray="3 3"></path>
+          </svg>
+        </div>
+        <div class="node-detail"><span class="nd-title">Click a node or the key marker</span><div class="nd-body">See which node owns the key and what moves on a membership change.</div></div>
+      </div>
+    </div>
+    <div class="card">
+      <div class="kicker">rendezvous (highest-random-weight) hashing — mechanism</div>
+      <p class="muted">No ring. For a key, score every node with <code>hash(key, node)</code> and pick the <b>highest</b>. Removing a node only re-homes that node's keys (each moves to its next-highest scorer); no vnode bookkeeping needed.</p>
+      <pre class="code">owner = argmax<sub>node</sub>  hash(key, node)   <span class="cm"># pick the max-scoring node</span></pre>
+      <div class="callout tip"><b>Consistent vs rendezvous:</b> both move only ~1/N keys on change. Consistent hashing scales to huge node counts cheaply (lookup via the ring); rendezvous is simpler and gives perfectly even load for a small, mostly-static node set. <b>Used in:</b> cache/shard placement, CDN edge selection.</div>
+    </div>
+  </section>
+
+  <!-- C · CONSENSUS & COORDINATION -->
+  <section>
+    <div class="sec-h"><span class="n">C</span><h2>Consensus &amp; coordination</h2><span class="tag">agreeing without a boss</span></div>
+    <div class="grid g3">
+      <div class="card">
+        <div class="kicker">leader election (Raft)</div>
+        <p class="muted"><b>What:</b> elect one leader per <i>term</i> via majority vote, using randomized election timeouts to avoid split votes.</p>
+        <ul class="tight">
+          <li>Follower times out → becomes <b>candidate</b>, votes for itself, requests votes.</li>
+          <li>Wins on a <b>majority</b> → sends heartbeats to stay leader.</li>
+          <li>Split vote → new random timeouts, retry next term.</li>
+        </ul>
+        <p class="muted"><b>Why/when:</b> exactly one node must own writes/decisions.</p>
+        <div class="callout"><b>Used in:</b> P17 task scheduler (Bully election), P19 service discovery (Consul/Raft).</div>
+      </div>
+      <div class="card">
+        <div class="kicker">quorum — W + R &gt; N</div>
+        <p class="muted"><b>What:</b> a write needs W acks, a read needs R responses; if <code>W+R&gt;N</code> the two sets must overlap on a fresh replica.</p>
+        <pre class="code"><span class="cm">// N=3, W=2, R=2  →  4 &gt; 3</span>
+write {A,B}   read {B,C}
+overlap = {B} <span class="cm">// sees latest</span></pre>
+        <p class="muted"><b>Why/when:</b> tune the W/R split for read- vs write-heavy loads; <code>W+R≤N</code> = fast but may read stale (AP).</p>
+        <div class="callout"><b>Used in:</b> P07 distributed cache (tunable consistency).</div>
+      </div>
+      <div class="card">
+        <div class="kicker">gossip / SWIM</div>
+        <p class="muted"><b>What:</b> every T seconds each node syncs state with a random peer; knowledge spreads exponentially.</p>
+        <pre class="code">round k → ~2^k nodes know
+all N nodes in O(log N) rounds
+1000 nodes, T=1s → ~10 s</pre>
+        <p class="muted"><b>Why/when:</b> decentralized membership &amp; failure detection with no central registry; SWIM adds indirect PINGs to avoid false positives.</p>
+        <div class="callout"><b>Used in:</b> Cassandra/Consul membership; P18 observability, P19 backend health.</div>
+      </div>
+    </div>
+    <div class="callout tip"><b>Quorum ≠ consensus:</b> quorum guarantees read/write <i>overlap</i>; consensus (Raft/Paxos) guarantees all nodes <i>agree on a single ordered log</i>. Reach for consensus when you need a leader or a replicated log; reach for quorum when you just need to not read stale data.</div>
+  </section>
+
+  <!-- D · PROBABILISTIC STRUCTURES -->
+  <section>
+    <div class="sec-h"><span class="n">D</span><h2>Probabilistic structures</h2><span class="tag">approximate, tiny, fast</span></div>
+    <p class="muted">Trade a little accuracy for a huge space saving. All three answer a question in sublinear memory that would otherwise need one entry per item.</p>
+    <table>
+      <thead><tr><th>Structure</th><th>Answers</th><th>Error mode</th><th>Why / when</th><th>Used in</th></tr></thead>
+      <tbody>
+        <tr><td><b>Bloom filter</b></td><td>"have I seen this?"</td><td>false positive only<br>(never false negative)</td><td>skip an expensive DB/disk lookup for the common "no" case</td><td>P01 URL shortener (collision check), dedup first-pass</td></tr>
+        <tr><td><b>HyperLogLog</b></td><td>"how many <i>unique</i>?"</td><td>~2% count error</td><td>cardinality of a huge set in ~1.5 KB flat</td><td>P18 observability (unique users/IPs), feed reach</td></tr>
+        <tr><td><b>Count-Min Sketch</b></td><td>"how often <i>this</i> item?"</td><td>over-counts only</td><td>per-item frequency / heavy hitters in a stream</td><td>P18 hot endpoints, P02/P19 hot-key limiting, trending</td></tr>
+      </tbody>
+    </table>
+    <pre class="code"><span class="cm"># Bloom as a first-pass filter in front of an exact store</span>
+if bloom.contains(id):
+    exact_store.check(id)   <span class="cm"># rare, expensive — only on a "maybe"</span>
+else:
+    bloom.add(id); process(id)   <span class="cm"># cuts DB lookups by 99%+</span></pre>
+  </section>
+
+  <!-- E · CACHING EVICTION -->
+  <section>
+    <div class="sec-h"><span class="n">E</span><h2>Caching eviction — LRU vs LFU</h2><span class="tag">bounded memory</span></div>
+    <div data-tabscope>
+      <div class="tabs">
+        <button class="tab active" data-tab="lru">LRU</button>
+        <button class="tab" data-tab="lfu">LFU</button>
+        <button class="tab" data-tab="cmp">Compare</button>
+      </div>
+      <div class="tabpanel active" data-panel="lru">
+        <div class="card">
+          <div class="kicker">least recently used</div>
+          <p class="muted"><b>What:</b> evict the entry untouched for the longest time. Implemented with a hash map + doubly-linked list → O(1) get/put; every access moves the key to the front.</p>
+          <p class="muted"><b>Why/when:</b> access is bursty and recency predicts the next hit (a key hot now is likely hot in a second). The safe default.</p>
+          <p class="muted"><b>Weakness:</b> a one-off scan of many keys can flush genuinely popular entries.</p>
+        </div>
+      </div>
+      <div class="tabpanel" data-panel="lfu">
+        <div class="card">
+          <div class="kicker">least frequently used</div>
+          <p class="muted"><b>What:</b> evict the entry with the lowest access count (with tie-breaking / aging so old spikes decay).</p>
+          <p class="muted"><b>Why/when:</b> long-run popularity matters more than recency — a stable hot set that shouldn't be evicted by a burst of cold traffic.</p>
+          <p class="muted"><b>Weakness:</b> new-but-good entries start at count 1 and can be evicted before they prove themselves; needs aging to adapt.</p>
+        </div>
+      </div>
+      <div class="tabpanel" data-panel="cmp">
+        <table>
+          <thead><tr><th></th><th>LRU</th><th>LFU</th></tr></thead>
+          <tbody>
+            <tr><td>evicts</td><td>oldest access time</td><td>lowest access count</td></tr>
+            <tr><td>favours</td><td>recency</td><td>frequency</td></tr>
+            <tr><td>good for</td><td>bursty / temporal locality</td><td>stable popularity</td></tr>
+            <tr><td>hurt by</td><td>large one-off scans</td><td>cold start of good keys</td></tr>
+          </tbody>
+        </table>
+        <div class="callout"><b>Used in:</b> P07 distributed cache exposes both as pluggable EvictionStrategy (LRU / LFU / TTL).</div>
+      </div>
+    </div>
+  </section>
+
+  <!-- F · RATE LIMITING -->
+  <section>
+    <div class="sec-h"><span class="n">F</span><h2>Rate limiting</h2><span class="tag">throttle the firehose</span></div>
+    <div data-tabscope>
+      <div class="tabs">
+        <button class="tab active" data-tab="tb">Token bucket</button>
+        <button class="tab" data-tab="lb">Leaky bucket</button>
+        <button class="tab" data-tab="sw">Sliding window</button>
+      </div>
+      <div class="tabpanel active" data-panel="tb">
+        <div class="card">
+          <div class="kicker">token bucket</div>
+          <p class="muted"><b>What:</b> tokens refill at a fixed rate up to a cap; each request spends one; empty bucket → reject.</p>
+          <p class="muted"><b>Why/when:</b> you want a steady average rate but should <b>allow short bursts</b> (up to the bucket size). The most common API limiter.</p>
+          <pre class="code">tokens = min(cap, tokens + rate*Δt)
+if tokens >= 1: tokens -= 1  <span class="cm"># allow</span>
+else: reject</pre>
+        </div>
+      </div>
+      <div class="tabpanel" data-panel="lb">
+        <div class="card">
+          <div class="kicker">leaky bucket</div>
+          <p class="muted"><b>What:</b> requests enter a queue and drain (leak) at a constant rate; overflow → reject.</p>
+          <p class="muted"><b>Why/when:</b> you need a <b>smooth, constant output</b> rate downstream (no bursts) — e.g. protecting a fragile backend.</p>
+        </div>
+      </div>
+      <div class="tabpanel" data-panel="sw">
+        <div class="card">
+          <div class="kicker">sliding window</div>
+          <p class="muted"><b>What:</b> count requests in a rolling time window (log of timestamps, or a weighted counter across two fixed windows).</p>
+          <p class="muted"><b>Why/when:</b> you need an <b>accurate</b> rolling limit without the boundary spike that fixed windows allow (2× burst at the edge).</p>
+        </div>
+      </div>
+    </div>
+    <div class="callout"><b>Used in:</b> P02 rate limiter ships all five (token bucket, leaky bucket, fixed window, sliding-window log, sliding-window counter); P19 API gateway applies per-client limits at the edge. Rule of thumb: <b>token bucket</b> for APIs (bursts OK), <b>leaky bucket</b> to smooth downstream, <b>sliding window</b> when accuracy at the boundary matters.</div>
+  </section>
+
+  <!-- G · ORDERING & IDs -->
+  <section>
+    <div class="sec-h"><span class="n">G</span><h2>Ordering &amp; IDs</h2><span class="tag">time without a clock</span></div>
+    <div class="grid g3">
+      <div class="card">
+        <div class="kicker">Lamport timestamps</div>
+        <p class="muted"><b>What:</b> one integer per node; bump on each event, and on receive set <code>C = max(C, T) + 1</code>.</p>
+        <p class="muted"><b>Why/when:</b> a cheap <b>total order</b> for events with no synced wall clock. <code>a → b ⟹ C(a) &lt; C(b)</code>.</p>
+        <div class="callout"><b>Catch:</b> the converse is false — <code>C(a)&lt;C(b)</code> does <i>not</i> imply causality. Can't detect concurrency.</div>
+      </div>
+      <div class="card">
+        <div class="kicker">vector clocks</div>
+        <p class="muted"><b>What:</b> a vector of counters, one slot per node; merge = element-wise max on receive.</p>
+        <p class="muted"><b>Why/when:</b> detect <b>concurrency</b> — if neither vector dominates the other, the two writes conflict and need resolution.</p>
+        <div class="callout"><b>Used in:</b> P14 real-time collaboration, P04 chat ordering, Dynamo-style conflict detection.</div>
+      </div>
+      <div class="card">
+        <div class="kicker">Snowflake IDs</div>
+        <p class="muted"><b>What:</b> 64-bit ID = <code>timestamp | machine-id | sequence</code>.</p>
+        <pre class="code">| 41b time | 10b node | 12b seq |</pre>
+        <p class="muted"><b>Why/when:</b> globally unique, roughly time-sortable IDs across many servers with <b>no coordination</b> and no DB round-trip.</p>
+        <div class="callout"><b>Used in:</b> P01 URL shortener (distributed ID gen), P04/P16 event &amp; order IDs.</div>
+      </div>
+    </div>
+  </section>
+
+  <!-- H · GEO & ANTI-ENTROPY -->
+  <section>
+    <div class="sec-h"><span class="n">H</span><h2>Geo &amp; anti-entropy</h2><span class="tag">space &amp; repair</span></div>
+    <div class="grid g2">
+      <div class="card">
+        <div class="kicker">geohash / quadtree</div>
+        <p class="muted"><b>What:</b> <b>geohash</b> interleaves lat/long bits into one sortable string — shared prefix ≈ nearby. <b>Quadtree</b> recursively splits space into 4 quadrants, denser where there are more points.</p>
+        <p class="muted"><b>Why/when:</b> "find everything near me" and spatial range queries — turn 2-D proximity into a 1-D index lookup or a tree descent.</p>
+        <div class="callout"><b>Used in:</b> P08 ride sharing (match nearby drivers ↔ riders).</div>
+      </div>
+      <div class="card">
+        <div class="kicker">Merkle trees</div>
+        <p class="muted"><b>What:</b> a tree of hashes; each parent hashes its children, so the root fingerprints all the data.</p>
+        <pre class="code">        root=h(AB+CD)
+       /           \
+   h(A+B)        h(C+D)
+   /   \          /   \
+ [A]   [B]      [C]   [D]</pre>
+        <p class="muted"><b>Why/when:</b> <b>anti-entropy</b> — compare roots between replicas; if they differ, drill down in O(log N) to find and sync only the divergent ranges.</p>
+        <div class="callout"><b>Used in:</b> Cassandra/DynamoDB replica repair; P15 file storage (content verification &amp; dedup).</div>
+      </div>
+    </div>
+  </section>
+
+  <!-- GLOSSARY -->
+  <section>
+    <div class="sec-h"><span class="n">§</span><h2>Glossary — one-liners</h2><span class="tag">terms used above</span></div>
+    <div class="grid g2">
+      <div class="card">
+        <table>
+          <tbody>
+            <tr><td><b>Hash ring</b></td><td>circular hash space where keys and nodes coexist; key → first node clockwise</td></tr>
+            <tr><td><b>Virtual node</b></td><td>one physical node's many points on the ring, for even load</td></tr>
+            <tr><td><b>Quorum</b></td><td>the minimum acks/responses (W / R) needed for a write / read to count</td></tr>
+            <tr><td><b>Consensus</b></td><td>all nodes agree on one ordered log (Raft/Paxos) — stronger than quorum</td></tr>
+            <tr><td><b>Gossip</b></td><td>epidemic peer-to-peer state exchange; converges in O(log N) rounds</td></tr>
+            <tr><td><b>False positive</b></td><td>a "yes" that's actually "no" — Bloom's only error mode</td></tr>
+            <tr><td><b>Cardinality</b></td><td>count of distinct elements — what HyperLogLog estimates</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="card">
+        <table>
+          <tbody>
+            <tr><td><b>Heavy hitter</b></td><td>a disproportionately frequent item — what Count-Min surfaces</td></tr>
+            <tr><td><b>Eviction policy</b></td><td>rule for which cache entry to drop when full (LRU / LFU / TTL)</td></tr>
+            <tr><td><b>Burst</b></td><td>a short spike above the average rate; token bucket permits it, leaky bucket smooths it</td></tr>
+            <tr><td><b>Logical clock</b></td><td>event ordering from counters, not wall-clock time (Lamport / vector)</td></tr>
+            <tr><td><b>Concurrent events</b></td><td>events with no causal link; only vector clocks can flag them</td></tr>
+            <tr><td><b>Anti-entropy</b></td><td>background process that reconciles divergent replicas (via Merkle trees)</td></tr>
+            <tr><td><b>Geohash</b></td><td>lat/long encoded to one sortable string; shared prefix ≈ nearby</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+
+  <footer>
+    <p>Foundation F2 of 3 · System Design Basics — Must-Know Algorithms. Grounded in <code>docs/DISTRIBUTED_SYSTEMS_FUNDAMENTALS.md</code> and <code>docs/DESIGN_PATTERNS_REFERENCE.md</code>.</p>
+    <p class="run">Foundations: <a href="f1-cap-consistency.html">F1 · CAP &amp; Consistency</a> · F2 · Must-Know Algorithms · <a href="f3-estimation-numbers.html">F3 · Estimation &amp; Numbers</a> &nbsp;|&nbsp; <a href="index.html">→ Use-case canvases (hub)</a></p>
+    <p class="run"><a href="f3-estimation-numbers.html">Next → F3 · Estimation &amp; Numbers</a></p>
+  </footer>
+
+</div>
+<script src="assets/canvas.js"></script>
+</body>
+</html>

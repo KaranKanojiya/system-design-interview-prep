@@ -1,0 +1,296 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>05 · Social Media Feed — HLD</title>
+<link rel="stylesheet" href="../assets/canvas.css">
+</head>
+<body>
+<div class="wrap">
+
+  <header class="hero">
+    <h1>Social Media Feed — High-Level Design</h1>
+    <div class="sub">Use case 05 · Canvas 1 of 3. The big picture: requirements, back-of-envelope numbers, and an <b>interactive architecture diagram</b> — click a component to see its role, then step through the tweet-publish (write) and feed-generation (read) flows. The heart of this system is the <b>celebrity problem</b> and the <b>hybrid fan-out</b> that solves it.</div>
+    <div class="badges">
+      <span class="badge lvl">Use case 05 · HLD</span>
+      <span class="badge">Canvas 1 of 3</span>
+      <span class="badge">interactive</span>
+      <span class="badge">AP · read-heavy 600:1</span>
+    </div>
+    <div class="legend">
+      <span><i class="dot" style="background:var(--eden)"></i> click a component</span>
+      <span><i class="dot" style="background:var(--survivor)"></i> fan-out engine</span>
+      <span><i class="dot" style="background:var(--eden)"></i> current step</span>
+      <span><i class="dot" style="background:var(--old)"></i> data stores</span>
+      <span><i class="dot" style="background:var(--warn)"></i> async / off hot-path</span>
+    </div>
+  </header>
+
+  <!-- A · PROBLEM & REQUIREMENTS -->
+  <section>
+    <div class="sec-h"><span class="n">A</span><h2>Problem &amp; requirements</h2><span class="tag">clarify first</span></div>
+    <p class="muted">Build a Twitter/X-like feed: users post short tweets, follow others, and see a personalized home timeline aggregating everyone they follow. The core challenge: <b>deliver a ranked feed to 300M users in &lt;500 ms when a single celebrity post must reach 50M timelines</b>.</p>
+    <div class="grid g2">
+      <div class="card">
+        <div class="kicker">functional</div>
+        <ul class="tight">
+          <li>Post a tweet (≤280 chars + optional media) → unique <code>tweet_id</code> (Snowflake); fan-out to followers.</li>
+          <li>Home timeline — aggregated &amp; ranked feed of followees, cursor-paginated, near real-time.</li>
+          <li>User timeline (reverse-chrono), follow / unfollow, like / retweet.</li>
+          <li>Trending topics (by velocity, not volume; per region/window) and full-text search.</li>
+        </ul>
+      </div>
+      <div class="card">
+        <div class="kicker">non-functional</div>
+        <ul class="tight">
+          <li><b>Feed latency</b> &lt; 500 ms p99; poster sees own tweet &lt; 1 s; fan-out lag &lt; 5 s.</li>
+          <li><b>Availability</b> 99.99% — global, always-on (→ AP system).</li>
+          <li><b>Consistency</b> eventual — a 5–10 s stale feed is acceptable.</li>
+          <li><b>Scale</b> 300M MAU · 500M tweets/day · 100K tweets/s peak · <b>600:1</b> read-heavy · no tweet loss.</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <!-- B · ESTIMATION -->
+  <section>
+    <div class="sec-h"><span class="n">B</span><h2>Back-of-envelope estimation</h2><span class="tag">500M tweets/day · 600:1</span></div>
+    <div class="chips">
+      <div class="chip"><span class="k">Write QPS</span><span class="v">~6K/s</span></div>
+      <div class="chip"><span class="k">Write peak</span><span class="v">~100K/s</span></div>
+      <div class="chip"><span class="k">Read QPS</span><span class="v">~35K/s</span></div>
+      <div class="chip"><span class="k">Read peak</span><span class="v">~100K/s</span></div>
+      <div class="chip"><span class="k">Read : Write</span><span class="v">600 : 1</span></div>
+      <div class="chip"><span class="k">Fan-out writes</span><span class="v">~100B/day</span></div>
+      <div class="chip"><span class="k">Fan-out peak</span><span class="v">~1.15M/s</span></div>
+      <div class="chip"><span class="k">Timeline cache</span><span class="v">~1.8 TB</span></div>
+    </div>
+    <div class="callout tip"><b>Derivation:</b> 500M tweets ÷ 86.4K s ≈ <b>6K writes/s</b> · reads 3B/day (300M×10) ≈ <b>35K/s</b> → 600:1 · fan-out = 500M × 200 avg followers ≈ <b>100B writes/day</b> ≈ 1.15M/s sustained · one celebrity tweet = 50M writes ⇒ naïve fan-out takes <b>8+ min</b> → hybrid model skips it · timeline cache = 150M DAU × 12 KB ≈ <b>1.8 TB</b> active (≈12 TB full MAU, the dominant cost). <span class="run">→ full math on canvas 3 · Estimation</span></div>
+  </section>
+
+  <!-- C · INTERACTIVE ARCHITECTURE -->
+  <section data-flowscope>
+    <div class="sec-h"><span class="n">C</span><h2>Architecture — click components, then step the flows</h2><span class="tag">the design, from the diagram</span></div>
+    <div>
+      <div class="arch">
+        <svg viewBox="0 0 900 470" width="100%" style="max-width:900px" role="img" aria-label="Social media feed architecture">
+          <defs>
+            <marker id="ah" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" fill="var(--muted)"></path></marker>
+          </defs>
+
+          <!-- context (non-flow) connectors -->
+          <path class="arrow" d="M232,214 C 340,20 500,20 610,74" fill="none" stroke="var(--muted)" stroke-width="1.5" stroke-dasharray="4 3" marker-end="url(#ah)"></path>
+          <path class="arrow" d="M394,398 C 470,430 560,420 612,404" fill="none" stroke="var(--muted)" stroke-width="1.5" stroke-dasharray="4 3" marker-end="url(#ah)"></path>
+          <text x="440" y="30" fill="var(--faint)" font-size="9">search · media · trending</text>
+          <text x="460" y="446" fill="var(--faint)" font-size="9">social graph</text>
+
+          <!-- WRITE + READ flow arrows (drawn first, under the boxes) -->
+          <line class="arrow" x1="104" y1="229" x2="128" y2="229" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"
+                data-flow="write read" data-write="1" data-read="1"
+                data-desc-write="Client POSTs a new tweet (≤280 chars + optional media URLs) to the API gateway." data-desc-read="Client requests GET /api/feed?cursor=&amp;limit=20 through the API gateway."></line>
+          <line class="arrow" x1="232" y1="222" x2="272" y2="92" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"
+                data-flow="write" data-write="2"
+                data-desc-write="Gateway authenticates the JWT, applies rate limits (≤300 tweets/day/user), and routes to the Tweet Service."></line>
+          <line class="arrow" x1="232" y1="229" x2="272" y2="229" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"
+                data-flow="read" data-read="2"
+                data-desc-read="Gateway authenticates and routes the feed read to the stateless Feed Service."></line>
+          <path class="arrow" d="M394,88 C 560,100 610,240 612,300" fill="none" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"
+                data-flow="write" data-write="3"
+                data-desc-write="Tweet Service persists the tweet (Snowflake ID, time-sortable) into the tweet store (Cassandra), partitioned by user_id."></path>
+          <line class="arrow" x1="394" y1="80" x2="446" y2="80" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"
+                data-flow="write" data-write="4"
+                data-desc-write="Tweet Service publishes a tweet-created event to Kafka — partitioned by poster user_id, so it never blocks the poster's response."></line>
+          <path class="arrow" d="M496,102 L496,388 L398,388" fill="none" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"
+                data-flow="write" data-write="5"
+                data-desc-write="Fan-Out workers consume the event and check is_celebrity to pick a fan-out strategy."></path>
+          <path class="arrow" d="M394,376 C 520,340 560,240 612,188" fill="none" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"
+                data-flow="write" data-write="6"
+                data-desc-write="NORMAL poster → ZADD tweet_id into every follower's timeline sorted set (push). CELEBRITY → skip fan-out; the tweet is pulled at read time instead."></path>
+          <line class="arrow" x1="394" y1="222" x2="612" y2="182" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"
+                data-flow="read" data-read="3"
+                data-desc-read="Read the pre-computed timeline from Redis (ZREVRANGE timeline:{user_id}) — normal users' tweets, O(1) and fast."></line>
+          <line class="arrow" x1="394" y1="240" x2="612" y2="308" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"
+                data-flow="read" data-read="4"
+                data-desc-read="Pull the latest tweets from followed celebrities' user timelines (Cassandra), then merge + rank + hydrate the top 20."></line>
+          <path class="arrow" d="M272,244 C 180,320 110,320 62,254" fill="none" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"
+                data-flow="read" data-read="5"
+                data-desc-read="Feed Service returns the ranked, cursor-paginated feed (200 OK) — total ~20–35 ms, well within the 500 ms budget."></path>
+
+          <!-- nodes -->
+          <g data-node style="cursor:pointer" data-title="Client" data-detail="Browser or mobile app. <b>POST /api/tweets</b> to publish; <b>GET /api/feed</b> to load the home timeline. Media is uploaded to the Media Service first, then the tweet references the returned CDN URLs."><rect x="16" y="205" width="88" height="48" rx="9" fill="var(--panel-2)" stroke="var(--eden)"></rect><text x="60" y="234" text-anchor="middle" fill="var(--eden)" font-size="13" font-weight="600">Client</text></g>
+
+          <g data-node style="cursor:pointer" data-title="API Gateway / Load Balancer" data-detail="<b>Role:</b> single entry point — SSL termination, JWT auth, rate limiting (≤300 tweets/day/user via a Redis sliding window), and routing to the microservices.<br><b>Tech:</b> AWS ALB + API Gateway / Nginx / Kong."><rect x="128" y="205" width="104" height="48" rx="9" fill="var(--panel-2)" stroke="var(--border)"></rect><text x="180" y="228" text-anchor="middle" fill="var(--text)" font-size="12" font-weight="600">API Gateway</text><text x="180" y="243" text-anchor="middle" fill="var(--faint)" font-size="10">auth · rate limit</text></g>
+
+          <g data-node style="cursor:pointer" data-title="Tweet Service (stateless)" data-detail="<b>Role:</b> CRUD for tweets. Assigns a Snowflake ID, persists to Cassandra, and publishes a tweet-created event to Kafka.<br><b>Stateless:</b> any instance handles any request; horizontal auto-scale.<br><b>Tech:</b> Spring Boot in containers (ECS/EKS)."><rect x="272" y="58" width="122" height="44" rx="9" fill="var(--panel-2)" stroke="var(--border)"></rect><text x="333" y="80" text-anchor="middle" fill="var(--text)" font-size="12" font-weight="600">Tweet Service</text><text x="333" y="94" text-anchor="middle" fill="var(--faint)" font-size="10">Snowflake ID · publish</text></g>
+
+          <g data-node style="cursor:pointer" data-title="Feed Service (stateless)" data-detail="<b>Role:</b> builds the home timeline on the READ path — reads the pre-computed Redis timeline (normal users), pulls followed celebrities' recent tweets, merges, ranks by score, and hydrates the top 20.<br><b>Rank:</b> chronological first, then engagement (time-decay × like/retweet/reply weights × social affinity).<br><b>Stateless:</b> Redis-backed, scales behind the LB."><rect x="272" y="205" width="122" height="48" rx="9" fill="var(--panel-2)" stroke="var(--border)"></rect><text x="333" y="228" text-anchor="middle" fill="var(--text)" font-size="12" font-weight="600">Feed Service</text><text x="333" y="243" text-anchor="middle" fill="var(--faint)" font-size="10">merge · rank · hydrate</text></g>
+
+          <g data-node style="cursor:pointer" data-title="Fan-Out Service (workers)" data-detail="<b>Role:</b> the heart of the design. Kafka-consumer workers that check <code>is_celebrity</code>.<br><b>Normal user (&lt;10K followers):</b> fan-out ON WRITE — ZADD the tweet_id into each follower's timeline (batched pipelines of 1000, trim to 800, 7-day TTL).<br><b>Celebrity (&gt;threshold):</b> SKIP fan-out — the tweet stays in the celebrity's own timeline and is pulled at read time.<br><b>Scale:</b> Kafka consumer groups; auto-scale on consumer lag."><rect x="272" y="366" width="122" height="44" rx="9" fill="var(--panel-2)" stroke="var(--survivor)"></rect><text x="333" y="388" text-anchor="middle" fill="var(--survivor)" font-size="12" font-weight="600">Fan-Out Service</text><text x="333" y="402" text-anchor="middle" fill="var(--faint)" font-size="10">hybrid push/pull</text></g>
+
+          <g data-node style="cursor:pointer" data-title="Kafka (event bus)" data-detail="<b>Role:</b> decouples tweet writes from fan-out so the poster gets a fast response.<br><b>Why:</b> high throughput, durable, replayable. Partitioned by poster user_id → per-user ordering and even worker load. Topic: <code>tweet-events</code>."><rect x="446" y="58" width="100" height="44" rx="9" fill="var(--panel-2)" stroke="var(--warn)"></rect><text x="496" y="85" text-anchor="middle" fill="var(--warn)" font-size="12" font-weight="600">Kafka</text></g>
+
+          <g data-node style="cursor:pointer" data-title="Redis — Timeline Cache" data-detail="<b>Pattern:</b> one sorted set per user — <code>timeline:{user_id}</code>, member = tweet_id, score = timestamp.<br><b>Read:</b> ZREVRANGE 0 19 → newest 20. Max ~800 entries, 7-day TTL.<br><b>Also hosts:</b> trending ZSETs and social-graph sets.<br><b>Scale:</b> Redis Cluster sharded by hash(user_id) — the dominant cost (~$200K/mo at Twitter scale)."><rect x="612" y="150" width="160" height="48" rx="9" fill="var(--panel-2)" stroke="var(--old)"></rect><text x="692" y="173" text-anchor="middle" fill="var(--old)" font-size="12" font-weight="600">Redis · Timeline Cache</text><text x="692" y="188" text-anchor="middle" fill="var(--faint)" font-size="10">ZSET per user · 800/7d</text></g>
+
+          <g data-node style="cursor:pointer" data-title="Cassandra — Tweet Store" data-detail="<b>Access pattern:</b> write-heavy, key-value by user. PRIMARY KEY (user_id, tweet_id) CLUSTERING tweet_id DESC → a user's tweets co-located, newest first (user timeline).<br><b>Why:</b> horizontal scale, high availability. Also holds like / retweet / follow tables.<br><b>Cloud:</b> DynamoDB / Keyspaces work identically."><rect x="612" y="286" width="160" height="48" rx="9" fill="var(--panel-2)" stroke="var(--old)"></rect><text x="692" y="309" text-anchor="middle" fill="var(--old)" font-size="12" font-weight="600">Cassandra · Tweets</text><text x="692" y="324" text-anchor="middle" fill="var(--faint)" font-size="10">by user_id · tweet_id DESC</text></g>
+
+          <g data-node style="cursor:pointer" data-title="PostgreSQL — User DB / Social Graph" data-detail="<b>Role:</b> small relational store for user profiles, follower/following counts, and the <code>is_celebrity</code> flag + dynamic threshold that drives the fan-out decision.<br><b>Why relational:</b> profiles are low-volume and benefit from constraints/indexes. Follow adjacency also mirrored into Redis sets for fast lookups."><rect x="612" y="372" width="160" height="44" rx="9" fill="var(--panel-2)" stroke="var(--old)"></rect><text x="692" y="394" text-anchor="middle" fill="var(--old)" font-size="12" font-weight="600">Postgres · Users</text><text x="692" y="408" text-anchor="middle" fill="var(--faint)" font-size="10">profiles · is_celebrity</text></g>
+
+          <g data-node style="cursor:pointer" data-title="Search · Media · Trending" data-detail="<b>Search:</b> Elasticsearch/OpenSearch indexes tweet text &amp; hashtags for full-text search.<br><b>Media:</b> a Media Service stores images/video in S3 and serves via CDN — the tweet row keeps only <code>media_urls</code>.<br><b>Trending:</b> a consumer does ZINCRBY per hashtag per window in Redis; a periodic job scores by velocity (spike vs 7-day baseline)."><rect x="612" y="58" width="160" height="44" rx="9" fill="var(--panel-2)" stroke="var(--border)"></rect><text x="692" y="80" text-anchor="middle" fill="var(--text)" font-size="12" font-weight="600">Search · Media</text><text x="692" y="94" text-anchor="middle" fill="var(--faint)" font-size="10">ES · S3/CDN · Trending</text></g>
+        </svg>
+      </div>
+      <div class="node-detail"><span class="nd-title">Click any component</span><div class="nd-body">Its role, tech choice, and scaling note appear here. Then use the buttons below to step through a request flow.</div></div>
+
+      <div class="flowctl" data-flowctl>
+        <button class="btn" data-flow="write">Write path (post tweet)</button>
+        <button class="btn" data-flow="read">Read path (load feed)</button>
+        <span style="flex:1"></span>
+        <button class="btn" data-flowstep="prev">◀ Prev</button>
+        <button class="btn" data-flowstep="next">Next ▶</button>
+      </div>
+      <div class="flowlabel" data-flowlabel>Pick <b>Write</b> or <b>Read</b>, then press “Next ▶” to walk the numbered request flow one hop at a time.</div>
+
+      <!-- Numbered flows (the design, seen as steps) -->
+      <div class="flow">
+        <div class="step eden"><div class="box">Client</div><small>POST /api/tweets</small></div>
+        <div class="step"><div class="box">API Gateway</div><small>auth · rate-limit · route</small></div>
+        <div class="step"><div class="box">Tweet Service</div><small>Snowflake ID</small></div>
+        <div class="step old"><div class="box">Cassandra</div><small>persist tweet</small></div>
+        <div class="step warn"><div class="box">Kafka</div><small>tweet-events</small></div>
+        <div class="step survivor"><div class="box">Fan-Out Service</div><small>is_celebrity?</small></div>
+        <div class="step old"><div class="box">Redis timelines</div><small>ZADD (normal) · skip (celeb)</small></div>
+      </div>
+      <div class="flowlabel">Write path — publish a tweet. Normal poster fans out to every follower's timeline; a celebrity's tweet is left to be pulled at read time.</div>
+
+      <div class="flow">
+        <div class="step eden"><div class="box">Client</div><small>GET /api/feed</small></div>
+        <div class="step"><div class="box">API Gateway</div><small>auth · route</small></div>
+        <div class="step"><div class="box">Feed Service</div><small>build timeline</small></div>
+        <div class="step old"><div class="box">Redis timeline</div><small>ZREVRANGE (normal users)</small></div>
+        <div class="step old"><div class="box">Cassandra</div><small>pull celeb tweets</small></div>
+        <div class="step survivor"><div class="box">Merge + rank</div><small>hydrate top 20</small></div>
+        <div class="step eden"><div class="box">Client</div><small>200 · paginated feed</small></div>
+      </div>
+      <div class="flowlabel">Read path — the hybrid merge: fast pre-computed cache <b>+</b> a small pull of celebrity tweets → ranked in ~20–35 ms.</div>
+
+      <div class="cloudmap">
+        <div class="kicker" style="margin-top:4px">Managed-service mapping — the same components on each cloud</div>
+        <table class="cloudtable">
+          <thead><tr>
+            <th>Component</th>
+            <th><span class="hdrlogo"><span class="logochip"><img src="../assets/logos/aws.svg" alt="AWS"></span>AWS</span></th>
+            <th><span class="hdrlogo"><span class="logochip"><img src="../assets/logos/gcp.svg" alt="GCP"></span>GCP</span></th>
+            <th><span class="hdrlogo"><span class="logochip"><img src="../assets/logos/azure.svg" alt="Azure"></span>Azure</span></th>
+          </tr></thead>
+          <tbody>
+            <tr><td>API Gateway / LB</td><td><img class="svcicon" src="../assets/logos/services/aws-elb.svg" alt="">ALB / API Gateway</td><td><img class="svcicon" src="../assets/logos/services/gcp-elb.svg" alt="">Cloud Load Balancing</td><td><img class="svcicon" src="../assets/logos/services/azure-appgw.svg" alt="">App Gateway</td></tr>
+            <tr><td>Compute (services)</td><td><img class="svcicon" src="../assets/logos/services/aws-ecs.svg" alt="">ECS Fargate / EKS</td><td><img class="svcicon" src="../assets/logos/services/gcp-run.svg" alt="">Cloud Run / GKE</td><td><img class="svcicon" src="../assets/logos/services/azure-aks.svg" alt="">AKS</td></tr>
+            <tr><td>Timeline Cache (Redis)</td><td><img class="svcicon" src="../assets/logos/services/aws-elasticache.svg" alt="">ElastiCache</td><td><img class="svcicon" src="../assets/logos/services/gcp-memorystore.svg" alt="">Memorystore</td><td><img class="svcicon" src="../assets/logos/services/azure-redis.svg" alt="">Cache for Redis</td></tr>
+            <tr><td>Event bus (Kafka)</td><td><img class="svcicon" src="../assets/logos/services/aws-msk.svg" alt="">MSK / Kinesis</td><td><img class="svcicon" src="../assets/logos/services/gcp-pubsub.svg" alt="">Pub/Sub</td><td><img class="svcicon" src="../assets/logos/services/azure-eventhubs.svg" alt="">Event Hubs</td></tr>
+            <tr><td>Tweet Store (NoSQL)</td><td><img class="svcicon" src="../assets/logos/services/aws-dynamodb.svg" alt="">DynamoDB / Keyspaces</td><td><img class="svcicon" src="../assets/logos/services/gcp-bigtable.svg" alt="">Bigtable</td><td><img class="svcicon" src="../assets/logos/services/azure-cosmos.svg" alt="">Cosmos DB</td></tr>
+            <tr><td>Trending (Redis)</td><td><img class="svcicon" src="../assets/logos/services/aws-elasticache.svg" alt="">ElastiCache</td><td><img class="svcicon" src="../assets/logos/services/gcp-memorystore.svg" alt="">Memorystore</td><td><img class="svcicon" src="../assets/logos/services/azure-redis.svg" alt="">Cache for Redis</td></tr>
+            <tr><td>User DB (relational)</td><td>RDS PostgreSQL</td><td>Cloud SQL</td><td>Azure SQL Database</td></tr>
+            <tr><td>Search</td><td>OpenSearch</td><td>Elasticsearch on GKE</td><td>Cognitive Search</td></tr>
+            <tr><td>Media</td><td>S3 + CloudFront</td><td>Cloud Storage + CDN</td><td>Blob Storage + CDN</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+
+  <!-- D · API -->
+  <section>
+    <div class="sec-h"><span class="n">D</span><h2>API design</h2><span class="tag">thin &amp; RESTful</span></div>
+    <table>
+      <thead><tr><th>Endpoint</th><th>Purpose</th><th>Response</th></tr></thead>
+      <tbody>
+        <tr><td><code>POST /api/tweets</code></td><td>publish (body: content, media_urls, reply_to_tweet_id)</td><td>201 + tweet_id (Snowflake)</td></tr>
+        <tr><td><code>GET /api/feed?cursor=&amp;limit=20</code></td><td>home timeline (the read hot path)</td><td>200 + tweets[] + next_cursor + has_more</td></tr>
+        <tr><td><code>GET /api/users/{id}/tweets</code></td><td>user timeline (reverse-chrono)</td><td>200 + tweets[] + next_cursor</td></tr>
+        <tr><td><code>POST</code> / <code>DELETE /api/users/{id}/follow</code></td><td>follow / unfollow</td><td>200 + status</td></tr>
+        <tr><td><code>POST /api/tweets/{id}/like</code> · <code>/retweet</code></td><td>like (toggle) / retweet</td><td>200 / 201 + updated counts</td></tr>
+        <tr><td><code>GET /api/trending?region=US&amp;window=6h</code></td><td>top trending hashtags by velocity</td><td>200 + ranked hashtags</td></tr>
+        <tr><td><code>GET /api/search?q=…&amp;type=recent</code></td><td>full-text tweet / hashtag search</td><td>200 + results[] + next_cursor</td></tr>
+      </tbody>
+    </table>
+    <p class="muted">Cursor-based pagination (not offset) keeps feed reads O(1) and stable as new tweets arrive — the cursor is the last <code>tweet_id</code>.</p>
+  </section>
+
+  <!-- E · DATA MODEL -->
+  <section>
+    <div class="sec-h"><span class="n">E</span><h2>Data model</h2><span class="tag">polyglot: Cassandra + Redis + Postgres</span></div>
+    <div class="grid g2">
+      <div class="card">
+        <div class="kicker">tweets — Cassandra (durable store)</div>
+        <pre class="code">tweet_id      BIGINT      <span class="cm">// Snowflake, time-sortable</span>
+user_id       BIGINT
+content       TEXT        <span class="cm">// ≤ 280 chars</span>
+media_urls    LIST&lt;TEXT&gt;  <span class="cm">// CDN links only</span>
+like_count    COUNTER
+retweet_count COUNTER
+hashtags      SET&lt;TEXT&gt;
+is_deleted    BOOLEAN     <span class="cm">// soft delete</span>
+created_at    TIMESTAMP
+<span class="cm">PRIMARY KEY (user_id, tweet_id)</span>
+<span class="cm">CLUSTERING ORDER BY (tweet_id DESC)</span></pre>
+        <p class="muted">Partition by <code>user_id</code> → a user's tweets co-located; clustering DESC → newest first (user timeline &amp; celebrity pull). Follow / like / retweet live in sibling Cassandra tables.</p>
+      </div>
+      <div class="card">
+        <div class="kicker">timeline:{user_id} — Redis sorted set (hot read)</div>
+        <pre class="code">Type   : Sorted Set (ZSET)
+Member : tweet_id
+Score  : tweet_timestamp (or rank score)
+
+ZADD     timeline:u_892 1713436200 "t_174928"
+ZREVRANGE timeline:u_892 0 19   <span class="cm">// newest 20</span>
+
+Max size : ~800 entries / user
+TTL      : 7 days (old entries age out)</pre>
+        <p class="muted">Pre-computed feed for normal-user tweets — populated by the Fan-Out Service, read in ~1–2 ms. Users live in <b>Postgres</b> (profiles, counts, <code>is_celebrity</code>); trending uses per-window ZSETs.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- F · KEY CHOICES -->
+  <section>
+    <div class="sec-h"><span class="n">F</span><h2>Key design choices (deep-dived on canvas 3)</h2><span class="tag">defend these</span></div>
+    <div class="grid g3">
+      <div class="card"><div class="kicker">fan-out strategy</div><h3>Hybrid push / pull</h3><p class="muted">Normal users → fan-out on write (fast reads); celebrities → fan-out on read (no 50M-write storm). Merged at read time. <span class="run">→ canvas 2 · LLD</span></p></div>
+      <div class="card"><div class="kicker">storage</div><h3>Polyglot</h3><p class="muted">Cassandra for write-heavy tweets, Redis for hot timelines, Postgres for small relational user/graph data. Right tool per access pattern.</p></div>
+      <div class="card"><div class="kicker">consistency</div><h3>AP · eventual</h3><p class="muted">A feed must never fail; a 5–10 s stale timeline is fine. Optimize the 600:1 read path. <span class="run">→ canvas 3</span></p></div>
+    </div>
+    <div class="callout tip" style="margin-top:12px"><b>Also on the deep-dive:</b> the celebrity problem &amp; dynamic reclassification · thundering herd on a viral celebrity tweet (singleflight + local cache) · trending by velocity · tweet-deletion &amp; unfollow via lazy read-time filtering. <span class="run">→ canvas 3 · Deep-dive &amp; Trade-offs</span></div>
+  </section>
+
+  <!-- GLOSSARY -->
+  <section>
+    <div class="sec-h"><span class="n">§</span><h2>Glossary — one-liners</h2><span class="tag">terms used above</span></div>
+    <div class="grid g2">
+      <div class="card"><table><tbody>
+        <tr><td><b>Fan-out on write</b></td><td>push a new tweet into every follower's timeline cache at post time</td></tr>
+        <tr><td><b>Fan-out on read</b></td><td>skip the push; pull the author's tweets when a follower loads their feed</td></tr>
+        <tr><td><b>Hybrid fan-out</b></td><td>write-path for normal users, read-path for celebrities, merged at read time</td></tr>
+        <tr><td><b>Celebrity problem</b></td><td>one high-follower post triggers tens of millions of timeline writes</td></tr>
+        <tr><td><b>Snowflake ID</b></td><td>64-bit time-sortable unique ID (timestamp + machine + sequence)</td></tr>
+        <tr><td><b>Sorted set (ZSET)</b></td><td>Redis structure ordering members by score — used for timelines &amp; trending</td></tr>
+      </tbody></table></div>
+      <div class="card"><table><tbody>
+        <tr><td><b>Timeline cache</b></td><td>the pre-computed home feed for a user, stored as a Redis ZSET</td></tr>
+        <tr><td><b>Social graph</b></td><td>the follower/following adjacency lists that drive fan-out</td></tr>
+        <tr><td><b>Cursor pagination</b></td><td>page by last-seen id (stable, O(1)) instead of numeric offset</td></tr>
+        <tr><td><b>Trending velocity</b></td><td>rank hashtags by spike vs baseline, not raw volume</td></tr>
+        <tr><td><b>Thundering herd</b></td><td>millions stampede one hot key when a celebrity tweets</td></tr>
+        <tr><td><b>AP (CAP)</b></td><td>favour Availability + Partition-tolerance over strong Consistency</td></tr>
+      </tbody></table></div>
+    </div>
+  </section>
+
+  <footer>
+    <p>Use case 05 · Social Media Feed — Canvas 1 of 3 (HLD). Grounded in <code>05-social-media-feed/docs/hld/</code>.</p>
+    <p class="run">This use case: HLD · <a href="lld.html">Canvas 2 · LLD</a> · <a href="deepdive.html">Canvas 3 · Deep-dive &amp; Trade-offs</a> &nbsp;|&nbsp; Next → <a href="lld.html">02 · LLD</a> &nbsp;|&nbsp; <a href="../index.html">Hub</a></p>
+  </footer>
+
+</div>
+<script src="../assets/canvas.js"></script>
+</body>
+</html>

@@ -1,0 +1,331 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>01 · URL Shortener — LLD</title>
+<link rel="stylesheet" href="../assets/canvas.css">
+</head>
+<body>
+<div class="wrap">
+
+  <header class="hero">
+    <h1>URL Shortener — Low-Level Design</h1>
+    <div class="sub">Use case 01 · Canvas 2 of 3. From boxes to classes: the actual Java object model. Start with the <b>interactive class map</b> — click a class to see its responsibility and how <code>AppConfig → Controller → Service → Strategy/Repository</code> is wired — then dig into Base62 encoding, the pluggable strategies, and the request sequences.</div>
+    <div class="badges">
+      <span class="badge lvl">Use case 01 · LLD</span>
+      <span class="badge">Canvas 2 of 3</span>
+      <span class="badge">interactive</span>
+      <span class="badge">OOP · Strategy · Builder · Repository</span>
+    </div>
+    <div class="legend">
+      <span><i class="dot" style="background:var(--eden)"></i> entry / composition root</span>
+      <span><i class="dot" style="background:var(--survivor)"></i> interface / contract</span>
+      <span><i class="dot" style="background:var(--old)"></i> concrete implementation</span>
+      <span><i class="dot" style="background:var(--warn)"></i> domain model</span>
+      <span><i class="dot" style="background:var(--muted)"></i> click a class for its role</span>
+    </div>
+  </header>
+
+  <!-- A · CLASS DESIGN (interactive class map) -->
+  <section>
+    <div class="sec-h"><span class="n">A</span><h2>Class design — click a class in the map</h2><span class="tag">the object model, wired</span></div>
+    <div>
+      <div class="arch">
+        <svg viewBox="0 0 740 350" width="100%" style="max-width:740px" role="img" aria-label="URL shortener class map">
+          <defs>
+            <marker id="ah" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" fill="var(--muted)"></path></marker>
+          </defs>
+
+          <!-- wiring arrows (under boxes) -->
+          <line class="arrow" x1="85" y1="68" x2="85" y2="108" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"></line>
+          <line class="arrow" x1="150" y1="132" x2="203" y2="132" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"></line>
+          <line class="arrow" x1="335" y1="124" x2="393" y2="74" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"></line>
+          <line class="arrow" x1="335" y1="140" x2="393" y2="188" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"></line>
+          <line class="arrow" x1="270" y1="154" x2="270" y2="198" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"></line>
+          <line class="arrow" x1="270" y1="244" x2="270" y2="288" stroke="var(--muted)" stroke-width="2" stroke-dasharray="4 3" marker-end="url(#ah)"></line>
+          <line class="arrow" x1="525" y1="60" x2="588" y2="42" stroke="var(--muted)" stroke-width="2" stroke-dasharray="4 3" marker-end="url(#ah)"></line>
+          <line class="arrow" x1="525" y1="66" x2="588" y2="92" stroke="var(--muted)" stroke-width="2" stroke-dasharray="4 3" marker-end="url(#ah)"></line>
+          <line class="arrow" x1="525" y1="72" x2="588" y2="144" stroke="var(--muted)" stroke-width="2" stroke-dasharray="4 3" marker-end="url(#ah)"></line>
+          <line class="arrow" x1="525" y1="192" x2="588" y2="198" stroke="var(--muted)" stroke-width="2" stroke-dasharray="4 3" marker-end="url(#ah)"></line>
+          <path class="arrow" d="M620,224 C 560,270 520,300 527,308" fill="none" stroke="var(--muted)" stroke-width="2" stroke-dasharray="4 3" marker-end="url(#ah)"></path>
+          <text x="94" y="92" fill="var(--faint)" font-size="9">wires</text>
+          <text x="158" y="126" fill="var(--faint)" font-size="9">uses</text>
+
+          <!-- nodes -->
+          <g data-node style="cursor:pointer" data-title="AppConfig  (config)" data-detail="<b>Role:</b> composition root / poor-man's DI container (Factory pattern).<br><b>Wiring:</b> static factory methods <code>createDefaultService()</code>, <code>createServiceWithStrategy(strategy)</code>, <code>createController()</code> new-up and connect the graph — Repository + EncodingStrategy → Service, then Service + AnalyticsService → Controller.<br><b>Constants:</b> BASE_URL=&quot;https://short.url&quot;, SHORT_CODE_LENGTH=7, DEFAULT_TTL_DAYS=365. The one place wiring changes."><rect x="20" y="24" width="130" height="44" rx="9" fill="var(--panel-2)" stroke="var(--eden)"></rect><text x="85" y="44" text-anchor="middle" fill="var(--eden)" font-size="12" font-weight="600">AppConfig</text><text x="85" y="59" text-anchor="middle" fill="var(--faint)" font-size="10">composition root</text></g>
+
+          <g data-node style="cursor:pointer" data-title="UrlShortenerController  (controller)" data-detail="<b>Role:</b> framework-free stand-in for a Spring @RestController.<br><b>Methods:</b> handleShortenRequest → 201, handleRedirect → 302, handleGetStats → 200, handleDelete → 204.<br><b>Wiring:</b> delegates business logic to UrlShortenerService; on each redirect it separately calls <code>analyticsService.recordClick(code, ip, userAgent)</code>."><rect x="20" y="110" width="130" height="44" rx="9" fill="var(--panel-2)" stroke="var(--border)"></rect><text x="85" y="130" text-anchor="middle" fill="var(--text)" font-size="12" font-weight="600">Controller</text><text x="85" y="145" text-anchor="middle" fill="var(--faint)" font-size="10">REST endpoints</text></g>
+
+          <g data-node style="cursor:pointer" data-title="UrlShortenerService  (service)" data-detail="<b>Role:</b> the orchestrator. Holds a <code>UrlRepository</code>, an <code>EncodingStrategy</code>, <code>baseUrl</code>, and an <code>AtomicLong counter</code> (starts at 100,000) for thread-safe IDs.<br><b>shortenUrl():</b> validateUrl → custom alias or generateUniqueCode() (collision retry ×3) → Url.builder() → repository.save().<br><b>redirect():</b> findByShortCode → isExpired() → incrementClickCount() → return originalUrl.<br>Depends only on the two <i>interfaces</i>."><rect x="205" y="110" width="130" height="44" rx="9" fill="var(--panel-2)" stroke="var(--border)"></rect><text x="270" y="130" text-anchor="middle" fill="var(--text)" font-size="12" font-weight="600">Service</text><text x="270" y="145" text-anchor="middle" fill="var(--faint)" font-size="10">orchestrator</text></g>
+
+          <g data-node style="cursor:pointer" data-title="AnalyticsService  (service)" data-detail="<b>Role:</b> simulated event-tracking service.<br><b>recordClick():</b> appends a ClickEvent to a <code>Collections.synchronizedList</code>.<br><b>getClickCount():</b> streams + filters the list by shortCode.<br><b>getRecentClicks():</b> reverses + limits. In production this fans out to Kafka/Kinesis and a time-series store (see canvas 1 · Kafka)."><rect x="205" y="200" width="130" height="44" rx="9" fill="var(--panel-2)" stroke="var(--border)"></rect><text x="270" y="220" text-anchor="middle" fill="var(--text)" font-size="12" font-weight="600">AnalyticsService</text><text x="270" y="235" text-anchor="middle" fill="var(--faint)" font-size="10">click tracking</text></g>
+
+          <g data-node style="cursor:pointer" data-title="ClickEvent  (model)" data-detail="<b>Role:</b> immutable analytics record.<br><b>Fields:</b> shortCode, timestamp (LocalDateTime), ipAddress, userAgent — all final, set through an all-args constructor.<br>Created by the controller per redirect and stored by AnalyticsService."><rect x="205" y="290" width="130" height="44" rx="9" fill="var(--panel-2)" stroke="var(--warn)"></rect><text x="270" y="310" text-anchor="middle" fill="var(--warn)" font-size="12" font-weight="600">ClickEvent</text><text x="270" y="325" text-anchor="middle" fill="var(--faint)" font-size="10">analytics record</text></g>
+
+          <g data-node style="cursor:pointer" data-title="EncodingStrategy  «interface»" data-detail="<b>Role:</b> the Strategy contract — <code>String encode(String input)</code> and <code>String name()</code>.<br><b>Why:</b> the Service depends on this interface only, so the short-code algorithm is swapped without touching service code (Open-Closed Principle). Three implementations ship today."><rect x="395" y="44" width="130" height="44" rx="9" fill="var(--panel-2)" stroke="var(--survivor)"></rect><text x="460" y="63" text-anchor="middle" fill="var(--survivor)" font-size="12" font-weight="600">EncodingStrategy</text><text x="460" y="78" text-anchor="middle" fill="var(--faint)" font-size="10">«interface»</text></g>
+
+          <g data-node style="cursor:pointer" data-title="Base62EncodingStrategy" data-detail="<b>Role:</b> converts the counter value to Base62 over alphabet <code>0-9a-zA-Z</code>, pads to 7 chars, reverses.<br><b>name()</b> = &quot;Base62&quot;. No collisions (sequential ids). <b>The default</b> strategy wired by AppConfig. 62⁷ ≈ 3.5 trillion codes. See section B for the worked example."><rect x="590" y="16" width="130" height="44" rx="9" fill="var(--panel-2)" stroke="var(--old)"></rect><text x="655" y="36" text-anchor="middle" fill="var(--old)" font-size="11" font-weight="600">Base62Strategy</text><text x="655" y="51" text-anchor="middle" fill="var(--faint)" font-size="10">id → base62</text></g>
+
+          <g data-node style="cursor:pointer" data-title="Md5EncodingStrategy" data-detail="<b>Role:</b> MD5-hashes the input URL, takes the first 7 hex chars.<br><b>name()</b> = &quot;MD5&quot;. Deterministic → same URL yields the same code (dedup-friendly), but only 16⁷ ≈ 268M codes from 7 hex chars, so collision handling is mandatory. Service appends <code>#attempt</code> on retry."><rect x="590" y="70" width="130" height="44" rx="9" fill="var(--panel-2)" stroke="var(--old)"></rect><text x="655" y="90" text-anchor="middle" fill="var(--old)" font-size="11" font-weight="600">Md5Strategy</text><text x="655" y="105" text-anchor="middle" fill="var(--faint)" font-size="10">hash + truncate</text></g>
+
+          <g data-node style="cursor:pointer" data-title="RandomEncodingStrategy" data-detail="<b>Role:</b> picks 7 chars from <code>0-9a-zA-Z</code> with <code>SecureRandom</code> (input ignored).<br><b>name()</b> = &quot;Random&quot;. Unpredictable / non-enumerable and needs no counter (distributed-friendly), but requires check-and-retry on collision."><rect x="590" y="124" width="130" height="44" rx="9" fill="var(--panel-2)" stroke="var(--old)"></rect><text x="655" y="144" text-anchor="middle" fill="var(--old)" font-size="11" font-weight="600">RandomStrategy</text><text x="655" y="159" text-anchor="middle" fill="var(--faint)" font-size="10">SecureRandom</text></g>
+
+          <g data-node style="cursor:pointer" data-title="UrlRepository  «interface»" data-detail="<b>Role:</b> the data-access contract — <code>findByShortCode</code>, <code>save</code>, <code>deleteByShortCode</code>, <code>existsByShortCode</code>, <code>count</code>.<br><b>Why:</b> the Service talks to this interface, so storage (in-memory today; DynamoDB / Postgres tomorrow) swaps without service changes. Repository pattern."><rect x="395" y="170" width="130" height="44" rx="9" fill="var(--panel-2)" stroke="var(--survivor)"></rect><text x="460" y="189" text-anchor="middle" fill="var(--survivor)" font-size="12" font-weight="600">UrlRepository</text><text x="460" y="204" text-anchor="middle" fill="var(--faint)" font-size="10">«interface»</text></g>
+
+          <g data-node style="cursor:pointer" data-title="InMemoryUrlRepository" data-detail="<b>Role:</b> the MVP implementation. <code>ConcurrentHashMap&lt;String,Url&gt;</code> keyed by shortCode → lock-free reads, safe concurrent writes.<br><b>Mapping:</b> save = put, deleteByShortCode = remove (hard delete), existsByShortCode = containsKey, count = size. The map key <i>is</i> the lookup index."><rect x="590" y="178" width="130" height="44" rx="9" fill="var(--panel-2)" stroke="var(--old)"></rect><text x="655" y="198" text-anchor="middle" fill="var(--old)" font-size="11" font-weight="600">InMemoryRepo</text><text x="655" y="213" text-anchor="middle" fill="var(--faint)" font-size="10">ConcurrentHashMap</text></g>
+
+          <g data-node style="cursor:pointer" data-title="Url  (model)" data-detail="<b>Role:</b> the core domain entity, built via the <b>Builder pattern</b> (<code>Url.builder()…build()</code>, which validates required originalUrl &amp; shortCode).<br><b>Fields:</b> id (UUID string), shortCode, originalUrl, createdAt, expiresAt, clickCount, customAlias, userId.<br><b>Logic:</b> isExpired() compares expiresAt to now; incrementClickCount() is <code>synchronized</code>."><rect x="395" y="290" width="130" height="44" rx="9" fill="var(--panel-2)" stroke="var(--warn)"></rect><text x="460" y="310" text-anchor="middle" fill="var(--warn)" font-size="12" font-weight="600">Url</text><text x="460" y="325" text-anchor="middle" fill="var(--faint)" font-size="10">«Builder» entity</text></g>
+        </svg>
+      </div>
+      <div class="node-detail"><span class="nd-title">Click any class</span><div class="nd-body">Its responsibility, key methods, and how it is wired appear here. The dashed arrows are <i>implements</i> / <i>creates</i>; solid arrows are <i>uses</i>. Notice the Service depends only on the two <b>«interface»</b> boxes — that is what makes strategies and storage swappable.</div></div>
+    </div>
+  </section>
+
+  <!-- B · BASE62 ENCODING -->
+  <section>
+    <div class="sec-h"><span class="n">B</span><h2>Base62 encoding — the core algorithm</h2><span class="tag">Base62EncodingStrategy</span></div>
+    <div class="grid g2">
+      <div class="card">
+        <div class="kicker">the code (verbatim)</div>
+        <pre class="code"><span class="kw">public</span> String <span class="ty">encode</span>(String input) {
+  <span class="kw">long</span> number = Long.parseLong(input);
+  StringBuilder enc = <span class="kw">new</span> StringBuilder();
+  <span class="cm">// decimal → base62</span>
+  <span class="kw">while</span> (number &gt; 0) {
+    <span class="kw">int</span> r = (<span class="kw">int</span>)(number % <span class="num">62</span>);
+    enc.append(BASE62_CHARS.charAt(r));
+    number /= <span class="num">62</span>;
+  }
+  <span class="cm">// pad to length 7, then flip</span>
+  <span class="kw">while</span> (enc.length() &lt; <span class="num">7</span>) enc.append(<span class="st">'0'</span>);
+  <span class="kw">return</span> enc.reverse().toString()
+            .substring(<span class="num">0</span>, <span class="num">7</span>);
+}</pre>
+        <p class="muted"><code>BASE62_CHARS = "0123456789a…zA…Z"</code> — index 0-61.</p>
+      </div>
+      <div class="card">
+        <div class="kicker">worked example — encode the first id</div>
+        <pre class="code"><span class="cm">// counter starts at 100_000</span>
+nextId() = <span class="num">100001</span>
+
+100001 % 62 = <span class="num">57</span> → <span class="st">'V'</span>   100001 / 62 = 1612
+  1612 % 62 = <span class="num">0</span>  → <span class="st">'0'</span>     1612 / 62 =   26
+    26 % 62 = <span class="num">26</span> → <span class="st">'q'</span>       26 / 62 =    0  <span class="cm">■ stop</span>
+
+append order → <span class="st">"V0q"</span>
+pad to 7     → <span class="st">"V0q0000"</span>
+reverse      → <span class="st">"0000q0V"</span>
+final code   → <span class="st">"0000q0V"</span></pre>
+        <p class="muted">Padding is <b>appended before</b> the reverse, so the zeros land as a prefix. Once the counter climbs past ~3.5B the code fills all 7 chars naturally.</p>
+      </div>
+    </div>
+    <div class="callout tip"><b>Why Base62?</b> The 62-char alphabet <code>[0-9a-zA-Z]</code> is URL-safe (no <code>+ / =</code> escaping like Base64) and case-sensitive, so 7 chars give 62⁷ ≈ <b>3.5 trillion</b> codes — far denser than Base10 (10⁷ = 10M) or hex (16⁷ ≈ 268M). Encoding a monotonic counter guarantees <b>zero collisions</b> without a lookup. The trade-off — a globally unique counter is a point of contention — is exactly the distributed-ID problem canvas 3 tackles.</div>
+  </section>
+
+  <!-- C · STRATEGIES COMPARED (tabs) -->
+  <section>
+    <div class="sec-h"><span class="n">C</span><h2>Code-generation strategies (Strategy pattern)</h2><span class="tag">swap the algorithm, not the service</span></div>
+    <div data-tabscope>
+      <div class="tabs">
+        <button class="tab active" data-tab="b62">Base62 · id</button>
+        <button class="tab" data-tab="md5">MD5 · hash+truncate</button>
+        <button class="tab" data-tab="rnd">Random</button>
+        <button class="tab" data-tab="beyond">Beyond MVP</button>
+      </div>
+      <div class="tabpanel active" data-panel="b62">
+        <p><b>Base62EncodingStrategy</b> — encodes the service's <code>AtomicLong</code> counter value. <span class="run">name() = "Base62" · the default in AppConfig</span></p>
+        <ul class="tight">
+          <li><b>Collisions:</b> none — sequential ids are unique by construction.</li>
+          <li><b>Predictability:</b> sequential → a client can enumerate neighbouring codes.</li>
+          <li><b>Cost:</b> O(log₆₂ n) — a handful of divisions. Best general-purpose choice.</li>
+        </ul>
+      </div>
+      <div class="tabpanel" data-panel="md5">
+        <p><b>Md5EncodingStrategy</b> — <code>MD5(url)</code> then first 7 hex chars. <span class="run">name() = "MD5"</span></p>
+        <ul class="tight">
+          <li><b>Deterministic:</b> same URL → same code, so it doubles as deduplication.</li>
+          <li><b>Collisions:</b> only 16⁷ ≈ 268M codes from 7 hex chars → mandatory retry; the service appends <code>"#" + attempt</code> to the input on each retry.</li>
+          <li><b>Cost:</b> O(n) over the URL bytes to hash. Best for content-addressed links.</li>
+        </ul>
+      </div>
+      <div class="tabpanel" data-panel="rnd">
+        <p><b>RandomEncodingStrategy</b> — 7 chars from <code>[0-9a-zA-Z]</code> via <code>SecureRandom</code>, input ignored. <span class="run">name() = "Random"</span></p>
+        <ul class="tight">
+          <li><b>Unpredictable:</b> non-enumerable → good when you don't want users guessing links.</li>
+          <li><b>No counter:</b> nothing to coordinate → naturally distributed-friendly.</li>
+          <li><b>Collisions:</b> low over 62⁷ but non-zero → check-and-retry required.</li>
+        </ul>
+      </div>
+      <div class="tabpanel" data-panel="beyond">
+        <p>Not implemented in the repo, but the interfaces make them drop-in — implement <code>EncodingStrategy</code> and register in <code>AppConfig</code>:</p>
+        <ul class="tight">
+          <li><b>KGS (Key Generation Service):</b> pre-generates random unique codes offline into a table; the service just claims the next unused key. No runtime hashing, no collisions, not guessable — the canvas-1 HLD choice.</li>
+          <li><b>Snowflake:</b> 64-bit id = timestamp + machine-id + sequence, then Base62 it. Distributed, coordination-free, roughly time-sortable — the answer to Base62's single-counter bottleneck.</li>
+        </ul>
+      </div>
+    </div>
+    <table>
+      <thead><tr><th>Aspect</th><th>Base62 (id)</th><th>MD5 (hash)</th><th>Random</th><th>KGS / Snowflake</th></tr></thead>
+      <tbody>
+        <tr><td>Collision risk</td><td>none (sequential)</td><td>medium (268M space)</td><td>low (3.5T space)</td><td>none / negligible</td></tr>
+        <tr><td>Guessable?</td><td>yes (sequential)</td><td>deterministic</td><td>no</td><td>no</td></tr>
+        <tr><td>Deduplication</td><td>no</td><td>yes</td><td>no</td><td>no</td></tr>
+        <tr><td>Distributed</td><td>needs shared counter</td><td>stateless</td><td>stateless</td><td>yes (built for it)</td></tr>
+        <tr><td>Best for</td><td>general use</td><td>content-addressed</td><td>security-sensitive</td><td>production scale</td></tr>
+      </tbody>
+    </table>
+    <div class="callout"><b>The pattern:</b> <code>UrlShortenerService</code> holds a single <code>EncodingStrategy</code> field and never branches on algorithm type — it just calls <code>strategy.encode(input)</code>. Adding <code>Sha256EncodingStrategy</code> is a new class + one line in <code>AppConfig</code>, with <b>zero</b> changes to the service, controller, or repository (Open-Closed Principle).</div>
+  </section>
+
+  <!-- D · DATA MODEL -->
+  <section>
+    <div class="sec-h"><span class="n">D</span><h2>Data model detail</h2><span class="tag">Url + ClickEvent</span></div>
+    <div class="grid g2">
+      <div class="card">
+        <div class="kicker">Url — url_mapping (hot lookup)</div>
+        <pre class="code">id          String   <span class="cm">// UUID</span>
+shortCode   String   <span class="cm">// KEY — the lookup index</span>
+originalUrl String
+createdAt   LocalDateTime
+expiresAt   LocalDateTime  <span class="cm">// nullable → TTL</span>
+clickCount  long           <span class="cm">// synchronized ++</span>
+customAlias String   <span class="cm">// nullable</span>
+userId      String   <span class="cm">// nullable</span></pre>
+        <p class="muted">Immutable except <code>clickCount</code>. In the MVP the <code>ConcurrentHashMap</code> key is <code>shortCode</code> — that map key <i>is</i> the unique index. In a SQL store: <code>UNIQUE(short_code)</code> + a secondary index on <code>expires_at</code> for a TTL sweep.</p>
+      </div>
+      <div class="card">
+        <div class="kicker">ClickEvent — click_events (append-only)</div>
+        <pre class="code">shortCode  String
+timestamp  LocalDateTime
+ipAddress  String
+userAgent  String</pre>
+        <p class="muted">Fully immutable (all-args constructor, all fields final). Held in a <code>Collections.synchronizedList</code> in <code>AnalyticsService</code>; <code>getClickCount</code> is a stream-filter over that list. In production this is an append-only stream keyed / partitioned by <code>short_code</code>, indexed on <code>(short_code, timestamp)</code> for time-series queries.</p>
+      </div>
+    </div>
+    <div class="callout tip"><b>Two counters, on purpose:</b> <code>Url.clickCount</code> is a denormalized total incremented on the redirect hot path (fast read for stats); the <code>ClickEvent</code> list is the detailed audit trail queried off-path. Canvas 1 shows why the detailed events flow through Kafka rather than blocking the redirect.</div>
+  </section>
+
+  <!-- E · REQUEST SEQUENCES -->
+  <section>
+    <div class="sec-h"><span class="n">E</span><h2>Request handling sequence</h2><span class="tag">which class does what, in order</span></div>
+
+    <div class="collapsible open">
+      <div class="c-head"><h3>POST /api/shorten &nbsp;→&nbsp; create a short URL</h3></div>
+      <div class="c-body">
+        <pre class="code"><span class="cm">Controller.handleShortenRequest(request)</span>
+  └─ Service.shortenUrl(request)
+       1  validateUrl(originalUrl)          <span class="cm">// regex → InvalidUrlException</span>
+       2  customAlias present?
+            yes → shortCode = alias
+                  existsByShortCode(alias)? → DuplicateAliasException
+            no  → generateUniqueCode():
+                    counter.incrementAndGet() → strategy.encode(id)
+                    existsByShortCode(code)? retry (max 3)
+       3  Url.builder().id(UUID).shortCode(code)
+              .originalUrl(..).createdAt(now)
+              .expiresAt(now + 365d).build()
+       4  repository.save(url)              <span class="cm">// map.put(shortCode, url)</span>
+       5  return UrlShortenResponse(baseUrl + "/" + code, ...)
+  └─ [201 Created]</pre>
+      </div>
+    </div>
+
+    <div class="collapsible open">
+      <div class="c-head"><h3>GET /{shortCode} &nbsp;→&nbsp; redirect</h3></div>
+      <div class="c-body">
+        <pre class="code"><span class="cm">Controller.handleRedirect(shortCode)</span>
+  └─ Service.redirect(shortCode)
+       1  repository.findByShortCode(code)  <span class="cm">// Optional</span>
+            empty? → UrlNotFoundException   <span class="cm">// 404</span>
+       2  url.isExpired()? → UrlExpiredException  <span class="cm">// 410 Gone</span>
+       3  url.incrementClickCount()         <span class="cm">// synchronized</span>
+       4  return url.getOriginalUrl()
+  └─ analyticsService.recordClick(code, ip, userAgent)  <span class="cm">// off to the side</span>
+  └─ [302 Redirect] Location: originalUrl</pre>
+        <p class="muted">Note the click is recorded by the <b>controller</b> after the service returns — the service's <code>redirect()</code> stays focused on resolution, and analytics never blocks the returned URL.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- F · DESIGN PATTERNS -->
+  <section>
+    <div class="sec-h"><span class="n">F</span><h2>Design patterns used</h2><span class="tag">GoF-categorized</span></div>
+    <div class="grid g3">
+      <div class="card">
+        <div class="kicker">Creational</div>
+        <ul class="tight">
+          <li><b>Builder</b> — <code>Url.builder()</code>. Readable construction of an 8-field entity; <code>build()</code> enforces required fields.</li>
+          <li><b>Factory</b> — <code>AppConfig</code> static factory methods centralise all wiring (composition root).</li>
+          <li><b>Singleton (conceptual)</b> — one shared <code>AtomicLong</code> counter is the single source of truth for the next id.</li>
+        </ul>
+      </div>
+      <div class="card">
+        <div class="kicker">Behavioral</div>
+        <ul class="tight">
+          <li><b>Strategy</b> — <code>EncodingStrategy</code> + Base62 / Md5 / Random. The centrepiece: swap the algorithm without touching the service.</li>
+          <li><b>Template-style workflow</b> — <code>shortenUrl()</code> fixes the skeleton validate → generate → build → save; the varying step (encode) is the injected strategy.</li>
+        </ul>
+      </div>
+      <div class="card">
+        <div class="kicker">Architectural (not GoF)</div>
+        <ul class="tight">
+          <li><b>Repository</b> — <code>UrlRepository</code> → <code>InMemoryUrlRepository</code>. Decouples business logic from storage; swap in JPA / Cassandra with no service change.</li>
+          <li><b>Dependency Injection</b> — constructor injection everywhere, wired by hand in AppConfig (Spring @Configuration in production).</li>
+        </ul>
+      </div>
+    </div>
+    <div class="callout"><b>Why they cluster:</b> Strategy + Repository + DI together deliver the Open-Closed Principle — new encodings and new storage backends are <i>additions</i>, never edits. Builder keeps the entity immutable and thread-safe; the Singleton counter and <code>ConcurrentHashMap</code> keep the write path lock-light. <span class="run">→ trade-offs &amp; the distributed-ID follow-up on canvas 3</span></div>
+  </section>
+
+  <!-- RUN IT -->
+  <section>
+    <div class="sec-h"><span class="n">▶</span><h2>Run it — repo file map</h2><span class="tag">concept → actual Java class</span></div>
+    <table>
+      <thead><tr><th>Concept above</th><th>File in <code>01-url-shortener/src/main/java/…/urlshortener/</code></th></tr></thead>
+      <tbody>
+        <tr><td>Composition root / wiring</td><td><code>config/AppConfig.java</code></td></tr>
+        <tr><td>REST endpoints</td><td><code>controller/UrlShortenerController.java</code></td></tr>
+        <tr><td>Orchestrator + counter + collision retry</td><td><code>service/UrlShortenerService.java</code></td></tr>
+        <tr><td>Click tracking</td><td><code>service/AnalyticsService.java</code></td></tr>
+        <tr><td>Strategy contract</td><td><code>strategy/EncodingStrategy.java</code></td></tr>
+        <tr><td>Encoders (§B, §C)</td><td><code>strategy/Base62EncodingStrategy.java</code> · <code>Md5EncodingStrategy.java</code> · <code>RandomEncodingStrategy.java</code></td></tr>
+        <tr><td>Storage contract + impl</td><td><code>repository/UrlRepository.java</code> · <code>InMemoryUrlRepository.java</code></td></tr>
+        <tr><td>Domain models (§D)</td><td><code>model/Url.java</code> · <code>model/ClickEvent.java</code> · <code>UrlShortenRequest.java</code> · <code>UrlShortenResponse.java</code></td></tr>
+        <tr><td>Exceptions (404 / 409 / 410 / 400)</td><td><code>exception/UrlNotFoundException.java</code> · <code>DuplicateAliasException.java</code> · <code>UrlExpiredException.java</code> · <code>InvalidUrlException.java</code></td></tr>
+        <tr><td>Runnable demo (main)</td><td><code>UrlShortenerApp.java</code></td></tr>
+      </tbody>
+    </table>
+    <div class="callout tip"><b>Run the demo</b> (Gradle <code>application</code> plugin, mainClass <code>UrlShortenerApp</code>, no framework):<br><pre class="code">./gradlew :01-url-shortener:run</pre>It shortens a few URLs, exercises a custom alias, redirects, prints stats, triggers the not-found and delete paths, and finally prints all three strategies side-by-side.</div>
+  </section>
+
+  <!-- GLOSSARY -->
+  <section>
+    <div class="sec-h"><span class="n">§</span><h2>Glossary — one-liners</h2><span class="tag">terms used above</span></div>
+    <div class="grid g2">
+      <div class="card"><table><tbody>
+        <tr><td><b>Strategy pattern</b></td><td>family of interchangeable algorithms behind one interface, chosen at runtime</td></tr>
+        <tr><td><b>Builder pattern</b></td><td>fluent step-by-step construction of an immutable object with optional fields</td></tr>
+        <tr><td><b>Repository pattern</b></td><td>interface over data access so storage can be swapped without touching logic</td></tr>
+        <tr><td><b>Composition root</b></td><td>the single place (AppConfig) where the object graph is wired</td></tr>
+        <tr><td><b>Open-Closed Principle</b></td><td>open to extension (new classes), closed to modification (no edits)</td></tr>
+      </tbody></table></div>
+      <div class="card"><table><tbody>
+        <tr><td><b>Base62</b></td><td>[0-9a-zA-Z] encoding; 62⁷ ≈ 3.5T 7-char codes, URL-safe</td></tr>
+        <tr><td><b>AtomicLong</b></td><td>lock-free CAS counter — thread-safe id/click increments without synchronized</td></tr>
+        <tr><td><b>ConcurrentHashMap</b></td><td>lock-striped map giving safe concurrent reads/writes</td></tr>
+        <tr><td><b>TOCTOU</b></td><td>check-then-act race; fixed with an atomic putIfAbsent for alias reservation</td></tr>
+        <tr><td><b>Soft vs hard delete</b></td><td>MVP does a hard <code>map.remove</code>; a deleted flag would keep an audit trail</td></tr>
+      </tbody></table></div>
+    </div>
+  </section>
+
+  <footer>
+    <p>Use case 01 · URL Shortener — Canvas 2 of 3 (LLD). Grounded in <code>01-url-shortener/docs/lld/</code>, <code>docs/patterns/</code>, and the Java under <code>src/main/java/com/systemdesign/urlshortener</code>.</p>
+    <p class="run">This use case: <a href="hld.html">Canvas 1 · HLD</a> · LLD · <a href="deepdive.html">Canvas 3 · Deep-dive &amp; Trade-offs</a> &nbsp;|&nbsp; Next → <a href="deepdive.html">Canvas 3 · Deep-dive &amp; Trade-offs</a> &nbsp;|&nbsp; <a href="../index.html">Hub</a></p>
+  </footer>
+
+</div>
+<script src="../assets/canvas.js"></script>
+</body>
+</html>

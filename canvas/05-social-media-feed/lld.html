@@ -1,0 +1,373 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>05 · Social Media Feed — LLD</title>
+<link rel="stylesheet" href="../assets/canvas.css">
+</head>
+<body>
+<div class="wrap">
+
+  <header class="hero">
+    <h1>Social Media Feed — Low-Level Design</h1>
+    <div class="sub">Use case 05 · Canvas 2 of 3. From boxes to classes: the actual Java object model of a Twitter/X-style feed. Start with the <b>interactive class map</b> — click a class to see its responsibility and how <code>AppConfig → Controller → TweetService/FeedService → FanoutStrategy/FeedRanker/Repository</code> is wired — then dig into the hybrid fan-out algorithm, the pluggable strategies, and the read/write request sequences.</div>
+    <div class="badges">
+      <span class="badge lvl">Use case 05 · LLD</span>
+      <span class="badge">Canvas 2 of 3</span>
+      <span class="badge">interactive</span>
+      <span class="badge">Strategy · Composite · Builder · Repository</span>
+    </div>
+    <div class="legend">
+      <span><i class="dot" style="background:var(--eden)"></i> entry / composition root</span>
+      <span><i class="dot" style="background:var(--survivor)"></i> interface / contract</span>
+      <span><i class="dot" style="background:var(--old)"></i> concrete implementation</span>
+      <span><i class="dot" style="background:var(--warn)"></i> domain model</span>
+      <span><i class="dot" style="background:var(--muted)"></i> click a class for its role</span>
+    </div>
+  </header>
+
+  <!-- A · CLASS DESIGN (interactive class map) -->
+  <section>
+    <div class="sec-h"><span class="n">A</span><h2>Class design — click a class in the map</h2><span class="tag">the object model, wired</span></div>
+    <div>
+      <div class="arch">
+        <svg viewBox="0 0 760 430" width="100%" style="max-width:760px" role="img" aria-label="Social media feed class map">
+          <defs>
+            <marker id="ah" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" fill="var(--muted)"></path></marker>
+          </defs>
+
+          <!-- wiring arrows -->
+          <line class="arrow" x1="85" y1="66" x2="85" y2="104" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"></line>
+          <line class="arrow" x1="150" y1="118" x2="198" y2="96" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"></line>
+          <line class="arrow" x1="150" y1="134" x2="198" y2="196" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"></line>
+          <line class="arrow" x1="330" y1="88" x2="388" y2="88" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"></line>
+          <line class="arrow" x1="330" y1="204" x2="388" y2="230" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"></line>
+          <line class="arrow" x1="453" y1="104" x2="453" y2="150" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"></line>
+          <line class="arrow" x1="518" y1="166" x2="578" y2="140" stroke="var(--muted)" stroke-width="2" stroke-dasharray="4 3" marker-end="url(#ah)"></line>
+          <line class="arrow" x1="518" y1="176" x2="578" y2="204" stroke="var(--muted)" stroke-width="2" stroke-dasharray="4 3" marker-end="url(#ah)"></line>
+          <line class="arrow" x1="640" y1="164" x2="640" y2="150" stroke="var(--muted)" stroke-width="2" stroke-dasharray="4 3" marker-end="url(#ah)"></line>
+          <line class="arrow" x1="518" y1="240" x2="578" y2="300" stroke="var(--muted)" stroke-width="2" stroke-dasharray="4 3" marker-end="url(#ah)"></line>
+          <line class="arrow" x1="453" y1="252" x2="453" y2="322" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"></line>
+          <line class="arrow" x1="263" y1="228" x2="263" y2="322" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"></line>
+          <text x="94" y="90" fill="var(--faint)" font-size="9">wires</text>
+          <text x="338" y="82" fill="var(--faint)" font-size="9">uses</text>
+
+          <!-- nodes -->
+          <g data-node style="cursor:pointer" data-title="AppConfig  (config)" data-detail="<b>Role:</b> composition root / poor-man's DI container (Factory pattern) — a plain constructor that news-up and wires the whole graph.<br><b>Wiring:</b> creates the 5 in-memory repositories, builds a <code>HybridFanoutStrategy(new FanoutOnWriteStrategy(), new FanoutOnReadStrategy(), User.CELEBRITY_THRESHOLD)</code>, then assembles FanoutService, TrendingService, TweetService, FollowService, FeedService (with an <code>EngagementRanker</code>) and finally the FeedController.<br><b>Seed:</b> seeds 6 users (alice/bob/carol/dave normal, elon 50M &amp; taylor 30M celebrities) and a follow graph. The one place wiring changes."><rect x="20" y="22" width="130" height="44" rx="9" fill="var(--panel-2)" stroke="var(--eden)"></rect><text x="85" y="42" text-anchor="middle" fill="var(--eden)" font-size="12" font-weight="600">AppConfig</text><text x="85" y="57" text-anchor="middle" fill="var(--faint)" font-size="10">composition root</text></g>
+
+          <g data-node style="cursor:pointer" data-title="FeedController  (controller)" data-detail="<b>Role:</b> framework-free stand-in for a Spring @RestController.<br><b>Methods:</b> handlePostTweet → tweet, handleGetFeed → feed, handleGetUserTimeline, handleFollow / handleUnfollow, handleLike / handleRetweet.<br><b>Wiring:</b> delegates to TweetService (writes), FeedService (reads), FollowService (graph) and TrendingService — pure pass-through with logging."><rect x="20" y="106" width="130" height="44" rx="9" fill="var(--panel-2)" stroke="var(--border)"></rect><text x="85" y="126" text-anchor="middle" fill="var(--text)" font-size="12" font-weight="600">FeedController</text><text x="85" y="141" text-anchor="middle" fill="var(--faint)" font-size="10">REST endpoints</text></g>
+
+          <g data-node style="cursor:pointer" data-title="TweetService  (write path)" data-detail="<b>Role:</b> the write-path orchestrator.<br><b>postTweet():</b> validate user → <code>Tweet.Builder</code> (UUID id) → <code>tweetRepo.save</code> → <code>fanoutService.processTweet</code> → <code>trendingService.recordTweet</code>.<br><b>Also:</b> deleteTweet (soft delete), likeTweet, retweetTweet — all look the tweet up by id and mutate its atomic counters."><rect x="198" y="72" width="132" height="44" rx="9" fill="var(--panel-2)" stroke="var(--border)"></rect><text x="264" y="92" text-anchor="middle" fill="var(--text)" font-size="12" font-weight="600">TweetService</text><text x="264" y="107" text-anchor="middle" fill="var(--faint)" font-size="10">write path</text></g>
+
+          <g data-node style="cursor:pointer" data-title="FeedService  (read path — THE core)" data-detail="<b>Role:</b> the read-path Mediator — where the hybrid model comes together.<br><b>generateFeed():</b> (1) pull pre-computed timeline from cache · (2) find celebrity followees · (3) pull their latest tweets (<code>CELEBRITY_TWEETS_PER_USER=3</code>) · (4) merge · (5) dedup by tweetId · (6) drop soft-deleted · (7) rank via FeedRanker · (8) take top N.<br><b>Depends only on interfaces:</b> repositories + FeedRanker."><rect x="198" y="182" width="132" height="44" rx="9" fill="var(--panel-2)" stroke="var(--border)"></rect><text x="264" y="202" text-anchor="middle" fill="var(--text)" font-size="12" font-weight="600">FeedService</text><text x="264" y="217" text-anchor="middle" fill="var(--faint)" font-size="10">read path · merge+rank</text></g>
+
+          <g data-node style="cursor:pointer" data-title="FanoutService  (orchestrator)" data-detail="<b>Role:</b> the bridge between &quot;tweet created&quot; and &quot;tweet distributed&quot;.<br><b>processTweet(tweet):</b> look up poster → <code>followRepo.getFollowerIds</code> → <code>strategy.fanout(tweet, poster, followerIds, timelineCache)</code> → returns follower count. Tracks <code>AtomicInteger</code> stats (tweets processed, total fan-outs)."><rect x="388" y="66" width="130" height="44" rx="9" fill="var(--panel-2)" stroke="var(--border)"></rect><text x="453" y="86" text-anchor="middle" fill="var(--text)" font-size="12" font-weight="600">FanoutService</text><text x="453" y="101" text-anchor="middle" fill="var(--faint)" font-size="10">orchestrator</text></g>
+
+          <g data-node style="cursor:pointer" data-title="FanoutStrategy  «interface»" data-detail="<b>Role:</b> THE key abstraction — <code>void fanout(Tweet, User poster, List&lt;String&gt; followerIds, TimelineCacheRepository cache)</code> and <code>String name()</code>.<br><b>Why:</b> FanoutService holds one FanoutStrategy and never branches on distribution type — swap push/pull/hybrid without touching orchestration (Open-Closed)."><rect x="388" y="150" width="130" height="44" rx="9" fill="var(--panel-2)" stroke="var(--survivor)"></rect><text x="453" y="170" text-anchor="middle" fill="var(--survivor)" font-size="12" font-weight="600">FanoutStrategy</text><text x="453" y="185" text-anchor="middle" fill="var(--faint)" font-size="10">«interface»</text></g>
+
+          <g data-node style="cursor:pointer" data-title="HybridFanoutStrategy  (THE answer)" data-detail="<b>Role:</b> Strategy + <b>Composite</b> — holds a FanoutOnWriteStrategy and a FanoutOnReadStrategy plus a <code>celebrityThreshold</code>.<br><b>fanout():</b> if <code>poster.isCelebrity()</code> → delegate to READ (no-op push); else → delegate to WRITE (push to every follower cache). This is what Twitter/X actually does and the interview centrepiece."><rect x="578" y="118" width="132" height="44" rx="9" fill="var(--panel-2)" stroke="var(--old)"></rect><text x="644" y="138" text-anchor="middle" fill="var(--old)" font-size="11" font-weight="600">HybridFanoutStrategy</text><text x="644" y="153" text-anchor="middle" fill="var(--faint)" font-size="10">composite · the answer</text></g>
+
+          <g data-node style="cursor:pointer" data-title="FanoutOnWrite / FanoutOnRead" data-detail="<b>FanoutOnWriteStrategy (push):</b> loops followerIds and does <code>timelineCache.addToTimeline(followerId, new FeedItem(tweet, freshness, FANOUT_WRITE))</code>. O(followers) writes, O(1) reads.<br><b>FanoutOnReadStrategy (pull):</b> intentionally a <b>no-op</b> — the tweet stays in the poster's TweetRepository and is pulled at read time. O(1) writes, avoids write amplification for celebrities."><rect x="578" y="188" width="132" height="44" rx="9" fill="var(--panel-2)" stroke="var(--old)"></rect><text x="644" y="205" text-anchor="middle" fill="var(--old)" font-size="10.5" font-weight="600">FanoutOnWrite / Read</text><text x="644" y="220" text-anchor="middle" fill="var(--faint)" font-size="10">push · pull leaves</text></g>
+
+          <g data-node style="cursor:pointer" data-title="FeedRanker  «interface»" data-detail="<b>Role:</b> the second Strategy axis — <code>List&lt;FeedItem&gt; rank(List&lt;FeedItem&gt;)</code> and <code>String name()</code>. Implementations may mutate each item's score, then sort.<br><b>Why:</b> FeedService orders the merged feed through this interface, so chronological vs. engagement (vs. a future ML ranker) is a per-cohort swap with no service change."><rect x="388" y="234" width="130" height="44" rx="9" fill="var(--panel-2)" stroke="var(--survivor)"></rect><text x="453" y="254" text-anchor="middle" fill="var(--survivor)" font-size="12" font-weight="600">FeedRanker</text><text x="453" y="269" text-anchor="middle" fill="var(--faint)" font-size="10">«interface»</text></g>
+
+          <g data-node style="cursor:pointer" data-title="EngagementRanker / ChronologicalRanker" data-detail="<b>EngagementRanker (wired default):</b> score = freshnessFactor × (likes·1 + retweets·2 + replies·1.5 + 1), where freshnessFactor = 1/(1 + hoursAge·0.1). The modern &quot;For You&quot; feed.<br><b>ChronologicalRanker:</b> score = 1000/(1 + secondsAgo·0.01) — pure recency, the &quot;Latest&quot; tab. Both sort by score descending."><rect x="578" y="278" width="132" height="44" rx="9" fill="var(--panel-2)" stroke="var(--old)"></rect><text x="644" y="295" text-anchor="middle" fill="var(--old)" font-size="10.5" font-weight="600">Engagement / Chrono</text><text x="644" y="310" text-anchor="middle" fill="var(--faint)" font-size="10">ranker impls</text></g>
+
+          <g data-node style="cursor:pointer" data-title="Repositories  «interface» ×5" data-detail="<b>Role:</b> the data-access contracts — TweetRepository, UserRepository, FollowRepository, TimelineCacheRepository, TrendingRepository. Each backed today by an <code>InMemory…</code> class over <code>ConcurrentHashMap</code>.<br><b>Why:</b> services talk to interfaces, so storage swaps to Cassandra / Redis / Postgres with no business-logic change (Repository pattern)."><rect x="388" y="322" width="130" height="44" rx="9" fill="var(--panel-2)" stroke="var(--survivor)"></rect><text x="453" y="342" text-anchor="middle" fill="var(--survivor)" font-size="11.5" font-weight="600">Repositories ×5</text><text x="453" y="357" text-anchor="middle" fill="var(--faint)" font-size="10">«interface» + InMemory</text></g>
+
+          <g data-node style="cursor:pointer" data-title="Tweet · User · FeedItem  (models)" data-detail="<b>Tweet:</b> immutable via <b>Builder</b> (validates id/user/content, ≤280 chars, auto-extracts #hashtags); atomic like/retweet/reply counters; volatile <code>deleted</code> flag (soft delete).<br><b>User:</b> followerCount + <code>isCelebrity()</code> against <code>CELEBRITY_THRESHOLD=10_000</code>; synchronized increment/decrement that flips UserType NORMAL↔CELEBRITY.<br><b>FeedItem:</b> wraps a Tweet with a mutable score + FeedSource; <code>compareTo</code> = higher score first."><rect x="198" y="322" width="132" height="44" rx="9" fill="var(--panel-2)" stroke="var(--warn)"></rect><text x="264" y="342" text-anchor="middle" fill="var(--warn)" font-size="11" font-weight="600">Tweet · User · FeedItem</text><text x="264" y="357" text-anchor="middle" fill="var(--faint)" font-size="10">domain models</text></g>
+        </svg>
+      </div>
+      <div class="node-detail"><span class="nd-title">Click any class</span><div class="nd-body">Its responsibility, key methods, and how it is wired appear here. Dashed arrows are <i>implements</i> / <i>delegates</i>; solid arrows are <i>uses</i>. Notice both <code>FanoutService</code> and <code>FeedService</code> depend only on the <b>«interface»</b> boxes — that is what makes the fan-out algorithm, the ranker, and every storage backend swappable.</div></div>
+    </div>
+  </section>
+
+  <!-- B · HYBRID FAN-OUT ALGORITHM -->
+  <section>
+    <div class="sec-h"><span class="n">B</span><h2>Hybrid fan-out — the core algorithm</h2><span class="tag">HybridFanoutStrategy + FeedService</span></div>
+    <div class="grid g2">
+      <div class="card">
+        <div class="kicker">the decision (verbatim)</div>
+        <pre class="code"><span class="cm">// HybridFanoutStrategy.fanout(...)</span>
+<span class="kw">boolean</span> isCeleb = poster.<span class="ty">isCelebrity</span>();
+<span class="cm">// isCelebrity() = followerCount &gt;= 10_000</span>
+
+<span class="kw">if</span> (isCeleb) {
+  <span class="cm">// PULL — do nothing now</span>
+  readStrategy.fanout(tweet, poster,
+      followerIds, timelineCache);
+} <span class="kw">else</span> {
+  <span class="cm">// PUSH — write to every follower cache</span>
+  writeStrategy.fanout(tweet, poster,
+      followerIds, timelineCache);
+}</pre>
+        <p class="muted"><code>FanoutOnWriteStrategy</code> loops <code>followerIds</code> and calls <code>timelineCache.addToTimeline(...)</code> once per follower. <code>FanoutOnReadStrategy</code> is a deliberate no-op.</p>
+      </div>
+      <div class="card">
+        <div class="kicker">worked example — one celebrity, one normal</div>
+        <pre class="code"><span class="cm">// @elon posts (50,000,000 followers)</span>
+isCelebrity() = <span class="num">true</span>  → <span class="st">READ</span>
+   writes to timeline caches = <span class="num">0</span>
+   → 50,000,000 writes AVOIDED
+   tweet pulled at read time (max 3/celeb)
+
+<span class="cm">// @alice posts (350 followers)</span>
+isCelebrity() = <span class="num">false</span> → <span class="st">WRITE</span>
+   for each of 350 followerIds:
+     cache.addToTimeline(id, FeedItem)
+   → 350 cache writes, feed pre-built
+
+<span class="cm">// @alice's feed read (follows elon+taylor)</span>
+push cache  → [bob, carol tweets]
+pull celebs → elon(3) + taylor(3) = 6
+merge → dedup → drop deleted → rank</pre>
+        <p class="muted">The asymmetry is the whole point: celebrities pay <b>zero</b> write cost; the merge work is deferred to the (far rarer, per-user) read.</p>
+      </div>
+    </div>
+    <div class="callout tip"><b>Why hybrid?</b> Pure fan-out-on-<b>write</b> gives O(1) reads but pushing Elon's tweet to 50M timelines is a write storm; pure fan-out-on-<b>read</b> is cheap to write but every feed read must pull from every followee. The hybrid splits on <code>User.CELEBRITY_THRESHOLD = 10_000</code>: <b>normal users push</b> (the common case, instant feeds), <b>celebrities are pulled</b> at read time and merged in. A user can cross the threshold mid-session — <code>updateUserType()</code> flips NORMAL→CELEBRITY on the follower increment, so the next tweet fans out the other way.</div>
+  </section>
+
+  <!-- C · STRATEGIES COMPARED (tabs) -->
+  <section>
+    <div class="sec-h"><span class="n">C</span><h2>Fan-out &amp; ranking strategies (two Strategy axes)</h2><span class="tag">swap behaviour, not the service</span></div>
+    <div data-tabscope>
+      <div class="tabs">
+        <button class="tab active" data-tab="write">Fan-out · Write</button>
+        <button class="tab" data-tab="read">Fan-out · Read</button>
+        <button class="tab" data-tab="hybrid">Fan-out · Hybrid</button>
+        <button class="tab" data-tab="rank">Rankers</button>
+      </div>
+      <div class="tabpanel active" data-panel="write">
+        <p><b>FanoutOnWriteStrategy</b> — push at post time to every follower's timeline cache. <span class="run">name() = "Fan-out on Write (Push)"</span></p>
+        <ul class="tight">
+          <li><b>Writes:</b> O(followers) — one <code>addToTimeline</code> per follower.</li>
+          <li><b>Reads:</b> O(1) — the feed is already materialised in the cache.</li>
+          <li><b>Best for:</b> normal users (&lt; 10K followers); wasteful and dangerous for celebrities.</li>
+        </ul>
+      </div>
+      <div class="tabpanel" data-panel="read">
+        <p><b>FanoutOnReadStrategy</b> — a no-op at write time; the tweet is pulled from the poster's store at read time. <span class="run">name() = "Fan-out on Read (Pull)"</span></p>
+        <ul class="tight">
+          <li><b>Writes:</b> O(1) — tweet stored once, nothing pushed.</li>
+          <li><b>Reads:</b> O(celebrities followed) — FeedService pulls the latest few tweets per celebrity.</li>
+          <li><b>Best for:</b> celebrities (≥ 10K followers) where push would be prohibitive.</li>
+        </ul>
+      </div>
+      <div class="tabpanel" data-panel="hybrid">
+        <p><b>HybridFanoutStrategy</b> — composes both leaves, delegating on <code>poster.isCelebrity()</code>. <span class="run">the wired default in AppConfig</span></p>
+        <ul class="tight">
+          <li><b>Composite:</b> holds a write leaf + a read leaf + a <code>celebrityThreshold</code>; callers see one <code>fanout()</code>.</li>
+          <li><b>Normal → push, celebrity → pull:</b> best of both; the merge happens in FeedService.</li>
+          <li><b>Tunable:</b> the threshold is the ops knob (10K today) trading write cost against read cost.</li>
+        </ul>
+      </div>
+      <div class="tabpanel" data-panel="rank">
+        <p>The second Strategy axis — <b>FeedRanker</b> orders the merged feed, independent of how items arrived.</p>
+        <ul class="tight">
+          <li><b>EngagementRanker</b> (wired): <code>freshness × (likes·1 + retweets·2 + replies·1.5 + 1)</code>, freshness = <code>1/(1+hoursAge·0.1)</code> — the "For You" feed.</li>
+          <li><b>ChronologicalRanker</b>: <code>1000/(1+secondsAgo·0.01)</code> — pure recency, the "Latest" tab.</li>
+          <li><b>Drop-in:</b> a future <code>MlRanker</code> is a new class + one line in AppConfig, no FeedService change.</li>
+        </ul>
+      </div>
+    </div>
+    <table>
+      <thead><tr><th>Aspect</th><th>Fan-out Write</th><th>Fan-out Read</th><th>Hybrid</th></tr></thead>
+      <tbody>
+        <tr><td>Write cost</td><td>O(followers)</td><td>O(1)</td><td>O(followers) for normal, O(1) for celeb</td></tr>
+        <tr><td>Read cost</td><td>O(1)</td><td>O(celebs followed)</td><td>cache + O(celebs followed)</td></tr>
+        <tr><td>Celebrity safe?</td><td>no (write storm)</td><td>yes</td><td>yes (routes celebs to read)</td></tr>
+        <tr><td>Feed freshness</td><td>instant</td><td>read-time pull</td><td>instant for normal, pulled for celeb</td></tr>
+        <tr><td>Used for</td><td>&lt; 10K followers</td><td>≥ 10K followers</td><td>production default</td></tr>
+      </tbody>
+    </table>
+    <div class="callout"><b>The pattern:</b> <code>FanoutService</code> holds a single <code>FanoutStrategy</code> and <code>FeedService</code> holds a single <code>FeedRanker</code> — neither branches on type, they just call <code>strategy.fanout(...)</code> / <code>ranker.rank(...)</code>. Adding a new distribution scheme or ranker is a new class + one line in <code>AppConfig</code>, with <b>zero</b> changes to the services (Open-Closed Principle).</div>
+  </section>
+
+  <!-- D · DATA MODEL -->
+  <section>
+    <div class="sec-h"><span class="n">D</span><h2>Data model detail</h2><span class="tag">Tweet · User · FeedItem · TrendingTopic</span></div>
+    <div class="grid g2">
+      <div class="card">
+        <div class="kicker">Tweet — immutable, Builder-built</div>
+        <pre class="code">tweetId     String   <span class="cm">// UUID prefix (8 chars)</span>
+userId      String
+content     String   <span class="cm">// ≤ 280, required</span>
+mediaUrls   List&lt;String&gt;   <span class="cm">// unmodifiable</span>
+hashtags    List&lt;String&gt;   <span class="cm">// auto-extracted #\w+</span>
+likeCount   AtomicInteger
+retweetCount AtomicInteger
+replyCount  AtomicInteger
+createdAt   LocalDateTime
+deleted     <span class="kw">volatile</span> boolean  <span class="cm">// soft delete</span></pre>
+        <p class="muted">Built via <code>Tweet.Builder</code> — <code>build()</code> validates id/user/content and the 280-char cap, and hashtags are extracted once at construction. Counters are atomic; <code>deleted</code> is volatile for cross-thread visibility.</p>
+      </div>
+      <div class="card">
+        <div class="kicker">User — drives the fan-out decision</div>
+        <pre class="code">userId        String
+username      String
+displayName   String
+followerCount int            <span class="cm">// synchronized ++/--</span>
+followingCount int
+userType      UserType       <span class="cm">// NORMAL | CELEBRITY | VERIFIED</span>
+createdAt     LocalDateTime
+
+isCelebrity() = followerCount &gt;= 10_000</pre>
+        <p class="muted"><code>incrementFollowers()</code> is synchronized and calls <code>updateUserType()</code>, which flips NORMAL↔CELEBRITY the moment the count crosses <code>CELEBRITY_THRESHOLD</code>. This is the value the hybrid strategy branches on.</p>
+      </div>
+      <div class="card">
+        <div class="kicker">FeedItem — merge unit</div>
+        <pre class="code">tweet   Tweet
+score   double            <span class="cm">// set by the ranker</span>
+source  FeedSource        <span class="cm">// FANOUT_WRITE | FANOUT_READ | MERGED</span>
+addedAt LocalDateTime
+
+compareTo: higher score first</pre>
+        <p class="muted">Wraps a Tweet with a mutable <code>score</code> and a <code>source</code> tag. <code>source</code> records whether the item was pushed or pulled — invaluable for debugging feed latency (too many <code>FANOUT_READ</code> = too many celebrity follows).</p>
+      </div>
+      <div class="card">
+        <div class="kicker">TrendingTopic + Follow</div>
+        <pre class="code"><span class="cm">// TrendingTopic (Comparable)</span>
+hashtag String
+count   long
+score   double      <span class="cm">// count-weighted</span>
+
+<span class="cm">// Follow — social-graph edge</span>
+followerId String   <span class="cm">// who follows</span>
+followeeId String   <span class="cm">// who is followed</span>
+createdAt  LocalDateTime  <span class="cm">// equals/hashCode on the pair</span></pre>
+        <p class="muted">TrendingRepository keys a <code>ConcurrentHashMap&lt;String,AtomicLong&gt;</code> by lowercased hashtag; <code>getTopTrending(k)</code> sorts by count. <code>Follow</code> uses value equality on (follower, followee) so the graph stays deduplicated.</p>
+      </div>
+    </div>
+    <div class="callout tip"><b>Two stores on the read path, on purpose:</b> the <code>TimelineCacheRepository</code> holds pre-built <code>FeedItem</code>s pushed for normal users (fast), while <code>TweetRepository</code> keeps the source-of-truth tweets pulled for celebrities. FeedService merges the two and dedups by <code>tweetId</code> so a tweet that arrived via both paths appears once. In production the cache is a Redis Sorted Set and tweets live in Cassandra.</div>
+  </section>
+
+  <!-- E · REQUEST SEQUENCES -->
+  <section>
+    <div class="sec-h"><span class="n">E</span><h2>Request handling sequence</h2><span class="tag">which class does what, in order</span></div>
+
+    <div class="collapsible open">
+      <div class="c-head"><h3>POST /api/tweets &nbsp;→&nbsp; post &amp; fan-out</h3></div>
+      <div class="c-body">
+        <pre class="code"><span class="cm">FeedController.handlePostTweet(userId, content)</span>
+  └─ TweetService.postTweet(userId, content, mediaUrls)
+       1  userRepo.findById(userId)        <span class="cm">// UserNotFoundException</span>
+       2  Tweet.Builder().tweetId(UUID).userId(..)
+              .content(..).mediaUrls(..).build()  <span class="cm">// validates, extracts #tags</span>
+       3  tweetRepo.save(tweet)
+       4  fanoutService.processTweet(tweet):
+            poster = userRepo.findById(tweet.userId)
+            followerIds = followRepo.getFollowerIds(userId)
+            strategy.fanout(tweet, poster, followerIds, cache)
+              poster.isCelebrity()? READ (no-op) : WRITE (push each)
+            return followerIds.size()
+       5  trendingService.recordTweet(tweet)   <span class="cm">// HashtagExtractor → incrementHashtag</span>
+  └─ return Tweet</pre>
+        <p class="muted">Fan-out and trending both hang off the post, but only the strategy decides push vs. pull. In production steps 4–5 become Kafka consumers (Observer) so the poster's request returns immediately.</p>
+      </div>
+    </div>
+
+    <div class="collapsible open">
+      <div class="c-head"><h3>GET /api/feed &nbsp;→&nbsp; generate feed (the read path)</h3></div>
+      <div class="c-body">
+        <pre class="code"><span class="cm">FeedController.handleGetFeed(userId, limit)</span>
+  └─ FeedService.generateFeed(userId, limit)
+       1  timelineCache.getTimeline(userId, 200)     <span class="cm">// pushed items</span>
+       2  followRepo.getFolloweeIds(userId)
+            → filter userRepo.findById(id).isCelebrity()
+       3  for each celeb: tweetRepo.findByUserId(id, 3)  <span class="cm">// PULL, FANOUT_READ</span>
+       4  merged = pushed + pulled
+       5  dedup by tweetId (HashSet)
+       6  drop item.tweet.isDeleted()
+       7  ranker.rank(active)          <span class="cm">// EngagementRanker: score desc</span>
+       8  return top `limit`
+  └─ printFeed(feed)</pre>
+        <p class="muted">Steps 1 and 3 are the two halves of the hybrid model reunited: pre-computed pushes for the many normal followees, live pulls for the few celebrities. Ranking runs over the merged, deduped, non-deleted set.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- F · DESIGN PATTERNS -->
+  <section>
+    <div class="sec-h"><span class="n">F</span><h2>Design patterns used</h2><span class="tag">GoF-categorized</span></div>
+    <div class="grid g3">
+      <div class="card">
+        <div class="kicker">Behavioral</div>
+        <ul class="tight">
+          <li><b>Strategy ×2</b> — <code>FanoutStrategy</code> (push/pull/hybrid) and <code>FeedRanker</code> (chrono/engagement). Two independent axes swapped without touching services.</li>
+          <li><b>Mediator</b> — <code>FeedService</code> orchestrates cache lookup → celebrity pull → merge → dedup → rank → trim so no caller coordinates the pipeline.</li>
+          <li><b>Observer (conceptual)</b> — post fires fan-out + trending; in production a Kafka topic with independent consumer groups.</li>
+        </ul>
+      </div>
+      <div class="card">
+        <div class="kicker">Structural</div>
+        <ul class="tight">
+          <li><b>Composite</b> — <code>HybridFanoutStrategy</code> IS-A FanoutStrategy but HAS-A write leaf + read leaf, delegating on celebrity status. The caller sees one <code>fanout()</code>.</li>
+          <li><b>Repository</b> — five interfaces (Tweet / User / Follow / TimelineCache / Trending) over <code>InMemory…</code> impls; swap to Redis / Cassandra with no service change.</li>
+        </ul>
+      </div>
+      <div class="card">
+        <div class="kicker">Creational</div>
+        <ul class="tight">
+          <li><b>Builder</b> — <code>Tweet.Builder</code>. Required + optional + derived (hashtags) fields; <code>build()</code> validates the 280-char cap and yields an immutable Tweet.</li>
+          <li><b>Factory / Composition root</b> — <code>AppConfig</code> news-up and wires the entire graph in one place (Spring <code>@Configuration</code> in production).</li>
+        </ul>
+      </div>
+    </div>
+    <div class="callout"><b>Why they cluster:</b> Strategy + Composite + Repository together deliver the Open-Closed Principle — a new fan-out scheme, a new ranker, or a new storage backend is an <i>addition</i>, never an edit. The Mediator keeps the feed pipeline in one readable place, and the Builder + atomic counters keep <code>Tweet</code> immutable and thread-safe. <span class="run">→ scaling trade-offs (Redis sorted sets, Kafka fan-out, the celebrity problem at 150M) on canvas 3</span></div>
+  </section>
+
+  <!-- RUN IT -->
+  <section>
+    <div class="sec-h"><span class="n">▶</span><h2>Run it — repo file map</h2><span class="tag">concept → actual Java class</span></div>
+    <table>
+      <thead><tr><th>Concept above</th><th>File in <code>05-social-media-feed/src/main/java/…/feed/</code></th></tr></thead>
+      <tbody>
+        <tr><td>Composition root / wiring + seed</td><td><code>config/AppConfig.java</code></td></tr>
+        <tr><td>REST endpoints</td><td><code>controller/FeedController.java</code></td></tr>
+        <tr><td>Write path (post / delete / like / retweet)</td><td><code>service/TweetService.java</code></td></tr>
+        <tr><td>Read path — merge + rank (§B, §E)</td><td><code>service/FeedService.java</code></td></tr>
+        <tr><td>Follow graph</td><td><code>service/FollowService.java</code></td></tr>
+        <tr><td>Fan-out contract + orchestrator</td><td><code>fanout/FanoutStrategy.java</code> · <code>fanout/FanoutService.java</code></td></tr>
+        <tr><td>Fan-out strategies (§B, §C)</td><td><code>fanout/FanoutOnWriteStrategy.java</code> · <code>FanoutOnReadStrategy.java</code> · <code>HybridFanoutStrategy.java</code></td></tr>
+        <tr><td>Ranking contract + impls (§C)</td><td><code>ranking/FeedRanker.java</code> · <code>EngagementRanker.java</code> · <code>ChronologicalRanker.java</code></td></tr>
+        <tr><td>Trending</td><td><code>trending/TrendingService.java</code> · <code>trending/HashtagExtractor.java</code></td></tr>
+        <tr><td>Storage contracts + impls</td><td><code>repository/*Repository.java</code> · <code>repository/InMemory*Repository.java</code></td></tr>
+        <tr><td>Domain models (§D)</td><td><code>model/Tweet.java</code> · <code>User.java</code> · <code>FeedItem.java</code> · <code>Follow.java</code> · <code>TrendingTopic.java</code> · <code>UserType.java</code> · <code>FeedSource.java</code></td></tr>
+        <tr><td>Exceptions</td><td><code>exception/FeedException.java</code> · <code>TweetNotFoundException.java</code> · <code>UserNotFoundException.java</code></td></tr>
+        <tr><td>Runnable demo (main)</td><td><code>FeedApp.java</code></td></tr>
+      </tbody>
+    </table>
+    <div class="callout tip"><b>Run the demo</b> (Gradle <code>application</code> plugin, mainClass <code>FeedApp</code>, no framework):<br><pre class="code">./gradlew :05-social-media-feed:run</pre>It seeds users (alice/bob/carol/dave normal, elon 50M &amp; taylor 30M celebrities), posts tweets to show write vs. read fan-out, generates a merged+ranked feed, and prints trending hashtags.</div>
+  </section>
+
+  <!-- GLOSSARY -->
+  <section>
+    <div class="sec-h"><span class="n">§</span><h2>Glossary — one-liners</h2><span class="tag">terms used above</span></div>
+    <div class="grid g2">
+      <div class="card"><table><tbody>
+        <tr><td><b>Fan-out on write</b></td><td>push a tweet to every follower's timeline cache at post time — fast reads, costly writes</td></tr>
+        <tr><td><b>Fan-out on read</b></td><td>store the tweet once, pull it into followers' feeds at read time — cheap writes, costly reads</td></tr>
+        <tr><td><b>Hybrid fan-out</b></td><td>push for normal users, pull for celebrities — the production answer to the celebrity problem</td></tr>
+        <tr><td><b>Celebrity problem</b></td><td>a user with millions of followers can't be pushed to in real time; route them to pull</td></tr>
+        <tr><td><b>Timeline cache</b></td><td>per-user store of pre-computed FeedItems filled by fan-out-on-write</td></tr>
+      </tbody></table></div>
+      <div class="card"><table><tbody>
+        <tr><td><b>Strategy pattern</b></td><td>interchangeable algorithms behind one interface, chosen at runtime (fan-out, ranker)</td></tr>
+        <tr><td><b>Composite pattern</b></td><td>an object that is a strategy but delegates to child strategies (HybridFanoutStrategy)</td></tr>
+        <tr><td><b>Mediator pattern</b></td><td>one class (FeedService) coordinates a multi-step pipeline so callers don't have to</td></tr>
+        <tr><td><b>Engagement score</b></td><td>freshness × (likes·1 + retweets·2 + replies·1.5 + 1) — the "For You" ordering</td></tr>
+        <tr><td><b>Soft delete</b></td><td>set a volatile <code>deleted</code> flag; the tweet is filtered out of feeds, not physically removed</td></tr>
+      </tbody></table></div>
+    </div>
+  </section>
+
+  <footer>
+    <p>Use case 05 · Social Media Feed — Canvas 2 of 3 (LLD). Grounded in <code>05-social-media-feed/docs/lld/</code>, <code>docs/patterns/</code>, and the Java under <code>src/main/java/com/systemdesign/feed</code>.</p>
+    <p class="run">This use case: <a href="hld.html">Canvas 1 · HLD</a> · LLD · <a href="deepdive.html">Canvas 3 · Deep-dive &amp; Trade-offs</a> &nbsp;|&nbsp; Next → <a href="deepdive.html">Canvas 3 · Deep-dive &amp; Trade-offs</a> &nbsp;|&nbsp; <a href="../index.html">Hub</a></p>
+  </footer>
+
+</div>
+<script src="../assets/canvas.js"></script>
+</body>
+</html>

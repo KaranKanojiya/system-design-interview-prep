@@ -1,0 +1,444 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>08 · Ride Sharing — LLD</title>
+<link rel="stylesheet" href="../assets/canvas.css">
+</head>
+<body>
+<div class="wrap">
+
+  <header class="hero">
+    <h1>Ride Sharing — Low-Level Design</h1>
+    <div class="sub">Use case 08 · Canvas 2 of 3. From boxes to classes: the real Java object model. Start with the <b>interactive class map</b> — click a class to see its responsibility and how <code>AppConfig → RideController → RideService(facade) → sub-services → Strategy/SpatialIndex/Repository</code> is wired — then dig into the Haversine + QuadTree algorithms, the pluggable matching/pricing strategies, the <code>Ride</code> state machine, and the request sequences.</div>
+    <div class="badges">
+      <span class="badge lvl">Use case 08 · LLD</span>
+      <span class="badge">Canvas 2 of 3</span>
+      <span class="badge">interactive</span>
+      <span class="badge">Strategy · Builder · State · Facade · Decorator</span>
+    </div>
+    <div class="legend">
+      <span><i class="dot" style="background:var(--eden)"></i> entry / composition root</span>
+      <span><i class="dot" style="background:var(--survivor)"></i> interface / contract</span>
+      <span><i class="dot" style="background:var(--old)"></i> concrete implementation</span>
+      <span><i class="dot" style="background:var(--warn)"></i> domain model</span>
+      <span><i class="dot" style="background:var(--muted)"></i> click a class for its role</span>
+    </div>
+  </header>
+
+  <!-- A · CLASS DESIGN (interactive class map) -->
+  <section>
+    <div class="sec-h"><span class="n">A</span><h2>Class design — click a class in the map</h2><span class="tag">the object model, wired</span></div>
+    <div>
+      <div class="arch">
+        <svg viewBox="0 0 780 448" width="100%" style="max-width:780px" role="img" aria-label="Ride sharing class map">
+          <defs>
+            <marker id="ah" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" fill="var(--muted)"></path></marker>
+          </defs>
+
+          <!-- wiring arrows -->
+          <line class="arrow" x1="95" y1="66" x2="95" y2="114" stroke="var(--muted)" stroke-width="2" stroke-dasharray="4 3" marker-end="url(#ah)"></line>
+          <line class="arrow" x1="170" y1="137" x2="192" y2="137" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"></line>
+          <!-- facade -> sub-services (uses) -->
+          <path class="arrow" d="M240,158 C 200,176 190,192 194,214" fill="none" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"></path>
+          <path class="arrow" d="M240,158 C 184,200 176,254 194,275" fill="none" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"></path>
+          <path class="arrow" d="M240,158 C 172,232 166,314 194,336" fill="none" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"></path>
+          <path class="arrow" d="M240,158 C 160,252 158,374 194,396" fill="none" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"></path>
+          <!-- services -> interfaces (uses) -->
+          <line class="arrow" x1="346" y1="217" x2="394" y2="217" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"></line>
+          <line class="arrow" x1="346" y1="277" x2="394" y2="305" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"></line>
+          <line class="arrow" x1="346" y1="397" x2="394" y2="397" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"></line>
+          <!-- interfaces -> impls (implements, dashed) -->
+          <line class="arrow" x1="538" y1="210" x2="588" y2="197" stroke="var(--muted)" stroke-width="2" stroke-dasharray="4 3" marker-end="url(#ah)"></line>
+          <line class="arrow" x1="538" y1="224" x2="588" y2="249" stroke="var(--muted)" stroke-width="2" stroke-dasharray="4 3" marker-end="url(#ah)"></line>
+          <line class="arrow" x1="538" y1="300" x2="588" y2="303" stroke="var(--muted)" stroke-width="2" stroke-dasharray="4 3" marker-end="url(#ah)"></line>
+          <line class="arrow" x1="538" y1="312" x2="588" y2="357" stroke="var(--muted)" stroke-width="2" stroke-dasharray="4 3" marker-end="url(#ah)"></line>
+          <line class="arrow" x1="538" y1="397" x2="588" y2="409" stroke="var(--muted)" stroke-width="2" stroke-dasharray="4 3" marker-end="url(#ah)"></line>
+          <!-- decorator wraps -->
+          <path class="arrow" d="M628,336 C 610,330 610,328 628,325" fill="none" stroke="var(--muted)" stroke-width="2" stroke-dasharray="3 2" marker-end="url(#ah)"></path>
+          <text x="98" y="94" fill="var(--faint)" font-size="9">creates</text>
+          <text x="352" y="212" fill="var(--faint)" font-size="9">uses</text>
+          <text x="596" y="322" fill="var(--faint)" font-size="9">wraps</text>
+
+          <!-- C1: AppConfig + Controller -->
+          <g data-node style="cursor:pointer" data-title="AppConfig  (config · Factory)" data-detail="<b>Role:</b> composition root / poor-man's DI container — the ONLY class that says <code>new ConcreteClass()</code>.<br><b>Wiring:</b> static factories <code>createRideService()</code> and <code>createController()</code> build the graph bottom-up: repositories → QuadTree spatial index → strategies → services → RideService facade → RideController.<br><b>Constants:</b> the San Francisco bounding box (<code>SF_MIN_LAT 37.70 … SF_MAX_LNG -122.35</code>), <code>SURGE_GRID_SIZE_KM=20</code>, <code>SURGE_ZONE_RADIUS_KM=2</code>. Swap Nearest→ETA matching or add surge here in one line."><rect x="20" y="24" width="150" height="42" rx="9" fill="var(--panel-2)" stroke="var(--eden)"></rect><text x="95" y="44" text-anchor="middle" fill="var(--eden)" font-size="12" font-weight="600">AppConfig</text><text x="95" y="59" text-anchor="middle" fill="var(--faint)" font-size="10">composition root · Factory</text></g>
+
+          <g data-node style="cursor:pointer" data-title="RideController  (controller)" data-detail="<b>Role:</b> framework-free stand-in for a Spring @RestController.<br><b>Methods:</b> <code>handleRequestRide</code>, <code>handleStartRide</code>, <code>handleCompleteRide</code>, <code>handleCancelRide</code>, <code>handleGetRide</code>, <code>handleGetSurgePrice</code>.<br><b>Wiring:</b> holds one dependency — the <code>RideService</code> facade — and simply forwards each call. All orchestration lives behind the facade."><rect x="20" y="116" width="150" height="42" rx="9" fill="var(--panel-2)" stroke="var(--border)"></rect><text x="95" y="136" text-anchor="middle" fill="var(--text)" font-size="12" font-weight="600">RideController</text><text x="95" y="151" text-anchor="middle" fill="var(--faint)" font-size="10">REST endpoints</text></g>
+
+          <!-- C2: facade + services -->
+          <g data-node style="cursor:pointer" data-title="RideService  (service · FACADE)" data-detail="<b>Role:</b> the FACADE and orchestrator of the whole ride lifecycle. Holds 9 collaborators (5 services + 3 repos + LocationService).<br><b>requestRide():</b> rider lookup → <code>surgeService.getSurgeMultiplier(pickup)</code> → <code>pricingService.estimateFare(...)</code> → build <code>Ride</code> (REQUESTED) → <code>matchingService.findAndMatchDriver()</code> → <code>ride.matchDriver()</code> (MATCHED) → <code>driver.markBusy()</code> → <code>ride.driverEnRoute()</code> → notify both parties → save.<br><b>Also:</b> startRide, completeRide (calc actual fare + payment), cancelRide."><rect x="196" y="116" width="150" height="42" rx="9" fill="var(--panel-2)" stroke="var(--warn)"></rect><text x="271" y="136" text-anchor="middle" fill="var(--warn)" font-size="12" font-weight="600">RideService</text><text x="271" y="151" text-anchor="middle" fill="var(--faint)" font-size="10">FACADE · orchestrator</text></g>
+
+          <g data-node style="cursor:pointer" data-title="MatchingService  (service)" data-detail="<b>Role:</b> finds and matches the best driver.<br><b>findAndMatchDriver():</b> (1) <code>locationService.findNearbyDrivers(pickup, 5km, 10)</code> via QuadTree → (2) hydrate full <code>Driver</code> objects from <code>DriverRepository</code>, filter <code>isAvailable()</code> → (3) <code>matchingStrategy.findBestDriver()</code> → (4) simulate acceptance, cascading to the next driver up to <code>MAX_CASCADE_ATTEMPTS=3</code> on timeout.<br>Depends on the <code>MatchingStrategy</code> interface only."><rect x="196" y="196" width="150" height="42" rx="9" fill="var(--panel-2)" stroke="var(--border)"></rect><text x="271" y="216" text-anchor="middle" fill="var(--text)" font-size="12" font-weight="600">MatchingService</text><text x="271" y="231" text-anchor="middle" fill="var(--faint)" font-size="10">nearby + strategy + cascade</text></g>
+
+          <g data-node style="cursor:pointer" data-title="PricingService  (service)" data-detail="<b>Role:</b> fare calculation via the injected <code>PricingStrategy</code>.<br><b>estimateFare():</b> Haversine(pickup,dropoff) × <code>ROAD_FACTOR 1.3</code> → duration = dist / 30 km/h → <code>strategy.calculateFare(dist, dur, type, surge)</code> (shown pre-ride).<br><b>calculateActualFare(ride):</b> uses the ride's recorded distance and the real elapsed time between startTime/endTime."><rect x="196" y="256" width="150" height="42" rx="9" fill="var(--panel-2)" stroke="var(--border)"></rect><text x="271" y="276" text-anchor="middle" fill="var(--text)" font-size="12" font-weight="600">PricingService</text><text x="271" y="291" text-anchor="middle" fill="var(--faint)" font-size="10">estimate + actual fare</text></g>
+
+          <g data-node style="cursor:pointer" data-title="SurgeService  (service)" data-detail="<b>Role:</b> owns the grid of <code>SurgeZone</code>s (2 km cells over a 20 km SF grid ≈ 100 zones).<br><b>getSurgeMultiplier(pickup):</b> finds the zone whose center is within <code>radiusKm</code> of the pickup and returns <code>zone.calculateMultiplier()</code> — a tiered demand/supply ratio capped at 3.0×. Returns 1.0 if no zone covers the point.<br><b>updateZoneMetrics(zoneId, supply, demand):</b> a background job would call this every few seconds."><rect x="196" y="316" width="150" height="42" rx="9" fill="var(--panel-2)" stroke="var(--border)"></rect><text x="271" y="336" text-anchor="middle" fill="var(--text)" font-size="12" font-weight="600">SurgeService</text><text x="271" y="351" text-anchor="middle" fill="var(--faint)" font-size="10">supply/demand zones</text></g>
+
+          <g data-node style="cursor:pointer" data-title="LocationService  (service)" data-detail="<b>Role:</b> real-time driver positions on top of the <code>SpatialIndex</code>.<br><b>Methods:</b> <code>addDriver</code>, <code>updateDriverLocation</code> (remove+insert), <code>removeDriver</code>, <code>findNearbyDrivers(loc, radiusKm, maxResults)</code>.<br><b>Concurrency:</b> all methods are <code>synchronized</code> — the QuadTree is not thread-safe, so writes and reads take the monitor for a consistent snapshot. Separates real-time POSITIONS from the DriverRepository's PROFILES."><rect x="196" y="376" width="150" height="42" rx="9" fill="var(--panel-2)" stroke="var(--border)"></rect><text x="271" y="396" text-anchor="middle" fill="var(--text)" font-size="12" font-weight="600">LocationService</text><text x="271" y="411" text-anchor="middle" fill="var(--faint)" font-size="10">driver positions</text></g>
+
+          <!-- C3: models + interfaces -->
+          <g data-node style="cursor:pointer" data-title="Ride  (model · Builder + State machine)" data-detail="<b>Role:</b> the core domain entity. Built with <code>new Ride.Builder(rider, pickup, dropoff)…build()</code> (auto-generates an 8-char id, computes distance if unset).<br><b>State machine:</b> guarded transition methods — <code>matchDriver()</code> (REQUESTED→MATCHED), <code>driverEnRoute()</code> (→DRIVER_EN_ROUTE), <code>startRide()</code> (→IN_PROGRESS), <code>completeRide(fare)</code> (→COMPLETED, adds driver earnings + frees driver), <code>cancelRide()</code> (→CANCELLED unless already terminal). Each throws <code>InvalidRideStateException</code> on an illegal move."><rect x="396" y="24" width="142" height="42" rx="9" fill="var(--panel-2)" stroke="var(--warn)"></rect><text x="467" y="44" text-anchor="middle" fill="var(--warn)" font-size="12" font-weight="600">Ride</text><text x="467" y="59" text-anchor="middle" fill="var(--faint)" font-size="10">«Builder + State»</text></g>
+
+          <g data-node style="cursor:pointer" data-title="MatchingStrategy  «interface»" data-detail="<b>Role:</b> the driver-matching contract — <code>Optional&lt;Driver&gt; findBestDriver(RideRequest, List&lt;Driver&gt; candidates, Location pickup)</code>.<br><b>Why:</b> MatchingService depends on this interface, so the ranking algorithm swaps with zero service changes (Open-Closed). Two implementations ship: Nearest and ETA-based."><rect x="396" y="196" width="142" height="42" rx="9" fill="var(--panel-2)" stroke="var(--survivor)"></rect><text x="467" y="216" text-anchor="middle" fill="var(--survivor)" font-size="11" font-weight="600">MatchingStrategy</text><text x="467" y="231" text-anchor="middle" fill="var(--faint)" font-size="10">«interface»</text></g>
+
+          <g data-node style="cursor:pointer" data-title="PricingStrategy  «interface»" data-detail="<b>Role:</b> the fare contract — <code>double calculateFare(double distanceKm, double durationMinutes, Vehicle.VehicleType type, double surgeMultiplier)</code>.<br><b>Why:</b> PricingService holds one <code>PricingStrategy</code> and never branches on pricing mode. Standard and Surge implementations are interchangeable (Surge is a Decorator of Standard)."><rect x="396" y="284" width="142" height="42" rx="9" fill="var(--panel-2)" stroke="var(--survivor)"></rect><text x="467" y="304" text-anchor="middle" fill="var(--survivor)" font-size="11" font-weight="600">PricingStrategy</text><text x="467" y="319" text-anchor="middle" fill="var(--faint)" font-size="10">«interface»</text></g>
+
+          <g data-node style="cursor:pointer" data-title="SpatialIndex  «interface»" data-detail="<b>Role:</b> the spatial-index contract — <code>insert</code>, <code>remove</code>, <code>update</code>, <code>findNearby(center, radiusKm, maxResults)</code>, <code>size</code>, <code>clear</code>.<br><b>Why:</b> LocationService depends on this interface, so the QuadTree could be swapped for a GeoHash, R-Tree, or H3-based index without touching services. QuadTree is the shipped implementation."><rect x="396" y="376" width="142" height="42" rx="9" fill="var(--panel-2)" stroke="var(--survivor)"></rect><text x="467" y="396" text-anchor="middle" fill="var(--survivor)" font-size="11" font-weight="600">SpatialIndex</text><text x="467" y="411" text-anchor="middle" fill="var(--faint)" font-size="10">«interface»</text></g>
+
+          <!-- C4: models + impls -->
+          <g data-node style="cursor:pointer" data-title="Location  (model · Haversine)" data-detail="<b>Role:</b> immutable lat/lng value object — validates ranges in the constructor.<br><b>distanceKm(from, to):</b> the great-circle Haversine formula (see §B). THE most-called method in the system: matching, pricing, ETA, surge-zone containment all lean on it.<br><b>Why not Euclidean:</b> lat/lng are on a sphere — 1° of longitude shrinks by <code>cos(latitude)</code>, so flat distance is nonsense."><rect x="590" y="24" width="170" height="42" rx="9" fill="var(--panel-2)" stroke="var(--warn)"></rect><text x="675" y="44" text-anchor="middle" fill="var(--warn)" font-size="12" font-weight="600">Location</text><text x="675" y="59" text-anchor="middle" fill="var(--faint)" font-size="10">«Haversine» value object</text></g>
+
+          <g data-node style="cursor:pointer" data-title="NearestDriverStrategy" data-detail="<b>Role:</b> picks the closest available driver by straight-line Haversine distance.<br><b>findBestDriver():</b> stream → filter <code>isAvailable()</code> and vehicle-type match → sort by <code>Location.distanceKm(driver, pickup)</code> → <code>findFirst()</code>. No nulls, no nested ifs. The simplest, most predictable strategy."><rect x="590" y="176" width="170" height="42" rx="9" fill="var(--panel-2)" stroke="var(--old)"></rect><text x="675" y="196" text-anchor="middle" fill="var(--old)" font-size="11" font-weight="600">NearestDriverStrategy</text><text x="675" y="211" text-anchor="middle" fill="var(--faint)" font-size="10">min Haversine distance</text></g>
+
+          <g data-node style="cursor:pointer" data-title="ETABasedStrategy" data-detail="<b>Role:</b> picks the driver with the lowest estimated time of arrival, not the nearest.<br><b>ETA:</b> <code>(Haversine × 1.3 road factor) / (30 km/h × trafficFactor) × 60</code>. <code>trafficFactor</code> = 0.5 at rush hour (7–9, 17–19), 1.2 late night (23–5), else 1.0.<br><b>Why:</b> a driver 2 km away in traffic can be slower than one 3 km away on an open road."><rect x="590" y="228" width="170" height="42" rx="9" fill="var(--panel-2)" stroke="var(--old)"></rect><text x="675" y="248" text-anchor="middle" fill="var(--old)" font-size="11" font-weight="600">ETABasedStrategy</text><text x="675" y="263" text-anchor="middle" fill="var(--faint)" font-size="10">min ETA (dist + traffic)</text></g>
+
+          <g data-node style="cursor:pointer" data-title="StandardPricingStrategy" data-detail="<b>Role:</b> base + distance + time fare, per vehicle type.<br><b>Rate table (EnumMap):</b> SEDAN 2.00/1.50/0.25, SUV 3.50/2.00/0.35, POOL 1.50/0.80/0.15, LUXURY 5.00/3.00/0.50, AUTO_RICKSHAW 1.00/0.50/0.10 (base / $-per-km / $-per-min).<br><b>Formula:</b> <code>base + dist·perKm + dur·perMin</code>, floored at the base fare. Ignores the surge argument by design — surge is the decorator's job."><rect x="590" y="282" width="170" height="42" rx="9" fill="var(--panel-2)" stroke="var(--old)"></rect><text x="675" y="302" text-anchor="middle" fill="var(--old)" font-size="11" font-weight="600">StandardPricingStrategy</text><text x="675" y="317" text-anchor="middle" fill="var(--faint)" font-size="10">base + dist + time</text></g>
+
+          <g data-node style="cursor:pointer" data-title="SurgePricingStrategy  (Decorator)" data-detail="<b>Role:</b> a Decorator that WRAPS a <code>StandardPricingStrategy</code>.<br><b>calculateFare():</b> compute the standard fare (surge=1.0) → cap the multiplier at <code>MAX_SURGE=3.0</code> → return <code>standardFare × cappedSurge</code>.<br><b>Why Decorator:</b> Standard stays usable alone; surge logic is isolated and composable (you could stack surge × promo × subscription)."><rect x="590" y="336" width="170" height="42" rx="9" fill="var(--panel-2)" stroke="var(--old)"></rect><text x="675" y="356" text-anchor="middle" fill="var(--old)" font-size="11" font-weight="600">SurgePricingStrategy</text><text x="675" y="371" text-anchor="middle" fill="var(--faint)" font-size="10">«Decorator» × surge</text></g>
+
+          <g data-node style="cursor:pointer" data-title="QuadTree  (SpatialIndex impl)" data-detail="<b>Role:</b> recursive 2-D spatial partition over a <code>BoundingBox</code>. <code>MAX_POINTS=4</code> per leaf, <code>MAX_DEPTH=10</code>.<br><b>Nodes:</b> <code>QuadTreeNode</code> holds points or 4 children (NW/NE/SW/SE); <code>BoundingBox</code> supplies <code>contains()</code> / <code>intersects()</code>.<br><b>findNearby():</b> box → prune non-intersecting subtrees → Haversine-filter candidates → sort → top-k. A side <code>HashMap&lt;id,Location&gt;</code> gives O(1) update lookups. O(√n + k) per query."><rect x="590" y="388" width="170" height="42" rx="9" fill="var(--panel-2)" stroke="var(--old)"></rect><text x="675" y="408" text-anchor="middle" fill="var(--old)" font-size="11" font-weight="600">QuadTree</text><text x="675" y="423" text-anchor="middle" fill="var(--faint)" font-size="10">recursive quad partition</text></g>
+        </svg>
+      </div>
+      <div class="node-detail"><span class="nd-title">Click any class</span><div class="nd-body">Its responsibility, key methods, and how it is wired appear here. Dashed arrows are <i>implements</i> / <i>creates</i> / <i>wraps</i>; solid arrows are <i>uses</i>. Notice <b>RideService</b> is the single facade the controller talks to, and each service depends only on the <b>«interface»</b> boxes — that is what makes matching, pricing, and the spatial index swappable.</div></div>
+    </div>
+  </section>
+
+  <!-- B · CORE ALGORITHMS -->
+  <section>
+    <div class="sec-h"><span class="n">B</span><h2>Core algorithms — Haversine &amp; the QuadTree range query</h2><span class="tag">Location · QuadTree</span></div>
+    <div class="grid g2">
+      <div class="card">
+        <div class="kicker">Haversine — great-circle distance (verbatim)</div>
+        <pre class="code"><span class="kw">public static double</span> <span class="ty">distanceKm</span>(Location from, Location to) {
+  <span class="cm">// 1 · degrees → radians</span>
+  <span class="kw">double</span> lat1 = Math.toRadians(from.lat);
+  <span class="kw">double</span> lat2 = Math.toRadians(to.lat);
+  <span class="kw">double</span> dLat = Math.toRadians(to.lat - from.lat);
+  <span class="kw">double</span> dLng = Math.toRadians(to.lng - from.lng);
+  <span class="cm">// 2 · haversine of the central angle</span>
+  <span class="kw">double</span> a = Math.sin(dLat/<span class="num">2</span>)*Math.sin(dLat/<span class="num">2</span>)
+    + Math.cos(lat1)*Math.cos(lat2)
+    * Math.sin(dLng/<span class="num">2</span>)*Math.sin(dLng/<span class="num">2</span>);
+  <span class="cm">// 3 · central angle (atan2 = numerically stable)</span>
+  <span class="kw">double</span> c = <span class="num">2</span> * Math.atan2(Math.sqrt(a), Math.sqrt(<span class="num">1</span>-a));
+  <span class="kw">return</span> EARTH_RADIUS_KM * c;   <span class="cm">// R = 6371</span>
+}</pre>
+        <p class="muted">Every match, fare, ETA and surge-zone check funnels through this one method.</p>
+      </div>
+      <div class="card">
+        <div class="kicker">worked example — pickup → dropoff</div>
+        <pre class="code">A = (<span class="num">37.7749</span>, <span class="num">-122.4194</span>)   <span class="cm">// SF pickup</span>
+B = (<span class="num">37.8049</span>, <span class="num">-122.4094</span>)   <span class="cm">// dropoff</span>
+
+Δlat = <span class="num">0.0300</span>°   Δlng = <span class="num">0.0100</span>°
+     → radians: dLat=<span class="num">5.24e-4</span>, dLng=<span class="num">1.75e-4</span>
+
+a = sin²(dLat/2)               = <span class="num">6.85e-8</span>
+  + cos(lat1)·cos(lat2)·sin²(dLng/2)
+    ≈ <span class="num">0.6241</span> · <span class="num">7.62e-9</span>       = <span class="num">4.75e-9</span>
+  a ≈ <span class="num">7.33e-8</span>
+
+c = 2·atan2(√a, √(1−a))        ≈ <span class="num">5.41e-4</span> rad
+d = 6371 · c                   ≈ <span class="st">3.45 km</span></pre>
+        <p class="muted">Flat Euclidean on the same points gives ≈0.032 "degrees" — meaningless. Haversine returns real kilometres because it accounts for longitude shrinking by <code>cos(lat)</code>.</p>
+      </div>
+    </div>
+    <div class="grid g2">
+      <div class="card">
+        <div class="kicker">QuadTree.findNearby — prune, then filter</div>
+        <pre class="code"><span class="cm">// 1 · box around the circle (fast, approximate)</span>
+BoundingBox box = BoundingBox.fromCenter(center, radiusKm);
+List candidates = <span class="kw">new</span> ArrayList();
+rangeQuery(root, box, candidates);
+
+<span class="kw">void</span> <span class="ty">rangeQuery</span>(node, box, out) {
+  <span class="cm">// PRUNE — the whole reason QuadTree is fast</span>
+  <span class="kw">if</span> (!node.bounds.intersects(box)) <span class="kw">return</span>;
+  <span class="kw">if</span> (node.isLeaf())
+    <span class="kw">for</span> (p : node.points)
+      <span class="kw">if</span> (box.contains(p)) out.add(p);
+  <span class="kw">else for</span> (child : node.children)
+    rangeQuery(child, box, out);       <span class="cm">// recurse</span>
+}
+<span class="cm">// 2 · exact Haversine filter  3 · sort  4 · top-k</span></pre>
+      </div>
+      <div class="card">
+        <div class="kicker">why two stages, and the cost</div>
+        <ul class="tight">
+          <li><b>Stage 1 — box:</b> <code>intersects()</code> lets the query skip entire quadrants that can't hold a result. Prunes most of the tree in O(√n).</li>
+          <li><b>Stage 2 — Haversine:</b> a box is a square but the search area is a circle; the exact distance check drops the four corner points, then results sort by distance and truncate to <code>maxResults</code>.</li>
+          <li><b>Insert:</b> a full leaf (>4 points) <code>subdivide()</code>s into NW/NE/SW/SE and redistributes — unless <code>MAX_DEPTH=10</code> is reached, which caps recursion for co-located drivers (e.g. an airport queue).</li>
+          <li><b>Update:</b> remove + re-insert, using a side <code>HashMap&lt;id,Location&gt;</code> for O(1) lookup — vital when 1M drivers ping every ~4 s.</li>
+        </ul>
+      </div>
+    </div>
+    <div class="callout tip"><b>The headline:</b> a brute-force "distance to every driver" scan is O(n) — at 100K drivers × 1000 req/s that is 100M Haversine calls per second. The QuadTree turns each query into roughly O(√n + k) — a handful of intersecting leaves plus the k results — cutting the work by orders of magnitude. Production Uber replaces the QuadTree with H3 / Google&nbsp;S2 hex cells but the idea is identical: <b>partition space, prune what's far away</b>.</div>
+  </section>
+
+  <!-- C · STRATEGIES COMPARED (tabs) -->
+  <section>
+    <div class="sec-h"><span class="n">C</span><h2>Pluggable strategies (Strategy ×2)</h2><span class="tag">swap the algorithm, not the service</span></div>
+    <div data-tabscope>
+      <div class="tabs">
+        <button class="tab active" data-tab="near">Matching · Nearest</button>
+        <button class="tab" data-tab="eta">Matching · ETA</button>
+        <button class="tab" data-tab="std">Pricing · Standard</button>
+        <button class="tab" data-tab="surge">Pricing · Surge</button>
+      </div>
+      <div class="tabpanel active" data-panel="near">
+        <p><b>NearestDriverStrategy</b> — ranks candidates by straight-line Haversine distance to the pickup. <span class="run">used by MatchingService · the AppConfig default</span></p>
+        <ul class="tight">
+          <li><b>Rule:</b> filter available + matching <code>VehicleType</code>, then <code>min(distanceKm(driver, pickup))</code>.</li>
+          <li><b>Pros:</b> dead simple, predictable, cheap. <b>Cons:</b> ignores traffic — nearest ≠ fastest.</li>
+        </ul>
+      </div>
+      <div class="tabpanel" data-panel="eta">
+        <p><b>ETABasedStrategy</b> — ranks by estimated arrival time instead of raw distance. <span class="run">drop-in alternative</span></p>
+        <ul class="tight">
+          <li><b>Rule:</b> <code>ETA = (Haversine × 1.3) / (30 km/h × trafficFactor) × 60</code>; pick the minimum.</li>
+          <li><b>Traffic:</b> 0.5× speed at rush hour (7–9, 17–19), 1.2× late night (23–5), else 1.0×.</li>
+          <li><b>Pros:</b> a farther driver on an open road beats a near one in gridlock. <b>Cons:</b> needs traffic data (simulated by time-of-day here).</li>
+        </ul>
+      </div>
+      <div class="tabpanel" data-panel="std">
+        <p><b>StandardPricingStrategy</b> — base + distance + time, per vehicle type, via an <code>EnumMap</code> rate table. <span class="run">ignores surge by design</span></p>
+        <ul class="tight">
+          <li><b>Formula:</b> <code>base + dist·perKm + dur·perMin</code>, floored at the base fare.</li>
+          <li><b>Rates:</b> SEDAN 2.00/1.50/0.25 · SUV 3.50/2.00/0.35 · POOL 1.50/0.80/0.15 · LUXURY 5.00/3.00/0.50 · AUTO 1.00/0.50/0.10.</li>
+        </ul>
+      </div>
+      <div class="tabpanel" data-panel="surge">
+        <p><b>SurgePricingStrategy</b> — a Decorator wrapping Standard; multiplies by the surge factor. <span class="run">the AppConfig default pricing</span></p>
+        <ul class="tight">
+          <li><b>Rule:</b> <code>standardFare × min(surge, MAX_SURGE=3.0)</code>.</li>
+          <li><b>Surge source:</b> SurgeService's per-zone demand/supply ratio (tiered, see §D).</li>
+          <li><b>Composable:</b> Standard remains usable alone; decorators could stack (surge × promo × subscription).</li>
+        </ul>
+      </div>
+    </div>
+    <table>
+      <thead><tr><th>Aspect</th><th>Nearest</th><th>ETA-based</th><th>Standard</th><th>Surge</th></tr></thead>
+      <tbody>
+        <tr><td>Family</td><td>matching</td><td>matching</td><td>pricing</td><td>pricing</td></tr>
+        <tr><td>Ranks / scales by</td><td>Haversine distance</td><td>arrival time + traffic</td><td>type rate table</td><td>standard × multiplier</td></tr>
+        <tr><td>Extra input</td><td>none</td><td>time-of-day traffic</td><td>none</td><td>zone surge</td></tr>
+        <tr><td>Pattern</td><td>Strategy</td><td>Strategy</td><td>Strategy</td><td>Strategy + Decorator</td></tr>
+        <tr><td>Best when</td><td>calm traffic</td><td>rush hour</td><td>normal demand</td><td>demand &gt; supply</td></tr>
+      </tbody>
+    </table>
+    <div class="callout"><b>The pattern:</b> <code>MatchingService</code> holds one <code>MatchingStrategy</code> and <code>PricingService</code> holds one <code>PricingStrategy</code>; neither branches on a mode string. Switching Nearest→ETA or adding surge is a new class plus one line in <code>AppConfig.createMatchingService(...)</code> / <code>createSurgePricingStrategy()</code> — <b>zero</b> changes to the services (Open-Closed Principle).</div>
+  </section>
+
+  <!-- D · DATA MODEL -->
+  <section>
+    <div class="sec-h"><span class="n">D</span><h2>Data model &amp; the ride state machine</h2><span class="tag">Ride · Location · SurgeZone</span></div>
+    <div class="grid g2">
+      <div class="card">
+        <div class="kicker">Ride — entity (Builder-built)</div>
+        <pre class="code">rideId      String   <span class="cm">// UUID[0..8]</span>
+rider       Rider    <span class="cm">// final</span>
+driver      Driver   <span class="cm">// null until MATCHED</span>
+pickup      Location <span class="cm">// final</span>
+dropoff     Location <span class="cm">// final</span>
+status      RideStatus
+requestTime Instant  <span class="cm">// final</span>
+matchTime / startTime / endTime  Instant
+estimatedFare / actualFare       double
+surgeMultiplier                  double
+distance    double   <span class="cm">// km (Haversine)</span>
+route       List&lt;Location&gt;</pre>
+        <p class="muted">Required fields (rider, pickup, dropoff) go in the <code>Builder</code> constructor; the rest are fluent setters with defaults. Mutable fields change <b>only</b> through guarded transition methods.</p>
+      </div>
+      <div class="card">
+        <div class="kicker">RideStatus — guarded state machine</div>
+        <pre class="code">REQUESTED ──matchDriver()──▶ MATCHED
+MATCHED ──driverEnRoute()──▶ DRIVER_EN_ROUTE
+DRIVER_EN_ROUTE ─startRide()─▶ IN_PROGRESS
+IN_PROGRESS ─completeRide($)─▶ COMPLETED
+   (any non-terminal) ─cancelRide()─▶ CANCELLED
+
+COMPLETED / CANCELLED = terminal</pre>
+        <p class="muted">Each method checks the current <code>status</code> and throws <code>InvalidRideStateException</code> on an illegal move — you can't complete a ride that never started, or cancel one already COMPLETED. <code>completeRide(fare)</code> also credits driver earnings and calls <code>driver.markAvailable()</code>.</p>
+      </div>
+    </div>
+    <div class="grid g2">
+      <div class="card">
+        <div class="kicker">SurgeZone — tiered demand/supply</div>
+        <pre class="code">demand/supply ratio │ multiplier
+────────────────────┼───────────
+ supply ≥ demand     │ 1.00×  (none)
+ ≤ 1.5               │ 1.25×
+ ≤ 2.0               │ 1.50×
+ ≤ 2.5               │ 2.00×
+ ≤ 3.0               │ 2.50×
+ &gt; 3.0 or supply=0   │ 3.00×  (cap)</pre>
+        <p class="muted">A zone is a circle: <code>containsLocation()</code> = <code>distanceKm(center, p) ≤ radiusKm</code>. SurgeService lays a 2 km grid over SF. The 3.0× cap is a deliberate PR guard.</p>
+      </div>
+      <div class="card">
+        <div class="kicker">Location &amp; Vehicle</div>
+        <pre class="code"><span class="cm">// Location — immutable, validated</span>
+lat  double   <span class="cm">// [-90, 90]</span>
+lng  double   <span class="cm">// [-180, 180]</span>
+
+<span class="cm">// Vehicle.VehicleType (capacity)</span>
+SEDAN·4  SUV·6  POOL·3
+LUXURY·4  AUTO_RICKSHAW·3</pre>
+        <p class="muted"><code>Driver</code> carries <code>volatile currentLocation</code> and <code>volatile isAvailable</code> — read by matching threads, written by the location thread. The spatial index stores only <code>(id, Location)</code>; MatchingService hydrates full <code>Driver</code> objects from the repository.</p>
+      </div>
+    </div>
+    <div class="callout tip"><b>Two distances, two fares:</b> the pre-ride <i>estimate</i> uses Haversine × 1.3 road factor at 30 km/h; the <i>actual</i> fare uses the ride's recorded distance and the real elapsed time between <code>startTime</code> and <code>endTime</code>. Keeping both on the <code>Ride</code> lets the app show a quote up front and reconcile at completion.</div>
+  </section>
+
+  <!-- E · REQUEST SEQUENCES -->
+  <section>
+    <div class="sec-h"><span class="n">E</span><h2>Request handling sequence</h2><span class="tag">which class does what, in order</span></div>
+
+    <div class="collapsible open">
+      <div class="c-head"><h3>requestRide &nbsp;→&nbsp; find &amp; match a driver</h3></div>
+      <div class="c-body">
+        <pre class="code"><span class="cm">RideController.handleRequestRide(riderId, pickup, dropoff, type)</span>
+  └─ RideService.requestRide(...)
+       1  riderRepository.findById(riderId)        <span class="cm">// else RideException</span>
+       2  surgeService.getSurgeMultiplier(pickup)  <span class="cm">// find zone → tier</span>
+       3  pricingService.estimateFare(pickup, dropoff, type, surge)
+       4  new Ride.Builder(rider, pickup, dropoff)...build()  <span class="cm">// REQUESTED</span>
+          rideRepository.save(ride)
+       5  matchingService.findAndMatchDriver(request):
+            a locationService.findNearbyDrivers(pickup, 5km, 10)  <span class="cm">// QuadTree</span>
+            b hydrate Drivers from repo, filter isAvailable()
+            c matchingStrategy.findBestDriver(...)
+            d simulate accept; cascade to next (max 3) on timeout
+               └─ none? → NoDriverAvailableException
+       6  ride.matchDriver(driver)        <span class="cm">// REQUESTED → MATCHED</span>
+       7  driver.markBusy()
+       8  ride.driverEnRoute()            <span class="cm">// MATCHED → DRIVER_EN_ROUTE</span>
+       9  notificationService.notifyRider / notifyDriver(...)
+      10  rideRepository.save(ride)
+  └─ return ride  (status DRIVER_EN_ROUTE)</pre>
+        <p class="muted">Surge and fare are computed <b>before</b> matching so the rider sees a quote up front. If no driver survives the cascade, the rider is notified and the exception propagates.</p>
+      </div>
+    </div>
+
+    <div class="collapsible open">
+      <div class="c-head"><h3>completeRide &nbsp;→&nbsp; finish &amp; charge</h3></div>
+      <div class="c-body">
+        <pre class="code"><span class="cm">RideController.handleCompleteRide(rideId)</span>
+  └─ RideService.completeRide(rideId)
+       1  rideRepository.findById(rideId)          <span class="cm">// else RideException</span>
+       2  pricingService.calculateActualFare(ride) <span class="cm">// real dist + elapsed time</span>
+       3  ride.completeRide(actualFare)            <span class="cm">// IN_PROGRESS → COMPLETED</span>
+            └─ driver.addEarnings(fare); driver.markAvailable()
+          rideRepository.save(ride)
+       4  paymentService.processPayment(ride)      <span class="cm">// PaymentFailedException → balance</span>
+       5  locationService.updateDriverLocation(driverId, dropoff)
+       6  notificationService.notifyRider / notifyDriver(receipt)
+  └─ return ride  (status COMPLETED)</pre>
+        <p class="muted">Note <code>ride.completeRide()</code> is the single guarded transition that sets the fare, stamps <code>endTime</code>, and frees the driver atomically — the service never pokes ride fields directly.</p>
+      </div>
+    </div>
+
+    <div class="collapsible open">
+      <div class="c-head"><h3>cancelRide &nbsp;→&nbsp; release the driver</h3></div>
+      <div class="c-body">
+        <pre class="code"><span class="cm">RideController.handleCancelRide(rideId)</span>
+  └─ RideService.cancelRide(rideId)
+       1  rideRepository.findById(rideId)
+       2  ride.cancelRide()               <span class="cm">// throws if already COMPLETED/CANCELLED</span>
+            └─ endTime = now; if driver != null → driver.markAvailable()
+          rideRepository.save(ride)
+       3  notify rider (and driver if assigned)
+       4  driver assigned? → locationService re-adds them as available
+  └─ return ride  (status CANCELLED)</pre>
+        <p class="muted">Cancellation is legal from any non-terminal state; the guard blocks only COMPLETED/CANCELLED. Production layers cancellation-fee rules on top (free before match, fee after).</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- F · DESIGN PATTERNS -->
+  <section>
+    <div class="sec-h"><span class="n">F</span><h2>Design patterns used</h2><span class="tag">GoF-categorized</span></div>
+    <div class="grid g3">
+      <div class="card">
+        <div class="kicker">Creational</div>
+        <ul class="tight">
+          <li><b>Builder</b> — <code>Ride.Builder</code>. Readable construction of a 12-field entity; required fields in the constructor, optional ones fluent with defaults.</li>
+          <li><b>Factory</b> — <code>AppConfig</code> static factories are the only <code>new ConcreteClass()</code> site (composition root).</li>
+          <li><b>Singleton (conceptual)</b> — one <code>QuadTree</code> per <code>LocationService</code> is the shared spatial index all matching leans on.</li>
+        </ul>
+      </div>
+      <div class="card">
+        <div class="kicker">Behavioral</div>
+        <ul class="tight">
+          <li><b>Strategy ×2</b> — <code>MatchingStrategy</code> (Nearest / ETA) and <code>PricingStrategy</code> (Standard / Surge). The centrepiece: swap algorithms without touching services.</li>
+          <li><b>State</b> — the <code>Ride</code> guarded state machine; transition methods enforce the legal REQUESTED→…→COMPLETED graph.</li>
+          <li><b>Observer</b> — <code>NotificationService</code> reacts to ride state changes, keeping notification logic out of the business flow.</li>
+        </ul>
+      </div>
+      <div class="card">
+        <div class="kicker">Structural (+ DDD)</div>
+        <ul class="tight">
+          <li><b>Facade</b> — <code>RideService</code> presents one API over 8+ collaborators.</li>
+          <li><b>Decorator</b> — <code>SurgePricingStrategy</code> wraps <code>StandardPricingStrategy</code> and multiplies the result transparently.</li>
+          <li><b>Repository</b> — <code>Ride/Driver/RiderRepository</code> hide the <code>ConcurrentHashMap</code> stores; swap to Postgres with no service change.</li>
+        </ul>
+      </div>
+    </div>
+    <div class="callout"><b>Why they cluster:</b> Strategy + Repository + the <code>SpatialIndex</code> interface + AppConfig-driven DI together deliver the Open-Closed Principle — new matching/pricing algorithms and new storage or spatial backends are <i>additions</i>, never edits. Builder + the guarded State machine keep <code>Ride</code> consistent, and the Facade shields the controller from all of it. <span class="run">→ scale, sharding &amp; hot-zone trade-offs on canvas 3</span></div>
+  </section>
+
+  <!-- RUN IT -->
+  <section>
+    <div class="sec-h"><span class="n">▶</span><h2>Run it — repo file map</h2><span class="tag">concept → actual Java class</span></div>
+    <table>
+      <thead><tr><th>Concept above</th><th>File in <code>08-ride-sharing/src/main/java/…/ridesharing/</code></th></tr></thead>
+      <tbody>
+        <tr><td>Composition root / wiring (§A, Factory)</td><td><code>config/AppConfig.java</code></td></tr>
+        <tr><td>REST endpoints</td><td><code>controller/RideController.java</code></td></tr>
+        <tr><td>Facade / orchestrator (§E)</td><td><code>service/RideService.java</code></td></tr>
+        <tr><td>Matching (nearby + cascade)</td><td><code>service/MatchingService.java</code></td></tr>
+        <tr><td>Pricing, surge, positions, payment, notify</td><td><code>service/PricingService.java</code> · <code>SurgeService.java</code> · <code>LocationService.java</code> · <code>PaymentService.java</code> · <code>NotificationService.java</code></td></tr>
+        <tr><td>Matching strategy contract + impls (§C)</td><td><code>strategy/matching/MatchingStrategy.java</code> · <code>NearestDriverStrategy.java</code> · <code>ETABasedStrategy.java</code></td></tr>
+        <tr><td>Pricing strategy contract + impls (§C)</td><td><code>strategy/pricing/PricingStrategy.java</code> · <code>StandardPricingStrategy.java</code> · <code>SurgePricingStrategy.java</code></td></tr>
+        <tr><td>Spatial index (§B)</td><td><code>spatial/SpatialIndex.java</code> · <code>QuadTree.java</code> · <code>QuadTreeNode.java</code> · <code>BoundingBox.java</code> · <code>GeoHash.java</code></td></tr>
+        <tr><td>Domain models (§D)</td><td><code>model/Ride.java</code> · <code>Location.java</code> · <code>Driver.java</code> · <code>Rider.java</code> · <code>Vehicle.java</code> · <code>RideStatus.java</code> · <code>RideRequest.java</code> · <code>SurgeZone.java</code> · <code>Payment.java</code> · <code>PaymentMethod.java</code></td></tr>
+        <tr><td>Storage contracts + impls</td><td><code>repository/RideRepository.java</code> · <code>DriverRepository.java</code> · <code>RiderRepository.java</code> (+ <code>InMemory*</code>)</td></tr>
+        <tr><td>Exceptions</td><td><code>exception/RideException.java</code> · <code>NoDriverAvailableException.java</code> · <code>InvalidRideStateException.java</code> · <code>PaymentFailedException.java</code></td></tr>
+        <tr><td>Stats display · runnable demo (main)</td><td><code>display/RideStatsDisplay.java</code> · <code>RideSharingApp.java</code></td></tr>
+      </tbody>
+    </table>
+    <div class="callout tip"><b>Run the demo</b> (Gradle <code>application</code> plugin, mainClass <code>RideSharingApp</code>, no framework):<br><pre class="code">./gradlew :08-ride-sharing:run</pre>It seeds SF riders and drivers, requests rides (surge quote → QuadTree lookup → strategy match → driver-accept cascade), starts, completes and charges them, cancels one, and prints ride/driver/surge stats.</div>
+  </section>
+
+  <!-- GLOSSARY -->
+  <section>
+    <div class="sec-h"><span class="n">§</span><h2>Glossary — one-liners</h2><span class="tag">terms used above</span></div>
+    <div class="grid g2">
+      <div class="card"><table><tbody>
+        <tr><td><b>Haversine</b></td><td>great-circle distance between two lat/lng points on a sphere</td></tr>
+        <tr><td><b>QuadTree</b></td><td>recursive 2-D partition; prunes far quadrants so nearby-search is ~O(√n + k)</td></tr>
+        <tr><td><b>BoundingBox</b></td><td>axis-aligned rectangle; <code>contains()</code> / <code>intersects()</code> drive the pruning</td></tr>
+        <tr><td><b>Strategy pattern</b></td><td>interchangeable algorithms behind one interface, chosen at wiring time</td></tr>
+        <tr><td><b>Decorator pattern</b></td><td>wrap an object to add behaviour (surge) while keeping its interface</td></tr>
+        <tr><td><b>Facade</b></td><td>one class (RideService) fronting many subsystems</td></tr>
+      </tbody></table></div>
+      <div class="card"><table><tbody>
+        <tr><td><b>State machine</b></td><td>guarded transitions; illegal moves throw instead of corrupting state</td></tr>
+        <tr><td><b>Builder pattern</b></td><td>fluent construction of a many-field object with validation at build()</td></tr>
+        <tr><td><b>Repository</b></td><td>interface over storage so services never see the map/DB</td></tr>
+        <tr><td><b>Surge multiplier</b></td><td>tiered demand/supply price factor per zone, capped at 3.0×</td></tr>
+        <tr><td><b>Cascade</b></td><td>on driver timeout, offer the ride to the next-best candidate (max 3)</td></tr>
+        <tr><td><b>volatile</b></td><td>visibility keyword so a driver's location/availability is seen across threads</td></tr>
+      </tbody></table></div>
+    </div>
+  </section>
+
+  <footer>
+    <p>Use case 08 · Ride Sharing — Canvas 2 of 3 (LLD). Grounded in <code>08-ride-sharing/docs/lld/</code>, <code>docs/patterns/</code>, and the Java under <code>src/main/java/com/systemdesign/ridesharing</code>.</p>
+    <p class="run">This use case: <a href="hld.html">Canvas 1 · HLD</a> · LLD · <a href="deepdive.html">Canvas 3 · Deep-dive &amp; Trade-offs</a> &nbsp;|&nbsp; Next → <a href="deepdive.html">Canvas 3 · Deep-dive &amp; Trade-offs</a> &nbsp;|&nbsp; <a href="../index.html">Hub</a></p>
+  </footer>
+
+</div>
+<script src="../assets/canvas.js"></script>
+</body>
+</html>

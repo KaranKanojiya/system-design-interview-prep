@@ -1,0 +1,513 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>20 · Distributed Message Queue — Deep-dive &amp; Trade-offs</title>
+<link rel="stylesheet" href="../assets/canvas.css">
+</head>
+<body>
+<div class="wrap">
+
+  <header class="hero">
+    <h1>Distributed Message Queue — Deep-dive &amp; Trade-offs</h1>
+    <div class="sub">Use case 20 · Canvas 3 of 3. The hard parts: <b>ISR + acks + min.insync.replicas</b> (the zero-loss recipe), <b>exactly-once semantics</b> (idempotent producer + transactions), <b>consumer rebalancing</b> (why cooperative sticky wins), the <b>hot partition</b> problem, <b>controller / leader election</b> under failure, retention vs compaction, the <b>configurable CP↔AP</b> position, and a phase-by-phase <b>interview walkthrough</b>. Switch the tabs. Open the bottleneck cards.</div>
+    <div class="badges">
+      <span class="badge lvl">Use case 20 · Deep-dive</span>
+      <span class="badge">Canvas 3 of 3</span>
+      <span class="badge">interactive</span>
+      <span class="badge">CP-tunable · configurable</span>
+    </div>
+    <div class="legend">
+      <span><i class="dot" style="background:var(--eden)"></i> chosen approach</span>
+      <span><i class="dot" style="background:var(--survivor)"></i> alternative</span>
+      <span><i class="dot" style="background:var(--warn)"></i> failure / hot path</span>
+      <span><i class="dot" style="background:var(--old)"></i> data / storage</span>
+    </div>
+  </header>
+
+  <!-- A · SCALING -->
+  <section>
+    <div class="sec-h"><span class="n">A</span><h2>Scaling strategy — three orthogonal axes</h2><span class="tag">throughput · storage · consumption</span></div>
+    <div class="grid g3">
+      <div class="card"><div class="kicker">add partitions</div><h3>throughput ↑</h3><p class="muted">More partitions ⇒ more parallel producers &amp; consumers. Topic 6 → 12 = 2× throughput. <b>Caveat:</b> you cannot easily shrink partition count — <code>hash(key)%N</code> mapping would break. Err high at creation.</p></div>
+      <div class="card"><div class="kicker">add brokers</div><h3>storage &amp; compute ↑</h3><p class="muted">Reassignment via <code>kafka-reassign-partitions.sh</code> or Cruise Control. 3 → 6 brokers = 2× disk + 2× network. Controller moves partition leaderships during the shuffle.</p></div>
+      <div class="card"><div class="kicker">add consumers</div><h3>consumption rate ↑</h3><p class="muted"><b>Max consumers = partition count.</b> More consumers than partitions ⇒ some sit idle. Consumer-group rebalance is automatic. To increase parallelism further, first add partitions.</p></div>
+    </div>
+    <div data-tabscope style="margin-top:16px">
+      <div class="tabs">
+        <button class="tab active" data-tab="linkedin">LinkedIn-scale math</button>
+        <button class="tab" data-tab="scaleup">Scaling triggers</button>
+        <button class="tab" data-tab="rebalance">Broker rebalance</button>
+      </div>
+      <div class="tabpanel active" data-panel="linkedin">
+        <div class="grid g2">
+          <div class="card">
+            <div class="kicker">throughput budget (from HLD §14.4)</div>
+            <pre class="code">Messages/day (LinkedIn) : 7 T = 7 × 10¹²
+Msg/sec                 : ~81 M
+Avg msg size            : ~500 B
+Ingress                 : ~40 GB/s
+× RF=3 replication      : ~120 GB/s write
+Single broker (seq I/O) : ~600 MB/s
+Brokers for throughput  : ~200</pre>
+          </div>
+          <div class="card">
+            <div class="kicker">storage budget</div>
+            <pre class="code">Storage / day (pre-repl): ~3.4 PB
+× 7 d × RF 3             : ~71 PB
+Kafka clusters (real)    : 4000+ brokers
+Partitions (real)        : millions
+
+<span class="cm">// keep hot data (7 d) on local NVMe;</span>
+<span class="cm">// tier warm/cold (30 d+) to S3 (Kafka 3.6+ tiered storage)</span></pre>
+          </div>
+        </div>
+      </div>
+      <div class="tabpanel" data-panel="scaleup">
+        <table>
+          <thead><tr><th>Signal</th><th>Threshold</th><th>Action</th></tr></thead>
+          <tbody>
+            <tr><td>Consumer lag growing</td><td>&gt; 10 K msg for 5 min</td><td>add consumers (up to partition count)</td></tr>
+            <tr><td>Lag at max consumers</td><td>all partitions assigned, still growing</td><td>add partitions (needs producer restart for new routing)</td></tr>
+            <tr><td>Broker disk</td><td>&gt; 70 %</td><td>add brokers, reassign partitions</td></tr>
+            <tr><td>Broker CPU</td><td>&gt; 80 % sustained</td><td>add brokers</td></tr>
+            <tr><td>NIC saturation</td><td>&gt; 80 % of NIC capacity</td><td>add brokers</td></tr>
+            <tr><td>Produce p99 (acks=all)</td><td>&gt; 50 ms</td><td>add brokers, check ISR health</td></tr>
+            <tr><td>Controller failover</td><td>&gt; 30 s</td><td>migrate ZK → KRaft (Raft consensus)</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="tabpanel" data-panel="rebalance">
+        <div class="card">
+          <div class="kicker">before / after adding broker-4</div>
+          <pre class="code">Before (3 brokers, 12 partitions)
+  B1 → [orders-0 .. orders-3]   (4)
+  B2 → [orders-4 .. orders-7]   (4)
+  B3 → [orders-8 .. orders-11]  (4)
+
+After (4 brokers, 12 partitions)
+  B1 → [orders-0 .. orders-2]   (3)
+  B2 → [orders-3 .. orders-5]   (3)
+  B3 → [orders-6 .. orders-8]   (3)
+  B4 → [orders-9 .. orders-11]  (3)     <span class="cm">// 3 partitions moved</span></pre>
+          <p class="muted">Reassignment is <b>online</b> — followers stream from leaders to catch up while producers/consumers keep flowing to the current leader. Once caught up, leadership transfers.</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- B · ISR + ACKS -->
+  <section>
+    <div class="sec-h"><span class="n">B</span><h2>ISR + acks + min.insync.replicas — the zero-loss recipe</h2><span class="tag">the star of the interview</span></div>
+    <div class="grid g3">
+      <div class="card"><div class="kicker">acks=0 (fire &amp; forget)</div><h3>~0.5 ms</h3><p class="muted"><b>LOWEST durability.</b> Producer returns immediately. Message may be lost if leader crashes before disk flush. No retry possible (producer never knew there was a problem). Use: high-volume metrics / logs.</p></div>
+      <div class="card"><div class="kicker">acks=1 (leader only)</div><h3>~2–5 ms</h3><p class="muted"><b>MEDIUM.</b> Durable on leader's disk. <span class="warn">Lost</span> if leader crashes between write and follower fetch. Kafka's historical default. Good balance for user-activity streams.</p></div>
+      <div class="card"><div class="kicker">acks=all (all ISR)</div><h3>~5–20 ms (~50 ms cross-rack)</h3><p class="muted"><b>HIGHEST.</b> Leader waits for every ISR replica to write. With RF=3 &amp; <code>min.insync.replicas=2</code>: <b>zero loss</b> if ≥ 2 brokers alive. Rejects (NotEnoughReplicasException) if ISR too small — CP behavior.</p></div>
+    </div>
+    <div class="callout tip"><b>The zero-loss recipe (verbatim from any Staff+ interview):</b> <code>acks=all</code> · <code>replication.factor=3</code> · <code>min.insync.replicas=2</code> · <code>unclean.leader.election.enable=false</code>. That's it. Any subset weakens the guarantee. Ask about at least two of those in an interview — <b>most candidates only name acks=all</b>.</div>
+
+    <div class="grid g2" style="margin-top:14px">
+      <div class="card">
+        <div class="kicker">ISR maintenance — how a replica falls out</div>
+        <pre class="code">Partition orders-2  (RF=3)
+
+  Broker-1 (LEADER):  [0 .. 20]
+  Broker-2 (ISR):     [0 .. 20]   <span class="cm">// caught up</span>
+  Broker-3 (ISR):     [0 .. 8]    <span class="cm">// 2 s behind → still ISR</span>
+
+<span class="cm">// Broker-3 falls &gt; 10 s behind (replica.lag.time.max.ms):</span>
+
+  Broker-3 (OUT):     [0 .. 8]    <span class="cm">// REMOVED from ISR</span>
+  ISR = [B1, B2]
+
+<span class="cm">// Broker-3 recovers → fetches from leader → catches up → re-added.</span></pre>
+      </div>
+      <div class="card">
+        <div class="kicker">min.insync.replicas — the safety net</div>
+        <pre class="code">acks=all · min.insync.replicas=2 · RF=3
+
+Scenario 1 — all 3 alive
+  ISR = [B1, B2, B3]  → 3 &gt;= 2 → WRITE OK
+
+Scenario 2 — one replica down
+  ISR = [B1, B2]      → 2 &gt;= 2 → WRITE OK
+
+Scenario 3 — two replicas down
+  ISR = [B1]          → 1 &lt; 2 → WRITE REJECTED
+                                 NotEnoughReplicasException
+                                 producer retries or gives up
+
+<span class="cm">// This is CP behavior — availability sacrificed to guarantee durability.</span></pre>
+      </div>
+    </div>
+  </section>
+
+  <!-- C · EXACTLY-ONCE -->
+  <section>
+    <div class="sec-h"><span class="n">C</span><h2>Exactly-once semantics (EOS) — the interview trap</h2><span class="tag">idempotent producer + transactions</span></div>
+    <div class="grid g2">
+      <div class="card">
+        <div class="kicker">layer 1 — idempotent producer (broker dedup)</div>
+        <pre class="code">Producer stamps every record with:
+  producerId   (assigned by broker)
+  sequenceNum  (per (producer, partition))
+
+Broker keeps per-partition:
+  Map&lt;producerId, lastSequenceNum&gt;
+
+On write:
+  if seq == lastSeq + 1  → accept
+  if seq &lt;= lastSeq       → DUPLICATE, silently drop
+  if seq &gt;  lastSeq + 1  → OutOfOrderSequenceException
+
+<span class="cm">// This prevents duplicates from producer retries.</span>
+<span class="cm">// Kafka config: enable.idempotence=true (default since 3.0).</span></pre>
+      </div>
+      <div class="card">
+        <div class="kicker">layer 2 — transactions (atomic read-process-write)</div>
+        <pre class="code">1. producer.beginTransaction()
+2. consumer.poll() → messages
+3. process(messages) → results
+4. producer.send(outputTopic, results)         <span class="cm">// buffered</span>
+5. producer.sendOffsetsToTransaction(
+       offsets, groupId)                       <span class="cm">// commit offsets in same txn</span>
+6. producer.commitTransaction()                <span class="cm">// atomic flush</span>
+
+<span class="cm">// Steps 4–5 are atomic — either both visible or neither.</span>
+<span class="cm">// Consumer isolation.level=read_committed skips aborted txns.</span>
+<span class="cm">// Crash during commit → txn coordinator times out → aborts → replay from committed offset.</span></pre>
+      </div>
+    </div>
+    <div class="callout"><b>What our code does:</b> <code>ExactlyOnceDeliveryStrategy</code> models <b>only</b> the consumer-side idempotent dedup (a Set of processed message IDs) — the second layer. Full Kafka EOS also needs idempotent producers on the write side and (for stream processing) transactions to atomically commit output-topic writes with input-topic offsets. Our code is a teaching simplification.</div>
+  </section>
+
+  <!-- D · REBALANCING -->
+  <section>
+    <div class="sec-h"><span class="n">D</span><h2>Consumer group rebalancing — Range vs Sticky vs Cooperative</h2><span class="tag">stop-the-world vs incremental</span></div>
+    <div data-tabscope>
+      <div class="tabs">
+        <button class="tab active" data-tab="range">Range (this code)</button>
+        <button class="tab" data-tab="rr">RoundRobin</button>
+        <button class="tab" data-tab="sticky">Sticky</button>
+        <button class="tab" data-tab="coop">CooperativeSticky (prod default)</button>
+      </div>
+      <div class="tabpanel active" data-panel="range">
+        <div class="grid g2">
+          <div class="card">
+            <div class="kicker">algorithm (verbatim from ConsumerGroupCoordinator)</div>
+            <pre class="code">consumerIds.sort(String::compareTo);
+<span class="kw">int</span> M = consumerIds.size();
+<span class="kw">int</span> perConsumer = partitionCount / M;
+<span class="kw">int</span> remainder   = partitionCount % M;
+<span class="cm">// first `remainder` consumers get 1 extra partition</span></pre>
+            <p class="muted">Example — 7 partitions, 3 consumers: A→[0,1,2], B→[3,4], C→[5,6].</p>
+          </div>
+          <div class="card">
+            <div class="kicker">character</div>
+            <ul class="tight">
+              <li><b>Simple + deterministic.</b> Easy to reason about.</li>
+              <li><b>High partition movement</b> on any change — nearly all partitions reassigned. Consumer must rebuild any in-memory state.</li>
+              <li><b>Skew on multi-topic subs</b> — same consumer index gets partition 0 across all topics; that consumer becomes hot.</li>
+              <li>Fine for single-topic, low-membership-churn workloads.</li>
+            </ul>
+          </div>
+        </div>
+      </div>
+      <div class="tabpanel" data-panel="rr">
+        <div class="card">
+          <p><b>RoundRobinAssignor:</b> flatten all (topic, partition) pairs across all subscribed topics; deal them round-robin to consumers.</p>
+          <ul class="tight">
+            <li>Better than Range for multi-topic subscriptions — evens skew.</li>
+            <li>Still full reshuffle on membership change.</li>
+          </ul>
+        </div>
+      </div>
+      <div class="tabpanel" data-panel="sticky">
+        <div class="card">
+          <p><b>StickyAssignor:</b> optimise for two goals — even load AND minimise movement from the previous assignment.</p>
+          <ul class="tight">
+            <li>Only moves what it must.</li>
+            <li>Still stop-the-world — all consumers pause during the rebalance protocol.</li>
+          </ul>
+        </div>
+      </div>
+      <div class="tabpanel" data-panel="coop">
+        <div class="card">
+          <p><b>CooperativeStickyAssignor</b> — Kafka's production default since 2.4.</p>
+          <ul class="tight">
+            <li><b>Incremental rebalance:</b> only partitions that need to move are revoked; the rest keep flowing.</li>
+            <li>Two rebalance rounds instead of one — first revoke, then reassign — but no full stop-the-world pause.</li>
+            <li><b>Static membership</b> (<code>group.instance.id</code>) further reduces spurious rebalances on rolling restarts.</li>
+          </ul>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- E · BOTTLENECKS -->
+  <section>
+    <div class="sec-h"><span class="n">E</span><h2>Bottlenecks &amp; solutions</h2><span class="tag">click a card to open</span></div>
+    <div class="grid g2">
+
+      <div class="card collapsible open">
+        <div class="c-head"><h3>Hot partition (the classic)</h3></div>
+        <div class="c-body">
+          <p><b>Symptom:</b> one partition sees 10× the traffic of the others — one broker's CPU pegs at 100 % while others idle. Consumer lag on that partition grows unbounded.</p>
+          <p><b>Cause:</b> key skew. Viral user, best-selling product, one big tenant. Hash partitioning is deterministic: same key → same partition → all traffic for that key on one broker.</p>
+          <p><b>Fixes:</b></p>
+          <ul class="tight">
+            <li><b>Salt the key</b> — for hot keys append a random suffix (<code>userId + "-" + rand(0,10)</code>) so writes spread; consumer must know to fan-in on read.</li>
+            <li><b>Custom partitioner</b> — sub-partition hot keys explicitly (routing table for the top-N).</li>
+            <li><b>Composite key</b> — <code>(userId, sessionId)</code> instead of <code>userId</code>. Trades per-user ordering for per-session ordering + spread.</li>
+            <li><b>Accept the skew</b> — if per-key ordering is non-negotiable (e.g., account balance events), scale up that broker (bigger disk + NIC) and cap the number of hot partitions per broker.</li>
+          </ul>
+        </div>
+      </div>
+
+      <div class="card collapsible">
+        <div class="c-head"><h3>Consumer lag runaway</h3></div>
+        <div class="c-body">
+          <p><b>Symptom:</b> <code>lag = latestOffset − committedOffset</code> keeps growing. Alert.</p>
+          <p><b>Diagnose:</b> is producer rate up (traffic spike) or consumer rate down (GC, downstream DB slow)? Compare produce &amp; consume MB/s per topic. If lag on one partition only → hot partition (above).</p>
+          <p><b>Fixes, in order:</b></p>
+          <ul class="tight">
+            <li><b>Scale consumers</b> up to partition count (free — no rebuild).</li>
+            <li>Beyond that, <b>add partitions</b> (requires producer restart to see the new topology and re-hash keys).</li>
+            <li><b>Reduce <code>max.poll.records</code></b> if processing is CPU-bound and blocking heartbeats.</li>
+            <li>Move downstream I/O off the consumer thread — async / batch writes to the DB.</li>
+          </ul>
+        </div>
+      </div>
+
+      <div class="card collapsible">
+        <div class="c-head"><h3>Rebalance storm</h3></div>
+        <div class="c-body">
+          <p><b>Symptom:</b> consumers repeatedly join / leave / are evicted; every rebalance pauses the whole group for seconds; lag oscillates.</p>
+          <p><b>Cause:</b> long GC pauses miss the session timeout · slow processing exceeds <code>max.poll.interval.ms</code> · rolling restarts without stable IDs.</p>
+          <p><b>Fixes:</b></p>
+          <ul class="tight">
+            <li><b>Static membership</b> — set <code>group.instance.id</code>. Restart within the session timeout is a no-op.</li>
+            <li><b>CooperativeStickyAssignor</b> — incremental rebalance eliminates the stop-the-world pause.</li>
+            <li>Tune <code>session.timeout.ms</code> up (30–60 s), <code>heartbeat.interval.ms</code> down (~ session/3).</li>
+            <li>Increase <code>max.poll.interval.ms</code> if per-batch processing is slow.</li>
+          </ul>
+        </div>
+      </div>
+
+      <div class="card collapsible">
+        <div class="c-head"><h3>Data loss on leader failure (acks=1)</h3></div>
+        <div class="c-body">
+          <p><b>Timeline:</b> T1 producer sends → T2 leader writes + acks (=1) → T3 leader crashes BEFORE follower replicates → T4 controller elects follower as new leader → message <b>M is gone</b>.</p>
+          <p><b>Fix:</b> the zero-loss recipe (section B). <code>acks=all + min.insync.replicas=2 + RF=3 + unclean.leader.election.enable=false</code>. Trade ~5–20 ms of latency for zero loss.</p>
+        </div>
+      </div>
+
+      <div class="card collapsible">
+        <div class="c-head"><h3>Unclean leader election</h3></div>
+        <div class="c-body">
+          <p><b>Scenario:</b> ISR = ∅ (all in-sync replicas dead). An out-of-sync replica has messages up to offset 900; the (now-dead) leader had up to 1000.</p>
+          <p><b>Option A — <code>unclean.leader.election=false</code></b> (default since 1.0): partition <b>OFFLINE</b> until an ISR replica recovers. Zero loss. <b>CP behavior.</b></p>
+          <p><b>Option B — <code>unclean.leader.election=true</code></b>: the out-of-sync replica becomes leader; offsets 901–1000 are <b>lost forever</b>. Partition available immediately. <b>AP behavior.</b></p>
+          <p>Choose CP for financial data, AP for metrics / logs. This is CAP in action.</p>
+        </div>
+      </div>
+
+      <div class="card collapsible">
+        <div class="c-head"><h3>Controller failure / split brain</h3></div>
+        <div class="c-body">
+          <p><b>Impact:</b> no new topic creation, no leader elections; existing traffic continues on last-known leaders.</p>
+          <p><b>Detection &amp; recovery:</b> ZK ephemeral znode expires OR KRaft Raft leader heartbeat lost → new controller elected (lowest brokerId in our code; Raft leader in KRaft). Typically &lt; 5 s.</p>
+          <p><b>Split brain prevention:</b> KRaft's Raft quorum (2f+1 controllers, needs majority) or ZK's ephemeral znode make double-election impossible — only one controller can hold the lock at a time.</p>
+        </div>
+      </div>
+
+      <div class="card collapsible">
+        <div class="c-head"><h3>Retention runaway — disk fills up</h3></div>
+        <div class="c-body">
+          <p><b>Symptom:</b> broker disk at 100 % → new writes fail. Cascading: producer buffer fills → producer crashes.</p>
+          <p><b>Fixes:</b></p>
+          <ul class="tight">
+            <li><b>Two knobs, not one:</b> <code>retention.ms</code> AND <code>retention.bytes</code>. Whichever hits first triggers cleanup.</li>
+            <li><b>Per-topic overrides</b> — noisy topics get shorter retention.</li>
+            <li><b>Tiered storage</b> (Kafka 3.6+): hot on local NVMe (7 d), cold on S3 (30 d+). Consumer transparently reads either tier.</li>
+            <li><b>Alert at 70 %</b>, add brokers and reassign before 90 %.</li>
+          </ul>
+        </div>
+      </div>
+
+      <div class="card collapsible">
+        <div class="c-head"><h3>Zombie fencing (producer / consumer restarts)</h3></div>
+        <div class="c-body">
+          <p><b>Producer zombie:</b> old producer instance keeps sending after a new one starts → duplicates or out-of-order. Fix: <b>transactional producer with <code>transactional.id</code></b> — the second producer.init() fences the first (broker rejects its writes).</p>
+          <p><b>Consumer zombie:</b> old consumer holds a partition assignment after the coordinator moved it. Fix: <b>generation ID</b> — every rebalance bumps a generation counter; commits from an old generation are rejected. Automatic in Kafka.</p>
+        </div>
+      </div>
+
+    </div>
+  </section>
+
+  <!-- F · CAP -->
+  <section>
+    <div class="sec-h"><span class="n">F</span><h2>CAP &amp; consistency — configurable per operation</h2><span class="tag">the &quot;it depends&quot; is the answer</span></div>
+    <div class="grid g2">
+      <div class="card">
+        <div class="kicker">the setting drives the position</div>
+        <table>
+          <thead><tr><th>Operation</th><th>Config</th><th>CAP</th></tr></thead>
+          <tbody>
+            <tr><td>Produce acks=0</td><td>fire-and-forget</td><td><b>AP</b> (no durability)</td></tr>
+            <tr><td>Produce acks=1</td><td>leader only</td><td><b>AP-lean</b></td></tr>
+            <tr><td>Produce acks=all + min.isr=2</td><td>ISR quorum</td><td><b>CP</b> — rejects if ISR small</td></tr>
+            <tr><td>Consume</td><td>always</td><td><b>AP</b> — reads what leader has</td></tr>
+            <tr><td>Metadata / leader</td><td>KRaft / ZK</td><td><b>CP</b> — quorum consensus</td></tr>
+            <tr><td>Offset commit (auto)</td><td>enable.auto.commit=true</td><td><b>AP</b> — async, may re-read</td></tr>
+            <tr><td>Unclean leader election</td><td>=true</td><td><b>AP</b> (data loss allowed)</td></tr>
+            <tr><td>Unclean leader election</td><td>=false (default)</td><td><b>CP</b> (partition offline)</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="card">
+        <div class="kicker">3 pipelines, 3 CAP positions</div>
+        <pre class="code"><span class="cm">// Financial (CP)</span>
+acks=all
+min.insync.replicas=2
+replication.factor=3
+unclean.leader.election.enable=false
+<span class="cm">// → zero loss; partition offline if quorum lost</span>
+
+<span class="cm">// Metrics (AP)</span>
+acks=0                 <span class="cm">// or 1</span>
+replication.factor=2
+unclean.leader.election.enable=true
+<span class="cm">// → maximum throughput &amp; availability; some loss OK</span>
+
+<span class="cm">// User activity (balanced)</span>
+acks=1
+replication.factor=3
+min.insync.replicas=1
+unclean.leader.election.enable=false
+<span class="cm">// → low latency, loss only on rare leader-crash-before-repl</span></pre>
+      </div>
+    </div>
+  </section>
+
+  <!-- G · CLOUD MAPPING -->
+  <section>
+    <div class="sec-h"><span class="n">G</span><h2>Cloud mapping (AWS / GCP / Azure)</h2><span class="tag">same commit log, three clouds</span></div>
+    <table class="cloudtable">
+      <thead><tr>
+        <th>Component</th>
+        <th><span class="hdrlogo"><span class="logochip"><img src="../assets/logos/aws.svg" alt="AWS"></span>AWS</span></th>
+        <th><span class="hdrlogo"><span class="logochip"><img src="../assets/logos/gcp.svg" alt="GCP"></span>GCP</span></th>
+        <th><span class="hdrlogo"><span class="logochip"><img src="../assets/logos/azure.svg" alt="Azure"></span>Azure</span></th>
+      </tr></thead>
+      <tbody>
+        <tr><td>Managed Kafka</td><td><img class="svcicon" src="../assets/logos/services/aws-msk.svg" alt="">MSK / MSK Serverless</td><td><img class="svcicon" src="../assets/logos/services/gcp-pubsub.svg" alt="">Confluent Cloud on GCP</td><td><img class="svcicon" src="../assets/logos/services/azure-eventhubs.svg" alt="">Event Hubs (Kafka endpoint)</td></tr>
+        <tr><td>Native pub/sub</td><td><img class="svcicon" src="../assets/logos/services/aws-sns.svg" alt="">SNS + SQS fan-out</td><td><img class="svcicon" src="../assets/logos/services/gcp-pubsub.svg" alt="">Cloud Pub/Sub (serverless)</td><td><img class="svcicon" src="../assets/logos/services/azure-servicebus.svg" alt="">Service Bus Topics</td></tr>
+        <tr><td>Task queue</td><td><img class="svcicon" src="../assets/logos/services/aws-sqs.svg" alt="">SQS (standard / FIFO)</td><td><img class="svcicon" src="../assets/logos/services/gcp-pubsub.svg" alt="">Pub/Sub pull sub</td><td><img class="svcicon" src="../assets/logos/services/azure-servicebus.svg" alt="">Service Bus Queues</td></tr>
+        <tr><td>Broker compute</td><td><img class="svcicon" src="../assets/logos/services/aws-ecs.svg" alt="">EKS (self-managed Kafka)</td><td><img class="svcicon" src="../assets/logos/services/gcp-run.svg" alt="">GKE (Strimzi operator)</td><td><img class="svcicon" src="../assets/logos/services/azure-aks.svg" alt="">AKS</td></tr>
+        <tr><td>Tiered log storage</td><td><img class="svcicon" src="../assets/logos/services/aws-s3.svg" alt="">S3 (MSK tiered storage)</td><td><img class="svcicon" src="../assets/logos/services/gcp-cloudstorage.svg" alt="">Cloud Storage</td><td><img class="svcicon" src="../assets/logos/services/azure-blob.svg" alt="">Blob Storage</td></tr>
+        <tr><td>Analytics sink</td><td><img class="svcicon" src="../assets/logos/services/aws-redshift.svg" alt="">Redshift / Athena</td><td><img class="svcicon" src="../assets/logos/services/gcp-bigquery.svg" alt="">BigQuery</td><td><img class="svcicon" src="../assets/logos/services/azure-synapse.svg" alt="">Synapse</td></tr>
+        <tr><td>Observability</td><td><img class="svcicon" src="../assets/logos/services/aws-opensearch.svg" alt="">OpenSearch + CloudWatch</td><td><img class="svcicon" src="../assets/logos/services/gcp-bigquery.svg" alt="">Cloud Logging / Monitoring</td><td><img class="svcicon" src="../assets/logos/services/azure-search.svg" alt="">Log Analytics</td></tr>
+      </tbody>
+    </table>
+    <p class="muted">GCP has no first-party managed Kafka — Google's answer is <b>Pub/Sub</b>, an entirely different API (topic + subscription, no partitions). Uber and others run Kafka on GKE via the Strimzi operator when they need the Kafka protocol.</p>
+  </section>
+
+  <!-- H · TRADE-OFFS SUMMARY -->
+  <section>
+    <div class="sec-h"><span class="n">H</span><h2>Trade-offs summary</h2><span class="tag">decision · chosen · alternative · why</span></div>
+    <table>
+      <thead><tr><th>Decision</th><th>Chosen</th><th>Alternative</th><th>Why</th></tr></thead>
+      <tbody>
+        <tr><td>Core data structure</td><td><b>Append-only commit log</b> per partition</td><td>Traditional queue (RabbitMQ)</td><td>O(1) sequential I/O · replay · multi-consumer for free · retained after read</td></tr>
+        <tr><td>Partitioning</td><td><b>Hash on key</b> (default)</td><td>Round-robin</td><td>Per-key ordering (userId → events ordered). RR only when ordering &lt; throughput</td></tr>
+        <tr><td>Durability</td><td><b>acks=all + min.isr=2 + RF=3</b></td><td>acks=1 (Kafka default)</td><td>Zero loss trades ~10 ms latency; the only safe choice for money</td></tr>
+        <tr><td>Delivery guarantee</td><td><b>at-least-once</b> (default)</td><td>at-most-once · exactly-once</td><td>Simple + correct if consumer is idempotent. EOS costs a dedup store</td></tr>
+        <tr><td>Rebalance</td><td><b>Range</b> (in code) → <b>CooperativeSticky</b> (prod)</td><td>RoundRobin · Sticky</td><td>Cooperative removes the stop-the-world pause</td></tr>
+        <tr><td>Retention</td><td><b>Time-based</b> (default) or <b>compaction</b> (per topic)</td><td>Infinite retention</td><td>Bounded storage; compaction for changelogs / CDC / <code>__consumer_offsets</code></td></tr>
+        <tr><td>Metadata store</td><td><b>KRaft</b> (Kafka 3.3+)</td><td>ZooKeeper</td><td>No external ensemble; supports millions of partitions; Raft consensus</td></tr>
+        <tr><td>Storage layout</td><td><b>Segment files</b> + sparse index + page cache + sendfile()</td><td>Custom heap cache</td><td>OS page cache is bigger and better tested than any JVM cache</td></tr>
+        <tr><td>Unclean leader election</td><td><b>false</b> (CP)</td><td>true (AP)</td><td>False for financial data (partition offline). True only for metrics/logs</td></tr>
+        <tr><td>Consumer offset store</td><td><b>__consumer_offsets</b> compacted topic</td><td>External DB / Redis</td><td>Self-bootstrapping · no external dep · replicated · same durability as user data</td></tr>
+        <tr><td>Consumer model</td><td><b>Pull</b> (long-poll)</td><td>Push (RabbitMQ)</td><td>Consumer controls rate; back-pressure free; batching easy</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <!-- I · INTERVIEW WALKTHROUGH -->
+  <section>
+    <div class="sec-h"><span class="n">I</span><h2>Interview walkthrough — timing strip</h2><span class="tag">30–45 min answer</span></div>
+    <div class="grid g2">
+      <div class="card">
+        <div class="kicker">phase-by-phase</div>
+        <ul class="tight">
+          <li><b>P1 · Opening (1 min)</b> — "I'll design a Kafka-style queue: append-only commit log per partition; producers append at O(1) with configurable ack modes; consumers pull by offset; consumer groups share partitions for parallel load-balanced consumption."</li>
+          <li><b>P2 · Requirements (3 min)</b> — FR: produce, consume, commit, subscribe, retention, cluster mgmt. NFR: 1M+ msg/s, p99 &lt; 10 ms, zero-loss with acks=all, per-partition ordering, linear scaling.</li>
+          <li><b>P3 · API (2 min)</b> — POST /topics, POST /topics/{t}/messages, GET /topics/{t}/messages, POST /commit, POST /subscribe.</li>
+          <li><b>P4 · Data model (3 min)</b> — Message (id, key, value, headers, topic, partition, offset, ts), Topic (partitionCount, RF, retentionMs), Partition (leader, replicas, ISR), ConsumerGroup, Offset, BrokerNode.</li>
+          <li><b>P5 · High-level arch (8 min)</b> — commit log per partition · MessageRouter cascade · ReplicationEngine with acks · ConsumerGroupCoordinator (join / leave / rebalance / offsets) · retention cleaner · controller / KRaft.</li>
+          <li><b>P6 · Deep dives (12 min)</b> — pick 2–3 of: <b>ISR + acks + min.isr</b> (zero-loss recipe), <b>hot partition</b> fixes, <b>EOS</b> (idempotent producer + transactions), <b>cooperative rebalance</b>, <b>log compaction</b> vs retention, <b>unclean leader election</b> (CAP).</li>
+          <li><b>P7 · Scaling (5 min)</b> — three axes (partitions / brokers / consumers) · lag alerts · tiered storage · KRaft over ZK.</li>
+          <li><b>P8 · Follow-ups (5 min)</b> — cloud mapping (MSK / Event Hubs / Pub/Sub) · monitoring (lag is #1) · schema evolution (Confluent Registry) · MirrorMaker for multi-DC.</li>
+        </ul>
+      </div>
+      <div class="card">
+        <div class="kicker">green flags vs red flags</div>
+        <p><b>Green:</b></p>
+        <ul class="tight">
+          <li>You say <b>&quot;commit log&quot;</b> not &quot;message broker&quot;. You know why the append-only shape wins.</li>
+          <li>You describe the zero-loss recipe as <b>4 knobs</b>: acks=all · RF=3 · min.isr=2 · unclean.leader.election=false.</li>
+          <li>You separate <b>idempotent producer</b> from <b>transactions</b> when discussing EOS.</li>
+          <li>You mention <b>consumer lag</b> as the #1 operational metric.</li>
+          <li>You mention <b>CooperativeSticky</b> over Range rebalance and <b>static membership</b>.</li>
+          <li>You call out <b>hot partition</b> without being asked.</li>
+        </ul>
+        <p><b>Red:</b></p>
+        <ul class="tight">
+          <li>&quot;Kafka is exactly-once by default&quot; — no, at-least-once is default. EOS needs specific config.</li>
+          <li>&quot;Just add partitions&quot; — you cannot easily shrink; producers need restart to see new topology.</li>
+          <li>Confusing <b>consumer groups</b> with <b>consumers</b> — same groupId shares partitions; different groupId reads independently.</li>
+          <li>Suggesting global ordering — Kafka only guarantees per-partition order.</li>
+          <li>Ignoring <b>controller</b> failover behavior.</li>
+          <li>&quot;Store offsets in Redis&quot; — <code>__consumer_offsets</code> already handles it, durably.</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <!-- GLOSSARY -->
+  <section>
+    <div class="sec-h"><span class="n">§</span><h2>Glossary — one-liners</h2><span class="tag">terms used above</span></div>
+    <div class="grid g2">
+      <div class="card"><table><tbody>
+        <tr><td><b>ISR</b></td><td>In-Sync Replicas — followers within <code>replica.lag.time.max.ms</code></td></tr>
+        <tr><td><b>min.insync.replicas</b></td><td>lower bound on ISR for acks=all to succeed</td></tr>
+        <tr><td><b>KRaft</b></td><td>Kafka's Raft-based metadata quorum, replaces ZooKeeper (3.3+)</td></tr>
+        <tr><td><b>Controller</b></td><td>the broker elected to do leader elections + topic management</td></tr>
+        <tr><td><b>High watermark</b></td><td>next offset to be assigned = latest replicated to all ISR</td></tr>
+        <tr><td><b>Consumer lag</b></td><td><code>latestOffset − committedOffset</code> — the #1 ops metric</td></tr>
+        <tr><td><b>Rebalance</b></td><td>redistribute partitions across group members</td></tr>
+      </tbody></table></div>
+      <div class="card"><table><tbody>
+        <tr><td><b>Idempotent producer</b></td><td>producerId + seqNumber ⇒ broker-side dedup on retries</td></tr>
+        <tr><td><b>Transactions</b></td><td>atomic multi-topic write + offset commit</td></tr>
+        <tr><td><b>EOS</b></td><td>exactly-once semantics = idempotent producer + transactions + read_committed</td></tr>
+        <tr><td><b>Log compaction</b></td><td>retain only latest value per key; tombstone = null value</td></tr>
+        <tr><td><b>Tiered storage</b></td><td>hot on local NVMe, cold on S3 (Kafka 3.6+)</td></tr>
+        <tr><td><b>Unclean leader election</b></td><td>allow out-of-sync replica to lead (AP, data loss)</td></tr>
+        <tr><td><b>Static membership</b></td><td><code>group.instance.id</code> — restart within session timeout = no rebalance</td></tr>
+      </tbody></table></div>
+    </div>
+  </section>
+
+  <footer>
+    <p>Use case 20 · Distributed Message Queue — Canvas 3 of 3 (Deep-dive &amp; Trade-offs). Grounded in <code>20-distributed-message-queue/docs/</code> and the real Java under <code>20-distributed-message-queue/src/</code>.</p>
+    <p class="run"><a href="hld.html">Canvas 1 · HLD</a> · <a href="lld.html">Canvas 2 · LLD</a> · Deep-dive &nbsp;|&nbsp; <a href="../index.html">Hub</a></p>
+  </footer>
+
+</div>
+<script src="../assets/canvas.js"></script>
+</body>
+</html>

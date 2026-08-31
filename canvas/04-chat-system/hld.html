@@ -1,0 +1,290 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>04 · Chat System — HLD</title>
+<link rel="stylesheet" href="../assets/canvas.css">
+</head>
+<body>
+<div class="wrap">
+
+  <header class="hero">
+    <h1>Chat System — High-Level Design</h1>
+    <div class="sub">Use case 04 · Canvas 1 of 3. The big picture: requirements, back-of-envelope numbers, and an <b>interactive architecture diagram</b> — click a component to see its role, then step through the message send and delivery flows (WhatsApp-scale, 500M concurrent connections).</div>
+    <div class="badges">
+      <span class="badge lvl">Use case 04 · HLD</span>
+      <span class="badge">Canvas 1 of 3</span>
+      <span class="badge">interactive</span>
+      <span class="badge">real-time · &lt;200ms delivery</span>
+    </div>
+    <div class="legend">
+      <span><i class="dot" style="background:var(--eden)"></i> click a component</span>
+      <span><i class="dot" style="background:var(--survivor)"></i> stateful connection layer</span>
+      <span><i class="dot" style="background:var(--eden)"></i> current step</span>
+      <span><i class="dot" style="background:var(--old)"></i> data stores</span>
+      <span><i class="dot" style="background:var(--warn)"></i> async / off hot-path</span>
+    </div>
+  </header>
+
+  <!-- A · PROBLEM & REQUIREMENTS -->
+  <section>
+    <div class="sec-h"><span class="n">A</span><h2>Problem &amp; requirements</h2><span class="tag">clarify first</span></div>
+    <div class="grid g2">
+      <div class="card">
+        <div class="kicker">functional</div>
+        <ul class="tight">
+          <li>1:1 and group chat (up to <b>256</b> members) in real time.</li>
+          <li>Online/offline <b>presence</b> + last-seen; <b>read receipts</b> (sent / delivered / read ticks).</li>
+          <li>Paginated message history; media sharing (image/video/file) via object storage.</li>
+          <li><b>Offline delivery</b> — queue messages, deliver on reconnect + push notification.</li>
+        </ul>
+      </div>
+      <div class="card">
+        <div class="kicker">non-functional</div>
+        <ul class="tight">
+          <li><b>Latency</b> &lt; 200 ms delivery for online users (same region).</li>
+          <li><b>Ordering</b> — guaranteed per-conversation; <b>durability</b> — zero loss after ACK.</li>
+          <li><b>Availability</b> 99.99%; <b>scale</b> 500M concurrent WebSocket connections.</li>
+          <li><b>Delivery</b> at-least-once (clients dedup by messageId); presence is eventually consistent.</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <!-- B · ESTIMATION -->
+  <section>
+    <div class="sec-h"><span class="n">B</span><h2>Back-of-envelope estimation</h2><span class="tag">500M DAU · 40B msgs/day</span></div>
+    <div class="chips">
+      <div class="chip"><span class="k">Avg msg QPS</span><span class="v">~460K/s</span></div>
+      <div class="chip"><span class="k">Peak msg QPS</span><span class="v">~800K/s</span></div>
+      <div class="chip"><span class="k">Concurrent conns</span><span class="v">500M</span></div>
+      <div class="chip"><span class="k">Conn servers</span><span class="v">~10,000</span></div>
+      <div class="chip"><span class="k">Text storage</span><span class="v">~4 TB/day</span></div>
+      <div class="chip"><span class="k">Media storage</span><span class="v">~800 TB/day</span></div>
+      <div class="chip"><span class="k">Msg size</span><span class="v">~100 B</span></div>
+      <div class="chip"><span class="k">Server retention</span><span class="v">30 days</span></div>
+    </div>
+    <div class="callout tip"><b>Derivation:</b> 40B msgs/day ÷ 86,400 ≈ <b>460K/s</b> avg · peak ×1.8 ≈ <b>800K/s</b> · 500M conns ÷ ~50K per WebSocket server ≈ <b>10K servers</b> · text = 40B × 100 B ≈ 4 TB/day (1.44 PB/yr) · media = 4B × 200 KB ≈ 800 TB/day (served via CDN, not chat servers). The dominant cost is the <b>always-on stateful connection tier</b>, not compute. <span class="run">→ full math on canvas 3 &amp; F · Estimation</span></div>
+  </section>
+
+  <!-- C · INTERACTIVE ARCHITECTURE -->
+  <section data-flowscope>
+    <div class="sec-h"><span class="n">C</span><h2>Architecture — click components, then step the flows</h2><span class="tag">the design, from the diagram</span></div>
+    <div>
+      <div class="arch">
+        <svg viewBox="0 0 900 380" width="100%" style="max-width:900px" role="img" aria-label="Chat system architecture">
+          <defs>
+            <marker id="ah" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" fill="var(--muted)"></path></marker>
+          </defs>
+
+          <!-- arrows (drawn first, under the boxes) -->
+          <line class="arrow" x1="104" y1="192" x2="118" y2="192" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"
+                data-flow="write" data-write="1"
+                data-desc-write="Alice's client sends the message over a persistent WebSocket to the load balancer."></line>
+          <line class="arrow" x1="212" y1="192" x2="230" y2="192" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"
+                data-flow="write" data-write="2"
+                data-desc-write="LB routes to the Connection Gateway server that holds Alice's WebSocket (session affinity / registry)."></line>
+          <line class="arrow" x1="344" y1="192" x2="382" y2="192" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"
+                data-flow="write" data-write="3"
+                data-desc-write="Connection Gateway validates and forwards the message to a stateless Message Service instance."></line>
+          <line class="arrow" x1="442" y1="168" x2="442" y2="90" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"
+                data-flow="write" data-write="4"
+                data-desc-write="Message Service assigns a monotonic sequence_number via Redis INCR on seq:{conversationId} — guarantees per-conversation ordering."></line>
+          <line class="arrow" x1="500" y1="192" x2="538" y2="192" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"
+                data-flow="write" data-write="5"
+                data-desc-write="Message Service persists the message to Cassandra (QUORUM write) before ACKing — durability."></line>
+          <line class="arrow" x1="442" y1="216" x2="442" y2="298" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"
+                data-flow="write" data-write="6"
+                data-desc-write="Message Service publishes to Kafka with key = conversationId, then returns ACK → single tick (SENT) to Alice."></line>
+
+          <line class="arrow" x1="500" y1="324" x2="538" y2="324" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"
+                data-flow="read" data-read="1"
+                data-desc-read="Message Router consumes from Kafka (one consumer per partition — ordering preserved)."></line>
+          <path class="arrow" d="M660,306 C 730,200 700,120 504,88" fill="none" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"
+                data-flow="read" data-read="2"
+                data-desc-read="Router looks up the recipient in the Redis connection registry: conn:{userId} → connectionServerId."></path>
+          <path class="arrow" d="M598,300 C 470,270 400,252 346,206" fill="none" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"
+                data-flow="read" data-read="3"
+                data-desc-read="Recipient ONLINE → Router forwards to their Connection Gateway server via internal RPC (batched per server for groups)."></path>
+          <path class="arrow" d="M232,180 C 150,150 100,150 64,176" fill="none" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"
+                data-flow="read" data-read="4"
+                data-desc-read="Connection Gateway pushes newMessage over Bob's WebSocket; his client ACKs → double tick (DELIVERED)."></path>
+          <line class="arrow" x1="672" y1="300" x2="700" y2="90" stroke="var(--muted)" stroke-width="2" stroke-dasharray="4 3" marker-end="url(#ah)"
+                data-flow="read" data-read="5"
+                data-desc-read="Recipient OFFLINE → queue in Redis (RPUSH offline:{userId}, 30-day TTL) and trigger a push notification via FCM/APNs."></line>
+
+          <!-- static async media arrow -->
+          <path class="arrow" d="M40,168 L40,90" fill="none" stroke="var(--muted)" stroke-width="2" stroke-dasharray="4 3" marker-end="url(#ah)"></path>
+          <text x="12" y="128" fill="var(--faint)" font-size="9">media direct</text>
+
+          <!-- nodes -->
+          <g data-node style="cursor:pointer" data-title="Client (mobile / web)" data-detail="WhatsApp-style client. Holds one persistent WebSocket for real-time send/receive, plus REST for history &amp; media. Dedups by messageId, reorders by sequence_number, and uploads media directly to object storage (not through chat servers)."><rect x="16" y="168" width="88" height="48" rx="9" fill="var(--panel-2)" stroke="var(--eden)"></rect><text x="60" y="192" text-anchor="middle" fill="var(--eden)" font-size="12" font-weight="600">Client</text><text x="60" y="207" text-anchor="middle" fill="var(--faint)" font-size="10">mobile / web</text></g>
+
+          <g data-node style="cursor:pointer" data-title="Load Balancer / API Gateway" data-detail="<b>Role:</b> single entry point — TLS termination, WebSocket upgrade, auth, geo-routing to the nearest region.<br><b>Tech:</b> ALB / API Gateway (WebSocket) with sticky sessions OR a connection registry.<br><b>Note:</b> at 500M conns, managed WS gateways get pricey per-message — large deployments move to custom servers."><rect x="118" y="168" width="94" height="48" rx="9" fill="var(--panel-2)" stroke="var(--border)"></rect><text x="165" y="188" text-anchor="middle" fill="var(--text)" font-size="11" font-weight="600">Load Bal.</text><text x="165" y="203" text-anchor="middle" fill="var(--faint)" font-size="10">/ API GW · WS</text></g>
+
+          <g data-node style="cursor:pointer" data-title="Connection Gateway (STATEFUL)" data-detail="<b>Role:</b> maintains the persistent WebSocket per client — the hardest part of the system.<br><b>Scale:</b> ~10,000 servers, ~50K conns each; registers conn:{userId}→serverId in Redis (TTL, refreshed by heartbeat).<br><b>Tech:</b> Netty / Spring WebFlux (non-blocking). Consistent-hashing LB affinity; graceful drain on shutdown.<br><b>Code:</b> ConnectionHandler + ConnectionRegistry."><rect x="230" y="168" width="114" height="48" rx="9" fill="var(--panel-2)" stroke="var(--survivor)"></rect><text x="287" y="188" text-anchor="middle" fill="var(--survivor)" font-size="11" font-weight="600">Connection GW</text><text x="287" y="203" text-anchor="middle" fill="var(--faint)" font-size="10">stateful · ~10K nodes</text></g>
+
+          <g data-node style="cursor:pointer" data-title="Message Service (stateless)" data-detail="<b>Role:</b> validate membership + size, assign sequence_number (Redis INCR), persist to Cassandra, publish to Kafka, ACK the sender.<br><b>Stateless:</b> any instance handles any message → scales horizontally behind the LB.<br><b>Durability:</b> persist BEFORE ACK; retry with messageId idempotency key.<br><b>Code:</b> MessageService."><rect x="384" y="168" width="116" height="48" rx="9" fill="var(--panel-2)" stroke="var(--border)"></rect><text x="442" y="188" text-anchor="middle" fill="var(--text)" font-size="11" font-weight="600">Message Service</text><text x="442" y="203" text-anchor="middle" fill="var(--faint)" font-size="10">stateless · sequence</text></g>
+
+          <g data-node style="cursor:pointer" data-title="Redis Cluster" data-detail="<b>Role:</b> connection registry (userId→serverId), presence (TTL heartbeat), per-conversation sequence counter (INCR), group-member cache, and per-user offline queue (LIST).<br><b>Why:</b> in-memory speed, TTL for auto-cleanup, pub/sub for presence fan-out.<br><b>Scaling:</b> Redis Cluster, sharded; separate clusters per concern."><rect x="384" y="42" width="116" height="48" rx="9" fill="var(--panel-2)" stroke="var(--old)"></rect><text x="442" y="62" text-anchor="middle" fill="var(--old)" font-size="11" font-weight="600">Redis Cluster</text><text x="442" y="77" text-anchor="middle" fill="var(--faint)" font-size="10">registry · presence · seq</text></g>
+
+          <g data-node style="cursor:pointer" data-title="Cassandra — messages" data-detail="<b>Access pattern:</b> write-heavy (~460K/s), time-series reads per conversation → NoSQL LSM store is ideal.<br><b>Schema:</b> PK = conversation_id, clustering = sequence_number DESC (natural sort, co-located).<br><b>Config:</b> RF=3, QUORUM writes / ONE reads, native TTL for 30-day retention."><rect x="540" y="168" width="120" height="48" rx="9" fill="var(--panel-2)" stroke="var(--old)"></rect><text x="600" y="188" text-anchor="middle" fill="var(--old)" font-size="11" font-weight="600">Cassandra</text><text x="600" y="203" text-anchor="middle" fill="var(--faint)" font-size="10">messages · time-series</text></g>
+
+          <g data-node style="cursor:pointer" data-title="PostgreSQL — users &amp; groups" data-detail="<b>Role:</b> relational source of truth for user profiles, groups, and membership (joins, ACID).<br><b>Why:</b> small dataset (~500M users), strong consistency for membership changes (don't deliver to a removed member).<br><b>CAP:</b> CP. Hot rows cached in Redis."><rect x="540" y="42" width="120" height="48" rx="9" fill="var(--panel-2)" stroke="var(--old)"></rect><text x="600" y="62" text-anchor="middle" fill="var(--old)" font-size="11" font-weight="600">PostgreSQL</text><text x="600" y="77" text-anchor="middle" fill="var(--faint)" font-size="10">users · groups</text></g>
+
+          <g data-node style="cursor:pointer" data-title="Kafka (message bus)" data-detail="<b>Role:</b> decouples the write path from fan-out and guarantees ordering.<br><b>Ordering:</b> partition key = conversationId → all messages for a chat land on one partition, delivered in order.<br><b>Scaling:</b> add partitions + consumers; target 10K–50K partitions."><rect x="384" y="300" width="116" height="48" rx="9" fill="var(--panel-2)" stroke="var(--warn)"></rect><text x="442" y="320" text-anchor="middle" fill="var(--warn)" font-size="11" font-weight="600">Kafka</text><text x="442" y="335" text-anchor="middle" fill="var(--faint)" font-size="10">partition = convId</text></g>
+
+          <g data-node style="cursor:pointer" data-title="Message Router / Fan-out" data-detail="<b>Role:</b> consumes from Kafka and routes to the recipients' connection servers.<br><b>1:1:</b> look up the one recipient in Redis, forward via RPC.<br><b>Group:</b> fetch member list, batch recipients per connection server (50 on server-7 → one RPC), stagger large groups to avoid thundering herd.<br><b>Code:</b> MessageRouter."><rect x="540" y="300" width="120" height="48" rx="9" fill="var(--panel-2)" stroke="var(--border)"></rect><text x="600" y="320" text-anchor="middle" fill="var(--text)" font-size="11" font-weight="600">Message Router</text><text x="600" y="335" text-anchor="middle" fill="var(--faint)" font-size="10">fan-out worker</text></g>
+
+          <g data-node style="cursor:pointer" data-title="Push Notification Service" data-detail="<b>Role:</b> notify OFFLINE users (no Redis presence key).<br><b>Flow:</b> consume a push event → look up device tokens → send via FCM (Android) / APNs (iOS) with sender + preview + deep link.<br><b>Batching:</b> collapse bursts (‘3 new messages from Alice’); rate-limit per conversation."><rect x="700" y="300" width="132" height="48" rx="9" fill="var(--panel-2)" stroke="var(--warn)"></rect><text x="766" y="320" text-anchor="middle" fill="var(--warn)" font-size="11" font-weight="600">Push Notif.</text><text x="766" y="335" text-anchor="middle" fill="var(--faint)" font-size="10">FCM / APNs · offline</text></g>
+
+          <g data-node style="cursor:pointer" data-title="Media Service — S3 + CDN" data-detail="<b>Role:</b> keep large binaries off the chat servers.<br><b>Flow:</b> client requests a pre-signed upload URL → uploads directly to S3 → sends a chat message carrying only the CDN URL.<br><b>Why:</b> S3 gives 11-nines durability, CloudFront delivers at the edge — cuts chat-server bandwidth ~99% for media."><rect x="16" y="42" width="132" height="48" rx="9" fill="var(--panel-2)" stroke="var(--old)"></rect><text x="82" y="62" text-anchor="middle" fill="var(--old)" font-size="11" font-weight="600">Media · S3 + CDN</text><text x="82" y="77" text-anchor="middle" fill="var(--faint)" font-size="10">pre-signed URL</text></g>
+        </svg>
+      </div>
+      <div class="node-detail"><span class="nd-title">Click any component</span><div class="nd-body">Its role, tech choice, and scaling note appear here. Then use the buttons below to step through a request flow.</div></div>
+
+      <div class="flowctl" data-flowctl>
+        <button class="btn" data-flow="write">Send path (Alice → server)</button>
+        <button class="btn" data-flow="read">Delivery path (server → Bob)</button>
+        <span style="flex:1"></span>
+        <button class="btn" data-flowstep="prev">◀ Prev</button>
+        <button class="btn" data-flowstep="next">Next ▶</button>
+      </div>
+      <div class="flowlabel" data-flowlabel>Pick <b>Send</b> or <b>Delivery</b>, then press “Next ▶” to walk the numbered flow one hop at a time. Send ends at the single-tick ACK; Delivery covers both the online (double tick) and offline (queue + push) branches.</div>
+
+      <div class="cloudmap">
+        <div class="kicker" style="margin-top:4px">Managed-service mapping — the same components on each cloud</div>
+        <table class="cloudtable">
+          <thead><tr>
+            <th>Component</th>
+            <th><span class="hdrlogo"><span class="logochip"><img src="../assets/logos/aws.svg" alt="AWS"></span>AWS</span></th>
+            <th><span class="hdrlogo"><span class="logochip"><img src="../assets/logos/gcp.svg" alt="GCP"></span>GCP</span></th>
+            <th><span class="hdrlogo"><span class="logochip"><img src="../assets/logos/azure.svg" alt="Azure"></span>Azure</span></th>
+          </tr></thead>
+          <tbody>
+            <tr><td>WebSocket LB / gateway</td><td><img class="svcicon" src="../assets/logos/services/aws-elb.svg" alt="">API Gateway (WS) / ALB</td><td><img class="svcicon" src="../assets/logos/services/gcp-elb.svg" alt="">Cloud Load Balancing</td><td><img class="svcicon" src="../assets/logos/services/azure-appgw.svg" alt="">App Gateway / SignalR</td></tr>
+            <tr><td>Connection &amp; message servers</td><td><img class="svcicon" src="../assets/logos/services/aws-ecs.svg" alt="">ECS / EKS</td><td><img class="svcicon" src="../assets/logos/services/gcp-run.svg" alt="">Cloud Run / GKE</td><td><img class="svcicon" src="../assets/logos/services/azure-aks.svg" alt="">AKS</td></tr>
+            <tr><td>Presence / cache (Redis)</td><td><img class="svcicon" src="../assets/logos/services/aws-elasticache.svg" alt="">ElastiCache</td><td><img class="svcicon" src="../assets/logos/services/gcp-memorystore.svg" alt="">Memorystore</td><td><img class="svcicon" src="../assets/logos/services/azure-redis.svg" alt="">Cache for Redis</td></tr>
+            <tr><td>Message store (Cassandra)</td><td><img class="svcicon" src="../assets/logos/services/aws-dynamodb.svg" alt="">Keyspaces / DynamoDB</td><td><img class="svcicon" src="../assets/logos/services/gcp-bigtable.svg" alt="">Bigtable</td><td><img class="svcicon" src="../assets/logos/services/azure-cosmos.svg" alt="">Cosmos DB (Cassandra API)</td></tr>
+            <tr><td>Message queue (Kafka)</td><td><img class="svcicon" src="../assets/logos/services/aws-msk.svg" alt="">MSK / Kinesis</td><td><img class="svcicon" src="../assets/logos/services/gcp-pubsub.svg" alt="">Pub/Sub</td><td><img class="svcicon" src="../assets/logos/services/azure-eventhubs.svg" alt="">Event Hubs</td></tr>
+            <tr><td>User / group metadata (SQL)</td><td>RDS (PostgreSQL)</td><td>Cloud SQL</td><td>Azure Database for PostgreSQL</td></tr>
+            <tr><td>Media storage + CDN</td><td>S3 + CloudFront</td><td>Cloud Storage + Cloud CDN</td><td>Blob Storage + Azure CDN</td></tr>
+            <tr><td>Push notifications</td><td>SNS + FCM/APNs</td><td>Firebase (FCM)</td><td>Notification Hubs</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+
+  <!-- D · API -->
+  <section>
+    <div class="sec-h"><span class="n">D</span><h2>API design</h2><span class="tag">WebSocket-first + REST fallback</span></div>
+    <div class="grid g2">
+      <div class="card">
+        <div class="kicker">WebSocket — real-time channel</div>
+        <table>
+          <thead><tr><th>Event</th><th>Direction</th><th>Purpose</th></tr></thead>
+          <tbody>
+            <tr><td><code>connect(userId, token)</code></td><td>C→S</td><td>open WS, register conn:{userId}→serverId in Redis</td></tr>
+            <tr><td><code>sendMessage(chatId, content, type)</code></td><td>C→S</td><td>send; server returns ACK + messageId + seq</td></tr>
+            <tr><td><code>ack(messageId, status)</code></td><td>C→S</td><td>DELIVERED / READ acknowledgement</td></tr>
+            <tr><td><code>newMessage / messageStatus</code></td><td>S→C</td><td>incoming message · tick updates</td></tr>
+            <tr><td><code>presenceUpdate / typingIndicator</code></td><td>S→C</td><td>contact online/offline · typing (ephemeral)</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="card">
+        <div class="kicker">REST — fallback &amp; management</div>
+        <table>
+          <thead><tr><th>Endpoint</th><th>Purpose</th></tr></thead>
+          <tbody>
+            <tr><td><code>POST /api/messages/send</code></td><td>send when WS unavailable (201 + seq)</td></tr>
+            <tr><td><code>GET /api/messages/{chatId}?before&amp;limit=50</code></td><td>history — cursor paginated, reverse-chron</td></tr>
+            <tr><td><code>POST /api/groups</code> · <code>PUT …/members</code></td><td>create group · add/remove members</td></tr>
+            <tr><td><code>GET /api/users/{userId}/presence</code></td><td>presence status</td></tr>
+            <tr><td><code>POST /api/media/upload-url</code></td><td>pre-signed URL for direct S3 upload</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+
+  <!-- E · DATA MODEL -->
+  <section>
+    <div class="sec-h"><span class="n">E</span><h2>Data model</h2><span class="tag">right store per shape</span></div>
+    <div class="grid g2">
+      <div class="card">
+        <div class="kicker">message — Cassandra (write-heavy)</div>
+        <pre class="code">conversation_id UUID    <span class="cm">// partition key</span>
+sequence_number BIGINT  <span class="cm">// clustering, DESC</span>
+message_id      UUID
+sender_id       UUID
+content         TEXT
+type            TEXT     <span class="cm">// TEXT/IMAGE/VIDEO/FILE</span>
+media_url       TEXT
+created_at      TIMESTAMP</pre>
+        <p class="muted">PK <code>(conversation_id)</code> + clustering <code>sequence_number DESC</code> → all messages for a chat co-located and sorted. TTL for 30-day server retention.</p>
+      </div>
+      <div class="card">
+        <div class="kicker">status &amp; membership + Redis keys</div>
+        <pre class="code">message_status (Cassandra)
+  message_id UUID, user_id UUID
+  status TEXT   <span class="cm">// SENT/DELIVERED/READ</span>
+
+conversation_member (PostgreSQL)
+  conversation_id, user_id, role
+  last_read_message_id   <span class="cm">// read pos</span>
+
+Redis: conn:{userId}→serverId (TTL)
+       presence:{userId} (TTL 60s)
+       seq:{conversationId} (INCR)
+       offline:{userId} (LIST, 30d)</pre>
+        <p class="muted">Per-conversation read position (<code>last_read_message_id</code>) batches read receipts — one update marks all earlier messages READ.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- F · KEY CHOICES -->
+  <section>
+    <div class="sec-h"><span class="n">F</span><h2>Key design choices (deep-dived on canvas 3)</h2><span class="tag">defend these</span></div>
+    <div class="grid g3">
+      <div class="card"><div class="kicker">connection layer</div><h3>WebSocket + Redis registry</h3><p class="muted">Persistent bidirectional channel; a registry (userId→serverId) lets any router reach any user — beats sticky sessions for failover &amp; even load. <span class="run">→ canvas 2 · LLD</span></p></div>
+      <div class="card"><div class="kicker">fan-out</div><h3>Fan-out on write</h3><p class="muted">Push to recipients immediately; batch per connection server for groups. Max group 256 bounds the cost — read fan-out only for broadcast channels.</p></div>
+      <div class="card"><div class="kicker">ordering</div><h3>Kafka partition = convId</h3><p class="muted">Per-conversation ordering via partition + Redis sequence number; client reorders as defense in depth. No global order needed. <span class="run">→ canvas 3</span></p></div>
+      <div class="card"><div class="kicker">storage</div><h3>Cassandra + PostgreSQL</h3><p class="muted">Cassandra for write-heavy time-series messages; PostgreSQL (CP) for relational user/group metadata.</p></div>
+      <div class="card"><div class="kicker">delivery guarantee</div><h3>At-least-once + dedup</h3><p class="muted">Exactly-once is too costly; persist-before-ACK gives durability, clients dedup by messageId. <span class="run">→ canvas 3</span></p></div>
+      <div class="card"><div class="kicker">presence</div><h3>Heartbeat + TTL (AP)</h3><p class="muted">30s heartbeat refreshes a 60s Redis TTL; stale “online” for a few seconds is harmless. Availability &gt; strict consistency.</p></div>
+    </div>
+  </section>
+
+  <!-- GLOSSARY -->
+  <section>
+    <div class="sec-h"><span class="n">§</span><h2>Glossary — one-liners</h2><span class="tag">terms used above</span></div>
+    <div class="grid g2">
+      <div class="card"><table><tbody>
+        <tr><td><b>WebSocket</b></td><td>persistent bidirectional TCP channel — server can push without the client polling</td></tr>
+        <tr><td><b>Connection registry</b></td><td>Redis map userId→serverId so any node can find which server holds a user's socket</td></tr>
+        <tr><td><b>Stateful vs stateless</b></td><td>Connection Gateway pins a socket (stateful); Message Service keeps none (stateless)</td></tr>
+        <tr><td><b>Fan-out on write</b></td><td>push a new message to every recipient at send time (vs pull on read)</td></tr>
+        <tr><td><b>Sequence number</b></td><td>monotonic per-conversation counter (Redis INCR) giving gap-free ordering</td></tr>
+      </tbody></table></div>
+      <div class="card"><table><tbody>
+        <tr><td><b>Heartbeat / TTL</b></td><td>periodic ping refreshes a short-lived Redis key; expiry ⇒ user offline</td></tr>
+        <tr><td><b>At-least-once</b></td><td>a message may arrive twice but never zero times; client dedups by messageId</td></tr>
+        <tr><td><b>Ticks</b></td><td>single = SENT, double = DELIVERED, blue = READ (per-member in groups)</td></tr>
+        <tr><td><b>QUORUM</b></td><td>a majority of Cassandra replicas must ack a write for durability</td></tr>
+        <tr><td><b>Thundering herd</b></td><td>a burst of simultaneous fan-out RPCs — avoided by batching/staggering</td></tr>
+      </tbody></table></div>
+    </div>
+  </section>
+
+  <footer>
+    <p>Use case 04 · Chat System — Canvas 1 of 3 (HLD). Grounded in <code>04-chat-system/docs/hld/</code> and <code>docs/cloud/</code>.</p>
+    <p class="run">This use case: HLD · <a href="lld.html">Canvas 2 · LLD</a> · <a href="deepdive.html">Canvas 3 · Deep-dive &amp; Trade-offs</a> &nbsp;|&nbsp; Next → <a href="lld.html">02 · LLD</a> &nbsp;|&nbsp; <a href="../index.html">Hub</a></p>
+  </footer>
+
+</div>
+<script src="../assets/canvas.js"></script>
+</body>
+</html>

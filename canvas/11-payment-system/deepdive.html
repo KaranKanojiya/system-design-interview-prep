@@ -1,0 +1,352 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>11 · Payment System — Deep-dive &amp; Trade-offs</title>
+<link rel="stylesheet" href="../assets/canvas.css">
+</head>
+<body>
+<div class="wrap">
+
+  <header class="hero">
+    <h1>Payment System — Deep-dive &amp; Trade-offs</h1>
+    <div class="sub">Use case 11 · Canvas 3 of 3. The hard parts: how to <b>scale</b> a ledger that must stay ACID, what you can (and must never) <b>cache</b> when money is involved, the <b>bottlenecks</b> that double-charge customers or unbalance the books (and their fixes), why a payment system is strictly <b>CP</b>, and a phase-by-phase <b>interview walkthrough</b>. <b>Switch the sharding tabs</b> and <b>open the bottleneck cards</b> to explore.</div>
+    <div class="badges">
+      <span class="badge lvl">Use case 11 · Deep-dive</span>
+      <span class="badge">Canvas 3 of 3</span>
+      <span class="badge">interactive</span>
+      <span class="badge">CP · exactly-once · ACID</span>
+    </div>
+    <div class="legend">
+      <span><i class="dot" style="background:var(--eden)"></i> switch a tab</span>
+      <span><i class="dot" style="background:var(--old)"></i> open a bottleneck</span>
+      <span><i class="dot" style="background:var(--survivor)"></i> chosen option</span>
+      <span><i class="dot" style="background:var(--warn)"></i> failure / risk</span>
+      <span><i class="dot" style="background:var(--gc)"></i> fix / mitigation</span>
+    </div>
+  </header>
+
+  <!-- A · SCALING STRATEGY -->
+  <section>
+    <div class="sec-h"><span class="n">A</span><h2>Scaling strategy</h2><span class="tag">scale ACID without breaking it</span></div>
+    <div class="grid g3">
+      <div class="card"><div class="kicker">app tier</div><h3>Stateless → horizontal</h3><p class="muted">The <code>PaymentService</code> orchestrator holds no state — idempotency lives in Redis, truth in Postgres. Any instance can serve any request, so auto-scale behind the LB. The bank/card-network call (~200 ms) dominates latency, not CPU.</p></div>
+      <div class="card"><div class="kicker">read replicas</div><h3>Dashboards only, never decisions</h3><p class="muted">Aurora read replicas have ms–s replication lag. Route <b>display</b> queries (merchant dashboard, reporting, analytics) to replicas; every <b>decision</b> query — balance check, idempotency, refund eligibility — hits the primary with <code>SELECT … FOR UPDATE</code>.</p></div>
+      <div class="card"><div class="kicker">functional partitioning</div><h3>Split by service first</h3><p class="muted">Before sharding rows, split by concern: Payment, Ledger, Fraud, Webhook, Reconciliation. Card charges are synchronous; settlement, payouts and reconciliation run as async daily batches, so back-office load never competes with the money path.</p></div>
+    </div>
+
+    <div data-tabscope style="margin-top:16px">
+      <div class="kicker">database partitioning — how to shard a ledger that must stay ACID</div>
+      <div class="tabs">
+        <button class="tab active" data-tab="merchant">Shard by merchant_id</button>
+        <button class="tab" data-tab="payment">Hash on payment_id</button>
+        <button class="tab" data-tab="replicas">Single primary + replicas</button>
+      </div>
+
+      <div class="tabpanel active" data-panel="merchant">
+        <div class="grid g2">
+          <div class="card">
+            <h3>Shard by merchant_id <span class="run">← chosen at scale</span></h3>
+            <p class="muted">Co-locate a merchant's payments, ledger entries and balance on one shard, so the debit + credit + balance update stay inside <b>one single-shard ACID transaction</b>. Balance validation and payouts for a merchant never cross shards.</p>
+            <pre class="code">shard = <span class="ty">hash</span>(merchant_id) % N   <span class="cm">// merchant's books stay together</span></pre>
+          </div>
+          <div class="card">
+            <div class="kicker">verdict</div>
+            <ul class="tight">
+              <li><b>Atomicity preserved:</b> double-entry write is local to one shard — no distributed 2PC.</li>
+              <li>Per-merchant balance <code>SUM</code> and reconciliation stay single-shard.</li>
+              <li><span style="color:var(--warn)">Hot merchant risk:</span> a huge merchant can skew a shard → split that merchant onto a dedicated shard.</li>
+            </ul>
+          </div>
+        </div>
+      </div>
+
+      <div class="tabpanel" data-panel="payment">
+        <div class="grid g2">
+          <div class="card">
+            <h3>Hash on payment_id</h3>
+            <p class="muted">Route each payment by <code>hash(payment_id) % N</code>. Writes spread perfectly evenly and no single merchant can hot-spot a shard.</p>
+            <pre class="code">shard = <span class="ty">hash</span>(payment_id) % N   <span class="cm">// even write spread, but…</span></pre>
+          </div>
+          <div class="card">
+            <div class="kicker">verdict — avoid for the ledger</div>
+            <ul class="tight">
+              <li><span style="color:var(--warn)">Cross-shard aggregation:</span> a merchant's entries scatter across all shards, so balance <code>SUM</code> and payout fan out to every node.</li>
+              <li>Debit and credit of one payment can land on different shards → needs distributed transaction. Fine for a payment record store, painful for double-entry books.</li>
+              <li>Good for high-throughput <b>non-financial</b> data (rate-limit counters, sessions).</li>
+            </ul>
+          </div>
+        </div>
+      </div>
+
+      <div class="tabpanel" data-panel="replicas">
+        <div class="grid g2">
+          <div class="card">
+            <h3>Single primary + read replicas</h3>
+            <p class="muted">Don't shard at all until you must. One Aurora primary handles ~50K TPS — far above real payment-write volume — with replicas fanning out read-only display traffic.</p>
+            <pre class="code"><span class="cm">// decisions → primary, always</span>
+<span class="kw">SELECT</span> balance … <span class="kw">FOR UPDATE</span>   <span class="cm">// row lock, no replica</span>
+<span class="cm">// dashboards / reports → replica (lag OK)</span></pre>
+          </div>
+          <div class="card">
+            <div class="kicker">verdict — start here</div>
+            <ul class="tight">
+              <li><b>Simplest correct design:</b> one writer means no cross-shard transaction problem at all.</li>
+              <li>Vertical scale + replicas carries you a long way; shard by merchant only when the primary saturates.</li>
+              <li><span style="color:var(--warn)">Never</span> read a balance from a replica — replication lag = approve-an-overdraft.</li>
+            </ul>
+          </div>
+        </div>
+      </div>
+
+      <div class="callout tip"><b>Money-safe scaling rule:</b> scale the <b>throughput</b> (stateless app tier, replicas for reads, functional split) freely, but keep every <b>correctness</b> operation — idempotency, balance, double-entry — on a single authoritative primary/shard inside one ACID transaction.</div>
+    </div>
+  </section>
+
+  <!-- B · CACHING DEEP-DIVE -->
+  <section>
+    <div class="sec-h"><span class="n">B</span><h2>Caching deep-dive</h2><span class="tag">cache for speed, read the DB for decisions</span></div>
+    <div class="callout"><b>The golden rule:</b> <b>CACHE for SPEED, read from the DB for DECISIONS.</b> A stale exchange rate on a dashboard is fine; a stale balance that approves a payment is an overdraft someone pays for. Payment caching is deliberately conservative.</div>
+    <div class="grid g2" style="margin-top:14px">
+      <div class="card">
+        <div class="kicker">idempotency — the most critical cache</div>
+        <pre class="code"><span class="kw">SET</span> idem:{key} <span class="st">"PENDING"</span> NX EX 86400
+  ├─ OK  → first request → process
+  └─ NIL → duplicate → GET &amp; return cached result
+
+<span class="kw">after commit:</span> SET idem:{key} <span class="st">"{result}"</span> XX EX 86400</pre>
+        <p class="muted"><code>SET NX</code> is an atomic, sub-ms check-and-set — Redis is single-threaded so two racing retries serialise, exactly one wins. Backed by <code>InMemoryIdempotencyRepository</code> in the sim; a Postgres <code>UNIQUE(idempotency_key)</code> is the defence-in-depth safety net.</p>
+      </div>
+      <div class="card">
+        <div class="kicker">what you must NEVER cache</div>
+        <pre class="code"><span class="cm">// balance check — always primary, always locked</span>
+<span class="kw">SELECT</span> balance <span class="kw">FROM</span> accounts
+  <span class="kw">WHERE</span> account_id = ? <span class="kw">FOR UPDATE</span>;
+<span class="kw">UPDATE</span> accounts <span class="kw">SET</span> balance = balance - ?
+  <span class="kw">WHERE</span> … <span class="kw">AND</span> balance &gt;= ?;   <span class="cm">// 0 rows = declined</span></pre>
+        <p class="muted"><b>Payment status, ledger entries, account balances, transaction IDs</b> are never cached. A 2-second stale balance approves a $100 charge against a $50 account → overdraft. 5 ms via <code>FOR UPDATE</code> beats 0.5 ms that is sometimes wrong.</p>
+      </div>
+    </div>
+
+    <div class="grid g3" style="margin-top:14px">
+      <div class="card">
+        <div class="kicker">exchange rates · cache-aside</div>
+        <h3>5-min TTL, lock at auth</h3>
+        <p class="muted">Forex API is ~100 ms; rates don't move per-second. Cache-aside with a 5-min TTL for display. But at checkout, <code>CurrencyService</code> <b>locks the rate at authorization time</b> and stores it on the payment — settlement uses the locked rate, never the current one.</p>
+        <pre class="code"><span class="kw">GET</span> exchange:USD_INR
+  MISS → forex API → SET … EX 300
+lockRate() → freeze rate on payment</pre>
+      </div>
+      <div class="card">
+        <div class="kicker">merchant config · read-through</div>
+        <h3>10-min TTL, shared</h3>
+        <p class="muted">Webhook URL, API version and notification prefs change rarely and many services read them (Webhook, Payment, Dashboard). Read-through centralises DB access so no two services cache with different logic.</p>
+        <pre class="code">merchant:{id} → cache
+  MISS → SELECT … → fill (EX 600)</pre>
+      </div>
+      <div class="card">
+        <div class="kicker">webhook retries · Redis ZSET</div>
+        <h3>Sorted set by retry time</h3>
+        <p class="muted">Score = next-retry epoch, member = delivery id. <code>ZRANGEBYSCORE 0 now</code> pulls everything due — time-based scheduling Kafka can't do cheaply. Delivery status still lives in Postgres.</p>
+        <pre class="code"><span class="kw">ZADD</span> webhook:retry {now+delay} {id}
+<span class="kw">ZRANGEBYSCORE</span> webhook:retry 0 {now}</pre>
+      </div>
+    </div>
+    <div class="callout tip"><b>When Redis dies:</b> idempotency <b>fails fast → 503</b> (never process without a dedup check; fall back to the DB <code>UNIQUE</code> constraint if the SLA demands it). Exchange rates degrade to last-known in-memory rates; merchant config reads straight from Postgres; webhook retries pause (records are durable in Postgres). Redis Sentinel / Cluster gives 5–30 s auto-failover. <span class="run">→ no CDN anywhere on the money path.</span></div>
+  </section>
+
+  <!-- C · BOTTLENECKS & SOLUTIONS -->
+  <section>
+    <div class="sec-h"><span class="n">C</span><h2>Bottlenecks &amp; solutions</h2><span class="tag">click a card to open</span></div>
+    <div class="grid" style="gap:10px">
+
+      <div class="card collapsible open">
+        <div class="c-head"><h3>Crash between bank charge and DB persist</h3></div>
+        <div class="c-body">
+          <p><b style="color:var(--warn)">Impact:</b> the card is charged (capture succeeds) but the process dies before the payment + ledger rows commit — the customer paid and we have no record of it.</p>
+          <p><b style="color:var(--gc)">Fix — three layers:</b> (1) <b>Bank-side idempotency</b> — pass our own key to the bank; on retry the bank returns the original result instead of re-charging. (2) <b>Reconciliation</b> — the daily job spots a bank capture with no matching ledger entry and back-fills it. (3) <b>Transactional outbox</b> — write the DB row and the event in one transaction so no event is lost. This is the #1 interview follow-up.</p>
+        </div>
+      </div>
+
+      <div class="card collapsible">
+        <div class="c-head"><h3>Concurrent duplicate requests (same idempotency key)</h3></div>
+        <div class="c-body">
+          <p><b style="color:var(--warn)">Impact:</b> two identical requests arrive in the same millisecond, both miss Redis, both reach the DB, both call the bank → two authorizations.</p>
+          <p><b style="color:var(--gc)">Fix:</b> the Postgres <code>UNIQUE(idempotency_key)</code> is the last line of defence — only one <code>INSERT</code> commits, the other gets a unique violation, <b>voids its auth</b> and returns the winner's result. Redis <code>SET NX</code> catches 99% earlier; the DB constraint guarantees correctness for the rest. If the void fails, the hold auto-expires in 7 days and reconciliation flags it.</p>
+        </div>
+      </div>
+
+      <div class="card collapsible">
+        <div class="c-head"><h3>Redis (idempotency store) down</h3></div>
+        <div class="c-body">
+          <p><b style="color:var(--warn)">Impact:</b> without the idempotency check, a retried request risks a double-charge — the single worst failure in the system.</p>
+          <p><b style="color:var(--gc)">Fix:</b> <b>fail fast, return 503</b> — never process a payment without a dedup check. This is the CP choice in action: temporary unavailability beats double-charging. Optional fallback to the DB <code>UNIQUE</code> constraint (10 ms vs 0.5 ms, but correct). Redis Sentinel/Cluster keeps failover to 5–30 s.</p>
+        </div>
+      </div>
+
+      <div class="card collapsible">
+        <div class="c-head"><h3>Ledger write bottleneck</h3></div>
+        <div class="c-body">
+          <p><b style="color:var(--warn)">Impact:</b> every payment is a multi-statement ACID transaction (payment + debit + credit + balance) on a single primary — the write ceiling as volume grows.</p>
+          <p><b style="color:var(--gc)">Fix:</b> functional partitioning (separate ledger service/DB), then shard by <code>merchant_id</code> so each merchant's double-entry stays single-shard. Aurora handles ~50K TPS before you need to shard at all; keep async work (settlement, payouts, reconciliation) off the synchronous path.</p>
+        </div>
+      </div>
+
+      <div class="card collapsible">
+        <div class="c-head"><h3>Network partition: app ↔ database</h3></div>
+        <div class="c-body">
+          <p><b style="color:var(--warn)">Impact:</b> the payment service can take requests but can't reach Postgres — it can't check balance, idempotency, or record the ledger.</p>
+          <p><b style="color:var(--gc)">Fix (CP, not AP):</b> stop processing, return 503, queue incoming requests in Kafka (durable, ordered) and drain in order when the partition heals — idempotency keys prevent duplicates during the drain. <span style="color:var(--warn)">The AP temptation</span> ("accept now, reconcile later") means overdrafts and unbalanced books. Payments are <b>delayed, never incorrect</b>.</p>
+        </div>
+      </div>
+
+      <div class="card collapsible">
+        <div class="c-head"><h3>Card network / bank timeout</h3></div>
+        <div class="c-body">
+          <p><b style="color:var(--warn)">Impact:</b> the authorization request to Visa/NPCI times out — we don't know if the charge succeeded.</p>
+          <p><b style="color:var(--gc)">Fix:</b> keep the payment in <code>PROCESSING</code>, return <b>PENDING</b> to the client (never SUCCESS, never DECLINE), and let a background job retry with backoff carrying the same bank idempotency key. After ~30 min, expire the payment and fire a <code>payment.expired</code> webhook. We <b>never tell the customer "successful"</b> until the network confirms.</p>
+        </div>
+      </div>
+
+      <div class="card collapsible">
+        <div class="c-head"><h3>Webhook delivery to a slow / down merchant</h3></div>
+        <div class="c-body">
+          <p><b style="color:var(--warn)">Impact:</b> a merchant server that's down or slow would block the payment path if delivery were synchronous.</p>
+          <p><b style="color:var(--gc)">Fix:</b> deliver async off a queue. <code>WebhookService</code> retries with exponential backoff (1m, 5m, 30m, 2h, 8h, 24h) scheduled in a Redis ZSET; after max attempts move to a DLQ and alert the merchant, who can poll the events API. Every payload is signed with HMAC-SHA256 so merchants verify authenticity.</p>
+        </div>
+      </div>
+
+    </div>
+  </section>
+
+  <!-- D · CAP & CONSISTENCY -->
+  <section>
+    <div class="sec-h"><span class="n">D</span><h2>CAP &amp; consistency — why CP</h2><span class="tag">consistency is non-negotiable for money</span></div>
+    <div class="grid g2">
+      <div class="card">
+        <div class="kicker">the choice</div>
+        <p class="muted">A payment system does <b>not</b> have a CAP choice. <b>P is mandatory</b> in any distributed system, and for money the real decision — A vs C during a partition — is <b>always C</b>. Unlike e-commerce, which tolerates a 5-second-stale price, a payment system cannot tolerate a stale balance for 1 ms.</p>
+        <ul class="tight">
+          <li><b>CP:</b> during a partition, refuse the request (503) rather than risk a double-charge or overdraft.</li>
+          <li><b>PACELC → PC/EC:</b> on Partition pick Consistency; Else pick Consistency over Latency — synchronous DB write before responding.</li>
+          <li>Worst case for the customer: "please try again in a moment" — a brief delay, never an incorrect charge.</li>
+        </ul>
+      </div>
+      <div class="card">
+        <div class="kicker">exactly-once = idempotency + ACID</div>
+        <pre class="code"><span class="cm">// 1. dedup lock (atomic, sub-ms)</span>
+SET idem:K1 <span class="st">"PENDING"</span> NX EX 86400
+<span class="cm">// 2. process inside ONE ACID transaction</span>
+BEGIN;
+  INSERT payment (…, idempotency_key)  <span class="cm">// UNIQUE</span>
+  INSERT ledger DEBIT  customer_hold
+  INSERT ledger CREDIT merchant_balance
+  UPDATE balance … WHERE balance &gt;= amt
+COMMIT;
+<span class="cm">// 3. store result against the key</span>
+SET idem:K1 <span class="st">"{result}"</span> XX EX 86400</pre>
+        <p class="muted">At-most-once loses payments; at-least-once double-charges. Only <b>exactly-once</b> — idempotency key + a single ACID transaction whose <code>UNIQUE</code> constraint serialises racers — is acceptable. If the transaction fails, the whole thing rolls back and the lock is released.</p>
+      </div>
+    </div>
+    <div class="callout tip"><b>Why append-only double-entry:</b> every operation writes a balanced debit + credit; <code>SUM(debits) = SUM(credits) = 0</code> at all times is the ledger's "unit test". A refund never deletes the original charge — it adds reverse entries, preserving a complete, immutable audit trail for regulators.</div>
+    <table style="margin-top:12px">
+      <thead><tr><th>Component</th><th>CAP</th><th>PACELC</th><th>Reasoning</th></tr></thead>
+      <tbody>
+        <tr><td>Payment processing</td><td>CP</td><td>PC/EC</td><td>Double-charge = chargeback + fine + lawsuit</td></tr>
+        <tr><td>Ledger (double-entry)</td><td>CP</td><td>PC/EC</td><td>Unbalanced books = audit failure; needs ACID (Postgres, not NoSQL)</td></tr>
+        <tr><td>Account balance</td><td>CP</td><td>PC/EC</td><td>Stale balance = overdraft; <code>SELECT … FOR UPDATE</code> on primary</td></tr>
+        <tr><td>Idempotency store</td><td>CP</td><td>PC/EC</td><td>Stale key = double-charge; fail fast if unavailable</td></tr>
+        <tr><td>Webhook delivery</td><td>AP</td><td>PA/EL</td><td>Delayed delivery OK; retry + DLQ, missed delivery not OK</td></tr>
+        <tr><td>Exchange rates</td><td>AP</td><td>PA/EL</td><td>5-min stale OK for display; checkout uses rate locked at auth</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <!-- E · TRADE-OFFS SUMMARY -->
+  <section>
+    <div class="sec-h"><span class="n">E</span><h2>Trade-offs summary</h2><span class="tag">decision · chosen · alternative · why</span></div>
+    <table>
+      <thead><tr><th>Decision</th><th>Chosen</th><th>Alternative</th><th>Why this choice</th></tr></thead>
+      <tbody>
+        <tr><td>Consistency model</td><td><b style="color:var(--survivor)">CP · strong</b></td><td>AP / eventual</td><td>Money path can't be stale; delay beats double-charge</td></tr>
+        <tr><td>Ledger database</td><td><b style="color:var(--survivor)">PostgreSQL / Aurora (ACID)</b></td><td>DynamoDB / Cassandra</td><td>Atomic debit+credit, SUM balance checks, reconciliation joins; NoSQL has no cross-partition txn</td></tr>
+        <tr><td>Ledger model</td><td><b style="color:var(--survivor)">Append-only double-entry</b></td><td>single "balance" field</td><td>Immutable audit trail, reconstruct any point in time, sum = 0 invariant</td></tr>
+        <tr><td>Exactly-once</td><td><b style="color:var(--survivor)">Idempotency key + ACID txn</b></td><td>at-least-once retry</td><td>Retries must not re-charge; UNIQUE constraint serialises races</td></tr>
+        <tr><td>Idempotency store</td><td><b style="color:var(--survivor)">Redis SET NX + DB UNIQUE</b></td><td>DB UNIQUE alone</td><td>Sub-ms atomic check; DB constraint is defence-in-depth</td></tr>
+        <tr><td>Money type</td><td><b style="color:var(--survivor)">Integer minor units (cents)</b></td><td>float / double</td><td>0.1 + 0.2 ≠ 0.3 in IEEE-754 — never float for money</td></tr>
+        <tr><td>DB sharding</td><td><b style="color:var(--survivor)">By merchant_id</b></td><td>hash on payment_id</td><td>Keeps a merchant's double-entry + balance single-shard ACID</td></tr>
+        <tr><td>Event bus</td><td><b style="color:var(--survivor)">Kafka (partition by payment_id)</b></td><td>RabbitMQ / SQS</td><td>Ordered per payment, replayable for reconciliation, multi-consumer</td></tr>
+        <tr><td>Fraud detection</td><td><b style="color:var(--survivor)">Chain of responsibility</b></td><td>one big ML model</td><td>Rules catch 80% cheap+explainable, ML the novel 20%</td></tr>
+        <tr><td>Card data</td><td><b style="color:var(--survivor)">Tokenization / vault (PCI)</b></td><td>store raw PAN</td><td>Card never touches our servers → SAQ-A, not full PCI L1 scope</td></tr>
+        <tr><td>Webhooks</td><td><b style="color:var(--survivor)">Async + HMAC + backoff + DLQ</b></td><td>synchronous POST</td><td>Slow merchant can't block the money path; signature prevents spoofing</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <!-- F · INTERVIEW WALKTHROUGH -->
+  <section>
+    <div class="sec-h"><span class="n">F</span><h2>Interview walkthrough — timing strip</h2><span class="tag">~35 min answer</span></div>
+    <div class="flow">
+      <div class="step eden"><div class="box">Clarify</div><small>P1 · 2–3 min<br>scale · auth/capture · PCI</small></div>
+      <div class="step eden"><div class="box">Architecture</div><small>P2 · 5–7 min<br>pipeline · CP · double-entry</small></div>
+      <div class="step surv"><div class="box">Idempotency</div><small>P3 · 8–10 min · THE STAR<br>two-layer · crash · race</small></div>
+      <div class="step surv"><div class="box">Ledger</div><small>P4 · 5–7 min<br>append-only · reconcile</small></div>
+      <div class="step old"><div class="box">Scale &amp; edges</div><small>P5 · fraud · webhooks · FX</small></div>
+      <div class="step dead"><div class="box">Trade-offs</div><small>P6 · CP/AP · SQL/NoSQL</small></div>
+    </div>
+    <div class="grid g2" style="margin-top:14px">
+      <div class="card">
+        <div class="kicker">phase-by-phase</div>
+        <ul class="tight">
+          <li><b>P1 Clarify (2–3):</b> scale (1M vs 1B/mo), single-step vs authorize-then-capture, payment methods, webhook guarantee, PCI in scope, multi-currency &amp; when to lock FX.</li>
+          <li><b>P2 Architecture (5–7):</b> five services — Payment, Ledger, Fraud, Webhook, Reconciliation. Lead with idempotency + double-entry ledger. State it's CP.</li>
+          <li><b>P3 Idempotency (8–10 · THE STAR):</b> two layers — Redis <code>SET NX</code> for speed, Postgres <code>UNIQUE</code> for truth. Walk the crash-between-bank-and-DB scenario and the concurrent-race with auth void.</li>
+          <li><b>P4 Ledger (5–7):</b> every op = balanced debit+credit, sum = 0, append-only, refunds add reverse entries; daily reconciliation vs bank statement.</li>
+        </ul>
+      </div>
+      <div class="card">
+        <div class="kicker">…and finish strong</div>
+        <ul class="tight">
+          <li><b>P5 Scale &amp; edges (5–8):</b> fraud as chain of responsibility (velocity → amount → geo → ML), webhooks with HMAC + backoff + DLQ, multi-currency with rate locked at auth.</li>
+          <li><b>P6 Trade-offs (3–5):</b> CP vs AP (money path CP, dashboards AP), SQL vs NoSQL (ACID for ledger), sync vs async (card sync, settlement async), own HSM vs third-party tokenizer.</li>
+          <li><b>Elevator pitch:</b> idempotent pipeline, two-layer dedup, double-entry ledger, state machine, fraud chain, HMAC webhooks, daily reconciliation, CP, PCI via vault.</li>
+          <li><b>Never skip P3</b> — the idempotency deep-dive is ~50% of this interview.</li>
+        </ul>
+      </div>
+    </div>
+    <div class="callout tip"><b>Green flags:</b> lead with idempotency · two-layer dedup · double-entry sum = 0 append-only · explain the crash scenario (bank-side idempotency + reconciliation) · fraud as a chain · integer cents · CP for money, AP for dashboards. <b>Red flags:</b> no idempotency key · floating-point money · mutable ledger (UPDATE/DELETE) · single "balance" field · no reconciliation · making the whole system AP · webhooks without signatures.</div>
+  </section>
+
+  <!-- GLOSSARY -->
+  <section>
+    <div class="sec-h"><span class="n">§</span><h2>Glossary — one-liners</h2><span class="tag">terms used above</span></div>
+    <div class="grid g2">
+      <div class="card"><table><tbody>
+        <tr><td><b>CP (CAP)</b></td><td>favour Consistency + Partition-tolerance; refuse rather than serve stale money data</td></tr>
+        <tr><td><b>PACELC → PC/EC</b></td><td>on Partition pick Consistency; Else still Consistency over Latency</td></tr>
+        <tr><td><b>Idempotency key</b></td><td>client-supplied id so a retried request is processed exactly once</td></tr>
+        <tr><td><b>SET NX / XX</b></td><td>Redis atomic set-if-absent / set-if-present — the dedup lock and its result update</td></tr>
+        <tr><td><b>Exactly-once</b></td><td>idempotency + ACID txn so N identical requests = one charge</td></tr>
+        <tr><td><b>Double-entry</b></td><td>every op = balanced debit + credit; SUM = 0 always</td></tr>
+      </tbody></table></div>
+      <div class="card"><table><tbody>
+        <tr><td><b>Append-only ledger</b></td><td>never UPDATE/DELETE; refunds add reverse entries — immutable audit trail</td></tr>
+        <tr><td><b>SELECT … FOR UPDATE</b></td><td>row-level lock on the primary; the only safe balance check</td></tr>
+        <tr><td><b>Reconciliation</b></td><td>daily match of internal ledger vs bank statement — the system's integration test</td></tr>
+        <tr><td><b>Authorize / capture</b></td><td>two-phase: hold funds, then charge later (card); UPI is single-phase</td></tr>
+        <tr><td><b>Tokenization</b></td><td>replace the card number with a token in a PCI vault — shrinks audit scope</td></tr>
+        <tr><td><b>HMAC-SHA256</b></td><td>shared-secret signature so merchants verify a webhook is genuine</td></tr>
+      </tbody></table></div>
+    </div>
+  </section>
+
+  <footer>
+    <p>Use case 11 · Payment System — Canvas 3 of 3 (Deep-dive &amp; Trade-offs). Grounded in <code>11-payment-system/docs/tradeoffs · caching · tech</code> and <code>revision/INTERVIEW_WALKTHROUGH.md</code>.</p>
+    <p class="run">This use case: <a href="hld.html">11a · HLD</a> · <a href="lld.html">11b · LLD</a> · Deep-dive &nbsp;|&nbsp; Next → <a href="../index.html">Hub</a></p>
+  </footer>
+
+</div>
+<script src="../assets/canvas.js"></script>
+</body>
+</html>

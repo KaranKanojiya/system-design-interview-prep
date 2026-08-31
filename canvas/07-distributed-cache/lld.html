@@ -1,0 +1,392 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>07 · Distributed Cache — LLD</title>
+<link rel="stylesheet" href="../assets/canvas.css">
+</head>
+<body>
+<div class="wrap">
+
+  <header class="hero">
+    <h1>Distributed Cache — Low-Level Design</h1>
+    <div class="sub">Use case 07 · Canvas 2 of 3. From boxes to classes: the actual Java object model. Start with the <b>interactive class map</b> — click a class to see its responsibility and how <code>AppConfig → Controller → CacheService (Facade) → EvictionStrategy / HashingStrategy / CacheStore</code> is wired — then dig into the O(1) LRU internals, the consistent-hashing ring, the pluggable eviction strategies, and the request sequences.</div>
+    <div class="badges">
+      <span class="badge lvl">Use case 07 · LLD</span>
+      <span class="badge">Canvas 2 of 3</span>
+      <span class="badge">interactive</span>
+      <span class="badge">Strategy ×2 · Facade · Factory · Proxy · Builder</span>
+    </div>
+    <div class="legend">
+      <span><i class="dot" style="background:var(--eden)"></i> entry / composition root</span>
+      <span><i class="dot" style="background:var(--survivor)"></i> interface / contract</span>
+      <span><i class="dot" style="background:var(--old)"></i> concrete implementation</span>
+      <span><i class="dot" style="background:var(--warn)"></i> domain model</span>
+      <span><i class="dot" style="background:var(--muted)"></i> click a class for its role</span>
+    </div>
+  </header>
+
+  <!-- A · CLASS DESIGN (interactive class map) -->
+  <section>
+    <div class="sec-h"><span class="n">A</span><h2>Class design — click a class in the map</h2><span class="tag">the object model, wired</span></div>
+    <div>
+      <div class="arch">
+        <svg viewBox="0 0 860 470" width="100%" style="max-width:860px" role="img" aria-label="Distributed cache class map">
+          <defs>
+            <marker id="ah" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" fill="var(--muted)"></path></marker>
+          </defs>
+
+          <!-- wiring / uses arrows (solid) -->
+          <line class="arrow" x1="91" y1="56" x2="91" y2="86" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"></line>
+          <line class="arrow" x1="91" y1="126" x2="91" y2="156" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"></line>
+          <line class="arrow" x1="166" y1="172" x2="338" y2="96" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"></line>
+          <path class="arrow" d="M166,182 C 250,240 260,300 338,306" fill="none" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"></path>
+          <line class="arrow" x1="166" y1="242" x2="338" y2="100" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"></line>
+          <line class="arrow" x1="166" y1="312" x2="338" y2="204" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"></line>
+          <line class="arrow" x1="558" y1="330" x2="492" y2="206" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"></line>
+          <text x="96" y="80" fill="var(--faint)" font-size="9">wires</text>
+          <text x="180" y="140" fill="var(--faint)" font-size="9">uses</text>
+
+          <!-- implements arrows (dashed) -->
+          <line class="arrow" x1="558" y1="36" x2="492" y2="84" stroke="var(--muted)" stroke-width="2" stroke-dasharray="4 3" marker-end="url(#ah)"></line>
+          <line class="arrow" x1="558" y1="79" x2="492" y2="90" stroke="var(--muted)" stroke-width="2" stroke-dasharray="4 3" marker-end="url(#ah)"></line>
+          <line class="arrow" x1="558" y1="123" x2="492" y2="96" stroke="var(--muted)" stroke-width="2" stroke-dasharray="4 3" marker-end="url(#ah)"></line>
+          <line class="arrow" x1="558" y1="179" x2="492" y2="194" stroke="var(--muted)" stroke-width="2" stroke-dasharray="4 3" marker-end="url(#ah)"></line>
+          <line class="arrow" x1="558" y1="223" x2="492" y2="200" stroke="var(--muted)" stroke-width="2" stroke-dasharray="4 3" marker-end="url(#ah)"></line>
+          <line class="arrow" x1="558" y1="289" x2="492" y2="304" stroke="var(--muted)" stroke-width="2" stroke-dasharray="4 3" marker-end="url(#ah)"></line>
+          <line class="arrow" x1="558" y1="333" x2="492" y2="310" stroke="var(--muted)" stroke-width="2" stroke-dasharray="4 3" marker-end="url(#ah)"></line>
+
+          <!-- === Column 1: composition + service layer === -->
+          <g data-node style="cursor:pointer" data-title="AppConfig  (config · Factory)" data-detail="<b>Role:</b> composition root / poor-man's DI container (Factory pattern) — the ONLY class that says <code>new ConcreteClass()</code>.<br><b>Methods:</b> <code>createCacheService(policy, maxSize)</code> builds CacheConfig → EvictionStrategy → InMemoryCacheStore → CacheStats → CacheService; <code>createDistributedCacheService(numNodes, maxSizePerNode, numVirtualNodes)</code> wires CacheNodes → ConsistentHashStrategy → NodeAwareCacheStore; <code>createEvictionService(...)</code> registers LRU/LFU/TTL. Private <code>createEvictionStrategy()</code> is a <code>switch</code> on EvictionPolicy."><rect x="16" y="16" width="150" height="40" rx="9" fill="var(--panel-2)" stroke="var(--eden)"></rect><text x="91" y="35" text-anchor="middle" fill="var(--eden)" font-size="12" font-weight="600">AppConfig</text><text x="91" y="49" text-anchor="middle" fill="var(--faint)" font-size="9">composition root</text></g>
+
+          <g data-node style="cursor:pointer" data-title="CacheController  (controller)" data-detail="<b>Role:</b> framework-free stand-in for a REST controller.<br><b>Methods:</b> <code>handleGet(key)</code> → 200 / 404, <code>handlePut(key, value, ttlSeconds)</code> → 201, <code>handleDelete(key)</code> → 200 / 404, <code>handleStats()</code> prints via CacheStatsDisplay.<br><b>Wiring:</b> delegates every call to the CacheService facade; holds a CacheStatsDisplay for output."><rect x="16" y="86" width="150" height="40" rx="9" fill="var(--panel-2)" stroke="var(--border)"></rect><text x="91" y="105" text-anchor="middle" fill="var(--text)" font-size="12" font-weight="600">CacheController</text><text x="91" y="119" text-anchor="middle" fill="var(--faint)" font-size="9">REST-like entry</text></g>
+
+          <g data-node style="cursor:pointer" data-title="CacheService  «Facade»" data-detail="<b>Role:</b> the Facade and orchestrator — the single entry point for all cache ops. Holds a <code>CacheStore</code>, an <code>EvictionStrategy</code>, a <code>CacheStats</code>, and the <code>CacheConfig</code>, all injected.<br><b>get():</b> store.get → null? miss → <code>isExpired()</code>? remove + miss → else <code>entry.touch()</code>, <code>eviction.onGet(key)</code>, <code>stats.recordHit()</code>.<br><b>put():</b> if full <code>evictOne()</code> → <code>CacheEntry.builder()...build()</code> → store.put → <code>eviction.onPut(key, entry)</code> → recordPut.<br>Depends only on the interfaces — never branches on algorithm type."><rect x="16" y="156" width="150" height="40" rx="9" fill="var(--panel-2)" stroke="var(--border)"></rect><text x="91" y="175" text-anchor="middle" fill="var(--text)" font-size="12" font-weight="600">CacheService</text><text x="91" y="189" text-anchor="middle" fill="var(--faint)" font-size="9">«Facade» orchestrator</text></g>
+
+          <g data-node style="cursor:pointer" data-title="EvictionService  (context)" data-detail="<b>Role:</b> the Strategy <i>context</i> — holds a <code>Map&lt;EvictionPolicy, EvictionStrategy&gt;</code> of all registered strategies and an <code>activePolicy</code>.<br><b>Methods:</b> <code>registerStrategy(policy, strategy)</code>, <code>getStrategy(policy)</code>, <code>getActiveStrategy()</code>, <code>setActivePolicy(policy)</code> / <code>switchPolicy()</code> — enabling a <b>runtime</b> policy swap (like Redis <code>CONFIG SET maxmemory-policy</code>) without rebuilding CacheService."><rect x="16" y="226" width="150" height="40" rx="9" fill="var(--panel-2)" stroke="var(--border)"></rect><text x="91" y="245" text-anchor="middle" fill="var(--text)" font-size="12" font-weight="600">EvictionService</text><text x="91" y="259" text-anchor="middle" fill="var(--faint)" font-size="9">runtime policy swap</text></g>
+
+          <g data-node style="cursor:pointer" data-title="ReplicationService  (conceptual)" data-detail="<b>Role:</b> simulates copying each key to N successor nodes on the ring (<code>replicationFactor</code>, default 3).<br><b>Methods:</b> <code>replicateToFollowers(key, entry, followers)</code>, <code>handleNodeFailure(failedNode, replicas)</code>, <code>getReplicationFactor()</code>. Uses the HashingStrategy to find successor nodes. Illustrates the CAP trade-off — see canvas 3."><rect x="16" y="296" width="150" height="40" rx="9" fill="var(--panel-2)" stroke="var(--border)"></rect><text x="91" y="315" text-anchor="middle" fill="var(--text)" font-size="12" font-weight="600">ReplicationService</text><text x="91" y="329" text-anchor="middle" fill="var(--faint)" font-size="9">N-replica copies</text></g>
+
+          <!-- === Column 2: interfaces === -->
+          <g data-node style="cursor:pointer" data-title="EvictionStrategy  «interface»" data-detail="<b>Role:</b> the eviction Strategy contract — <code>onGet(key)</code>, <code>onPut(key, entry)</code>, <code>evict(): String</code>, <code>remove(key)</code>, <code>size()</code>, <code>getEvictionPolicyName()</code>.<br><b>Why:</b> CacheService/EvictionService depend on this interface only, so LRU / LFU / TTL are swapped without touching cache logic (Open-Closed Principle). Implementations must be thread-safe."><rect x="340" y="70" width="152" height="40" rx="9" fill="var(--panel-2)" stroke="var(--survivor)"></rect><text x="416" y="89" text-anchor="middle" fill="var(--survivor)" font-size="12" font-weight="600">EvictionStrategy</text><text x="416" y="103" text-anchor="middle" fill="var(--faint)" font-size="9">«interface»</text></g>
+
+          <g data-node style="cursor:pointer" data-title="HashingStrategy  «interface»" data-detail="<b>Role:</b> the node-routing Strategy contract — <code>getNode(key, nodes): CacheNode</code>, <code>addNode(node)</code>, <code>removeNode(node)</code>, <code>getNodeCount()</code>.<br><b>Why:</b> NodeAwareCacheStore &amp; ReplicationService talk to this interface, so consistent hashing vs naive mod hashing swap with no change to storage or service logic. getNode must be deterministic for the same key."><rect x="340" y="180" width="152" height="40" rx="9" fill="var(--panel-2)" stroke="var(--survivor)"></rect><text x="416" y="199" text-anchor="middle" fill="var(--survivor)" font-size="12" font-weight="600">HashingStrategy</text><text x="416" y="213" text-anchor="middle" fill="var(--faint)" font-size="9">«interface»</text></g>
+
+          <g data-node style="cursor:pointer" data-title="CacheStore  «interface»" data-detail="<b>Role:</b> the storage contract — <code>get(key): CacheEntry</code>, <code>put(key, entry)</code>, <code>remove(key): CacheEntry</code>, <code>contains(key)</code>, <code>size()</code>, <code>clear()</code>, <code>getAllKeys(): Set&lt;String&gt;</code>.<br><b>Why:</b> the Facade depends on this interface, so single-node (in-memory) storage swaps for multi-node routing — or a future Redis backend — with zero service changes. Repository/Proxy pattern."><rect x="340" y="290" width="152" height="40" rx="9" fill="var(--panel-2)" stroke="var(--survivor)"></rect><text x="416" y="309" text-anchor="middle" fill="var(--survivor)" font-size="12" font-weight="600">CacheStore</text><text x="416" y="323" text-anchor="middle" fill="var(--faint)" font-size="9">«interface»</text></g>
+
+          <!-- === Column 3: implementations === -->
+          <g data-node style="cursor:pointer" data-title="LRUEvictionStrategy" data-detail="<b>Role:</b> Least-Recently-Used. <code>HashMap&lt;String, Node&gt;</code> for O(1) lookup + a custom <b>doubly-linked list</b> with sentinel <code>head</code>/<code>tail</code>.<br><b>onGet/onPut:</b> move node to head (most-recently-used). <b>evict():</b> unlink <code>tail.prev</code> (least-recently-used) — O(1). Built from scratch, not <code>LinkedHashMap</code>, to show the internals. See section B."><rect x="558" y="16" width="140" height="38" rx="9" fill="var(--panel-2)" stroke="var(--old)"></rect><text x="628" y="34" text-anchor="middle" fill="var(--old)" font-size="11" font-weight="600">LRUEviction</text><text x="628" y="47" text-anchor="middle" fill="var(--faint)" font-size="9">HashMap + DLL · O(1)</text></g>
+
+          <g data-node style="cursor:pointer" data-title="LFUEvictionStrategy" data-detail="<b>Role:</b> Least-Frequently-Used. <code>Map&lt;String,Integer&gt; keyToFreq</code> + <code>Map&lt;Integer, LinkedHashSet&lt;String&gt;&gt; freqToKeys</code> (frequency buckets) + a tracked <code>minFreq</code>.<br><b>onGet:</b> move key from bucket f to f+1, bump minFreq if bucket f empties. <b>onPut:</b> new key → bucket 1, minFreq = 1. <b>evict():</b> pull the first (oldest) key from the minFreq bucket — O(1). LinkedHashSet gives FIFO tie-breaking."><rect x="558" y="60" width="140" height="38" rx="9" fill="var(--panel-2)" stroke="var(--old)"></rect><text x="628" y="78" text-anchor="middle" fill="var(--old)" font-size="11" font-weight="600">LFUEviction</text><text x="628" y="91" text-anchor="middle" fill="var(--faint)" font-size="9">freq buckets · O(1)</text></g>
+
+          <g data-node style="cursor:pointer" data-title="TTLEvictionStrategy" data-detail="<b>Role:</b> time-based eviction. <code>TreeMap&lt;LocalDateTime, Set&lt;String&gt;&gt; expirationIndex</code> (sorted by expiry) + <code>keyToExpiration</code> reverse index.<br><b>evict():</b> first drain already-expired keys, else remove the earliest-expiring (<code>firstEntry()</code>). Supports both <b>lazy</b> expiration (checked on get) and <b>active</b> cleanup — exactly how Redis does it."><rect x="558" y="104" width="140" height="38" rx="9" fill="var(--panel-2)" stroke="var(--old)"></rect><text x="628" y="122" text-anchor="middle" fill="var(--old)" font-size="11" font-weight="600">TTLEviction</text><text x="628" y="135" text-anchor="middle" fill="var(--faint)" font-size="9">TreeMap by expiry</text></g>
+
+          <g data-node style="cursor:pointer" data-title="ConsistentHashStrategy" data-detail="<b>Role:</b> consistent hashing with virtual nodes. <code>TreeMap&lt;Integer, VirtualNode&gt; ring</code>, <code>numVirtualNodes</code> (150), MD5-based <code>hash()</code>.<br><b>getNode():</b> hash the key, <code>ring.ceilingEntry(hash)</code> walks clockwise, wraps via <code>firstEntry()</code>. <b>addNode():</b> place 150 vnodes. <b>Payoff:</b> adding/removing a node remaps only ~1/N keys. See section B."><rect x="558" y="160" width="140" height="38" rx="9" fill="var(--panel-2)" stroke="var(--old)"></rect><text x="628" y="178" text-anchor="middle" fill="var(--old)" font-size="11" font-weight="600">ConsistentHash</text><text x="628" y="191" text-anchor="middle" fill="var(--faint)" font-size="9">TreeMap ring · MD5</text></g>
+
+          <g data-node style="cursor:pointer" data-title="ModHashStrategy  (anti-pattern demo)" data-detail="<b>Role:</b> naive routing — <code>getNode = nodes.get(hash(key) % nodeCount)</code>.<br><b>Problem:</b> adding/removing a node changes the divisor, so <code>(N-1)/N</code> of ALL keys remap — 67% with 3 nodes, 99% with 100 → a cache stampede. Shipped only to contrast with consistent hashing. name() region prints a remap warning on addNode."><rect x="558" y="204" width="140" height="38" rx="9" fill="var(--panel-2)" stroke="var(--old)"></rect><text x="628" y="222" text-anchor="middle" fill="var(--old)" font-size="11" font-weight="600">ModHash</text><text x="628" y="235" text-anchor="middle" fill="var(--faint)" font-size="9">key % N · anti-pattern</text></g>
+
+          <g data-node style="cursor:pointer" data-title="InMemoryCacheStore" data-detail="<b>Role:</b> the single-node store. <code>ConcurrentHashMap&lt;String, CacheEntry&gt;</code> → lock-striped, safe concurrent reads/writes.<br><b>Mapping:</b> get/put/remove are direct map ops; contains = containsKey; getAllKeys = keySet. This is the leaf that actually holds bytes."><rect x="558" y="270" width="140" height="38" rx="9" fill="var(--panel-2)" stroke="var(--old)"></rect><text x="628" y="288" text-anchor="middle" fill="var(--old)" font-size="11" font-weight="600">InMemoryStore</text><text x="628" y="301" text-anchor="middle" fill="var(--faint)" font-size="9">ConcurrentHashMap</text></g>
+
+          <g data-node style="cursor:pointer" data-title="NodeAwareCacheStore  «Proxy»" data-detail="<b>Role:</b> a Proxy that <i>looks like</i> a CacheStore but routes each op to the right node. Holds a <code>Map&lt;String, InMemoryCacheStore&gt; nodeStores</code>, a <code>HashingStrategy</code>, and the node list.<br><b>get/put/remove:</b> <code>hashingStrategy.getNode(key, nodes)</code> → find that node's InMemoryCacheStore → delegate. The caller sees one cache; the topology is hidden."><rect x="558" y="314" width="140" height="38" rx="9" fill="var(--panel-2)" stroke="var(--old)"></rect><text x="628" y="332" text-anchor="middle" fill="var(--old)" font-size="11" font-weight="600">NodeAwareStore</text><text x="628" y="345" text-anchor="middle" fill="var(--faint)" font-size="9">«Proxy» routes</text></g>
+
+          <!-- === Models row === -->
+          <g data-node style="cursor:pointer" data-title="CacheEntry  (model · Builder)" data-detail="<b>Role:</b> the value wrapper every cached item is stored as, built via <code>CacheEntry.builder()...build()</code> (Builder — 7 fields, 4 optional).<br><b>Fields:</b> key, value (Object), createdAt, lastAccessedAt (mutable), expiresAt (null = never), frequency (int, for LFU), sizeBytes.<br><b>Logic:</b> <code>isExpired()</code> compares expiresAt to now; <code>touch()</code> updates lastAccessedAt and bumps frequency."><rect x="16" y="388" width="150" height="40" rx="9" fill="var(--panel-2)" stroke="var(--warn)"></rect><text x="91" y="407" text-anchor="middle" fill="var(--warn)" font-size="11" font-weight="600">CacheEntry</text><text x="91" y="421" text-anchor="middle" fill="var(--faint)" font-size="9">«Builder» value + meta</text></g>
+
+          <g data-node style="cursor:pointer" data-title="CacheConfig  (model · Builder + Singleton)" data-detail="<b>Role:</b> immutable, once-built configuration shared by every component (conceptual Singleton). Built via <code>CacheConfig.builder()</code>.<br><b>Fields:</b> maxSize, defaultTtlSeconds, <code>EvictionPolicy</code> enum {LRU, LFU, TTL}, hashingStrategy, numVirtualNodes (150), replicationFactor (3). One source of truth — no magic numbers, no drift."><rect x="188" y="388" width="150" height="40" rx="9" fill="var(--panel-2)" stroke="var(--warn)"></rect><text x="263" y="407" text-anchor="middle" fill="var(--warn)" font-size="11" font-weight="600">CacheConfig</text><text x="263" y="421" text-anchor="middle" fill="var(--faint)" font-size="9">«Builder» tunables</text></g>
+
+          <g data-node style="cursor:pointer" data-title="CacheNode  (model)" data-detail="<b>Role:</b> a physical cache server in the cluster.<br><b>Fields:</b> nodeId (&quot;node-1&quot;), host, port, <code>NodeStatus</code> {UP, DOWN, DRAINING}, addedAt.<br><b>Methods:</b> <code>getHashKey()</code> = nodeId:host:port (feeds the ring), <code>isAvailable()</code>, and assigned-key counters used by NodeAwareCacheStore for per-node distribution stats."><rect x="360" y="388" width="150" height="40" rx="9" fill="var(--panel-2)" stroke="var(--warn)"></rect><text x="435" y="407" text-anchor="middle" fill="var(--warn)" font-size="11" font-weight="600">CacheNode</text><text x="435" y="421" text-anchor="middle" fill="var(--faint)" font-size="9">physical server</text></g>
+
+          <g data-node style="cursor:pointer" data-title="VirtualNode  (model)" data-detail="<b>Role:</b> one point on the consistent-hashing ring. 150 of these per physical node smooth out key distribution and shrink the blast radius when a node joins/leaves.<br><b>Fields:</b> physicalNode (the real server it maps to), replicaIndex (0..149), hash (ring position). Stored as the <i>value</i> in ConsistentHashStrategy's TreeMap ring."><rect x="532" y="388" width="150" height="40" rx="9" fill="var(--panel-2)" stroke="var(--warn)"></rect><text x="607" y="407" text-anchor="middle" fill="var(--warn)" font-size="11" font-weight="600">VirtualNode</text><text x="607" y="421" text-anchor="middle" fill="var(--faint)" font-size="9">ring position</text></g>
+
+          <g data-node style="cursor:pointer" data-title="CacheStats  «Observer»" data-detail="<b>Role:</b> thread-safe metrics — five <code>AtomicLong</code> counters (hits, misses, evictions, totalRequests, puts) using lock-free CAS.<br><b>Methods:</b> <code>recordHit/Miss/Eviction/Put()</code> are called by CacheService at each operation (Observer); <code>getHitRate()</code> and <code>getMissRate()</code> are read by CacheStatsDisplay. Adding latency percentiles touches this class only."><rect x="704" y="388" width="140" height="40" rx="9" fill="var(--panel-2)" stroke="var(--border)"></rect><text x="774" y="407" text-anchor="middle" fill="var(--text)" font-size="11" font-weight="600">CacheStats</text><text x="774" y="421" text-anchor="middle" fill="var(--faint)" font-size="9">«Observer» counters</text></g>
+        </svg>
+      </div>
+      <div class="node-detail"><span class="nd-title">Click any class</span><div class="nd-body">Its responsibility, key methods, and how it is wired appear here. Dashed arrows are <i>implements</i>; solid arrows are <i>uses</i> / <i>wires</i>. Notice the Facade (<b>CacheService</b>) depends only on the three <b>«interface»</b> boxes — that is what makes eviction policies, hashing algorithms, and storage backends independently swappable.</div></div>
+    </div>
+  </section>
+
+  <!-- B · CORE ALGORITHMS -->
+  <section>
+    <div class="sec-h"><span class="n">B</span><h2>The two core algorithms — O(1) LRU &amp; the hash ring</h2><span class="tag">LRUEvictionStrategy · ConsistentHashStrategy</span></div>
+    <div class="grid g2">
+      <div class="card">
+        <div class="kicker">LRU in O(1) — HashMap + doubly-linked list</div>
+        <pre class="code"><span class="cm">// map: key → Node   ·   sentinel head/tail</span>
+<span class="kw">public</span> String <span class="ty">evict</span>() {          <span class="cm">// least-recently-used</span>
+  Node lru = tail.prev;          <span class="cm">// node next to tail</span>
+  <span class="kw">if</span> (lru == head) <span class="kw">return</span> <span class="kw">null</span>;  <span class="cm">// empty list</span>
+  removeNode(lru);               <span class="cm">// unlink  — O(1)</span>
+  map.remove(lru.key);
+  <span class="kw">return</span> lru.key;
+}
+<span class="kw">private void</span> <span class="ty">removeNode</span>(Node n){
+  n.prev.next = n.next;          <span class="cm">// no null checks —</span>
+  n.next.prev = n.prev;          <span class="cm">//  sentinels absorb edges</span>
+}
+<span class="kw">private void</span> <span class="ty">addAfterHead</span>(Node n){ <span class="cm">// = most-recently-used</span>
+  n.next = head.next; n.prev = head;
+  head.next.prev = n; head.next = n;
+}</pre>
+        <p class="muted">Every <code>onGet</code>/<code>onPut</code> does <code>removeNode + addAfterHead</code> (move-to-front). The node touched longest ago sinks to <code>tail.prev</code> — so eviction is a single unlink. <b>Sentinels</b> mean zero edge-case branches.</p>
+      </div>
+      <div class="card">
+        <div class="kicker">worked example — route a key on the ring</div>
+        <pre class="code"><span class="cm">// ConsistentHashStrategy: 3 nodes × 150 vnodes</span>
+hash(key) = MD5(key)[0..3] as int   <span class="cm">// uniform</span>
+
+getNode(<span class="st">"user:42"</span>):
+  h = hash(<span class="st">"user:42"</span>)      = <span class="num">1_732_500_900</span>
+  e = ring.ceilingEntry(h)          <span class="cm">// first vnode ≥ h</span>
+        → VirtualNode[hash=1_749_003_11.., node-2#87]
+  <span class="kw">if</span> (e == <span class="kw">null</span>) e = ring.firstEntry()  <span class="cm">// wrap around</span>
+  <span class="kw">return</span> e.getValue().getPhysicalNode()  <span class="cm">// → node-2</span>
+
+<span class="cm">// remove node-2  → only its ~1/N keys move,</span>
+<span class="cm">// they slide clockwise to the next vnode's node.</span></pre>
+        <p class="muted"><code>ceilingEntry</code> is the clockwise walk in O(log&nbsp;n); <code>firstEntry</code> closes the ring. 150 virtual nodes per server keep each server's slice of the ring even, so no single node becomes a hotspot.</p>
+      </div>
+    </div>
+    <div class="callout tip"><b>Why O(1) matters &amp; why a ring beats mod.</b> LRU's <code>HashMap + DLL</code> keeps get / put / evict all constant-time — a priority-queue LRU would be O(log&nbsp;n) per touch on the hot path. Consistent hashing replaces <code>key % N</code>, where changing <code>N</code> remaps <b>(N−1)/N</b> of all keys (a stampede that hammers the backing store), with a ring where adding or removing a node moves only <b>~1/N</b> keys. Virtual nodes turn a lumpy 3-point ring into a smooth 450-point one. LFU reaches the same O(1) with frequency buckets + a tracked <code>minFreq</code> instead of a linked list.</div>
+  </section>
+
+  <!-- C · STRATEGIES COMPARED -->
+  <section>
+    <div class="sec-h"><span class="n">C</span><h2>Pluggable strategies — Strategy pattern ×2</h2><span class="tag">swap the algorithm, not the service</span></div>
+    <div data-tabscope>
+      <div class="tabs">
+        <button class="tab active" data-tab="lru">LRU</button>
+        <button class="tab" data-tab="lfu">LFU</button>
+        <button class="tab" data-tab="ttl">TTL</button>
+        <button class="tab" data-tab="hash">Hashing</button>
+      </div>
+      <div class="tabpanel active" data-panel="lru">
+        <p><b>LRUEvictionStrategy</b> — evicts the key untouched for the longest. <span class="run">getEvictionPolicyName() = "LRU" · the AppConfig default</span></p>
+        <ul class="tight">
+          <li><b>Structures:</b> <code>HashMap&lt;String, Node&gt;</code> + custom doubly-linked list with sentinel head/tail.</li>
+          <li><b>Cost:</b> onGet / onPut / evict / remove all O(1) — hand-built, not <code>LinkedHashMap</code>, to expose the internals and control the node references.</li>
+          <li><b>Best for:</b> temporal locality — recently used data is likely to be needed again (the common case).</li>
+        </ul>
+      </div>
+      <div class="tabpanel" data-panel="lfu">
+        <p><b>LFUEvictionStrategy</b> — evicts the least-frequently accessed key. <span class="run">getEvictionPolicyName() = "LFU"</span></p>
+        <ul class="tight">
+          <li><b>Structures:</b> <code>keyToFreq</code> + <code>freqToKeys: Map&lt;Integer, LinkedHashSet&lt;String&gt;&gt;</code> (frequency buckets) + a tracked <code>minFreq</code>.</li>
+          <li><b>Tie-break:</b> LinkedHashSet preserves insertion order, so at equal frequency the <i>oldest</i> key goes first (FIFO) — <code>iterator().next()</code>.</li>
+          <li><b>Best for:</b> frequency skew — a few hot keys should stick; new keys start at freq 1, so a burst can't evict a proven-popular key.</li>
+        </ul>
+      </div>
+      <div class="tabpanel" data-panel="ttl">
+        <p><b>TTLEvictionStrategy</b> — evicts by expiry time. <span class="run">getEvictionPolicyName() = "TTL"</span></p>
+        <ul class="tight">
+          <li><b>Structures:</b> <code>TreeMap&lt;LocalDateTime, Set&lt;String&gt;&gt; expirationIndex</code> (sorted by expiry) + a <code>keyToExpiration</code> reverse index.</li>
+          <li><b>Two modes:</b> <b>lazy</b> — <code>isExpired()</code> checked on every get; <b>active</b> — a cleanup pass drains <code>expirationIndex</code>. evict() first frees expired keys, then the earliest-expiring.</li>
+          <li><b>Best for:</b> time-sensitive data — sessions, tokens, rate-limit counters. Exactly how Redis expiration works.</li>
+        </ul>
+      </div>
+      <div class="tabpanel" data-panel="hash">
+        <p>The <b>second</b> Strategy axis — <code>HashingStrategy.getNode(key, nodes)</code> decides which node owns a key, independent of eviction:</p>
+        <ul class="tight">
+          <li><b>ConsistentHashStrategy:</b> <code>TreeMap&lt;Integer, VirtualNode&gt;</code> ring, 150 vnodes/node, MD5 hashing → ~1/N keys move on topology change. The production choice.</li>
+          <li><b>ModHashStrategy:</b> <code>hash(key) % nodeCount</code> — an anti-pattern shipped for contrast: one node change remaps (N−1)/N of all keys.</li>
+        </ul>
+      </div>
+    </div>
+    <table>
+      <thead><tr><th>Aspect</th><th>LRU</th><th>LFU</th><th>TTL</th><th>Consistent vs Mod hash</th></tr></thead>
+      <tbody>
+        <tr><td>Data structure</td><td>HashMap + DLL</td><td>freq buckets + minFreq</td><td>TreeMap by expiry</td><td>TreeMap ring vs List</td></tr>
+        <tr><td>Evicts</td><td>oldest-used</td><td>least-used</td><td>soonest-expiring</td><td>n/a (routing)</td></tr>
+        <tr><td>Op cost</td><td>O(1)</td><td>O(1)</td><td>O(log n)</td><td>O(log n) vs O(1)</td></tr>
+        <tr><td>Keys moved on node change</td><td colspan="3">n/a — per-node policy</td><td>~1/N vs (N−1)/N</td></tr>
+        <tr><td>Best for</td><td>temporal locality</td><td>frequency skew</td><td>sessions / tokens</td><td>always consistent</td></tr>
+      </tbody>
+    </table>
+    <div class="callout"><b>The pattern:</b> <code>CacheService</code> holds one <code>EvictionStrategy</code> field and never branches on policy — it just calls <code>strategy.onGet(key)</code> / <code>strategy.evict()</code>. <code>NodeAwareCacheStore</code> holds one <code>HashingStrategy</code>. Adding an ARC or 2Q eviction policy, or a rendezvous-hash router, is a new class + one line in <code>AppConfig</code>, with <b>zero</b> changes to the service, store, or controller (Open-Closed Principle). <span class="run">Strategy is used twice — independently variable axes.</span></div>
+  </section>
+
+  <!-- D · DATA MODEL -->
+  <section>
+    <div class="sec-h"><span class="n">D</span><h2>Data model detail</h2><span class="tag">CacheEntry · CacheNode · VirtualNode · CacheConfig</span></div>
+    <div class="grid g2">
+      <div class="card">
+        <div class="kicker">CacheEntry — the value wrapper (Builder)</div>
+        <pre class="code">key            String   <span class="cm">// KEY</span>
+value          Object
+createdAt      LocalDateTime
+lastAccessedAt LocalDateTime  <span class="cm">// mutable — touch()</span>
+expiresAt      LocalDateTime  <span class="cm">// null = never</span>
+frequency      int            <span class="cm">// LFU signal, ++ on touch</span>
+sizeBytes      long           <span class="cm">// memory estimate</span></pre>
+        <p class="muted">Immutable except <code>lastAccessedAt</code> / <code>frequency</code>, both bumped by <code>touch()</code> on every hit. <b>Why a wrapper?</b> LRU needs lastAccessedAt, LFU needs frequency, TTL needs expiresAt — one metadata-rich entry lets the store stay policy-agnostic. Built via <code>CacheEntry.builder().key(..).value(..).ttlSeconds(..).build()</code> so 7 fields never get swapped.</p>
+      </div>
+      <div class="card">
+        <div class="kicker">Topology — CacheNode · VirtualNode · CacheConfig</div>
+        <pre class="code"><span class="cm">// CacheNode — a physical server</span>
+nodeId  String   <span class="cm">// "node-1"</span>
+host    String   port int
+status  NodeStatus  <span class="cm">// UP · DOWN · DRAINING</span>
+
+<span class="cm">// VirtualNode — one ring point (150 per node)</span>
+physicalNode  CacheNode
+replicaIndex  int    <span class="cm">// 0..149</span>
+hash          int    <span class="cm">// ring position</span>
+
+<span class="cm">// CacheConfig — one immutable config (Builder)</span>
+maxSize · defaultTtlSeconds · evictionPolicy
+numVirtualNodes(150) · replicationFactor(3)</pre>
+        <p class="muted">The ring is a <code>TreeMap&lt;Integer, VirtualNode&gt;</code>: 3 nodes × 150 vnodes = 450 points for smooth distribution. <code>CacheConfig</code> is built once by AppConfig and shared read-only across every component (conceptual Singleton) — no magic numbers, no drift.</p>
+      </div>
+    </div>
+    <div class="callout tip"><b>Metadata drives eviction.</b> The store keeps only <code>String → CacheEntry</code>; each eviction strategy keeps its <i>own</i> tracking structure (DLL / frequency buckets / expiry TreeMap) keyed by the same String key. That separation is why <code>CacheStore</code> never changes when you swap policies — the entry carries the signals, the strategy owns the index.</div>
+  </section>
+
+  <!-- E · REQUEST SEQUENCES -->
+  <section>
+    <div class="sec-h"><span class="n">E</span><h2>Request handling sequence</h2><span class="tag">which class does what, in order</span></div>
+
+    <div class="collapsible open">
+      <div class="c-head"><h3>get(key) &nbsp;→&nbsp; hit, miss, or lazy-expire</h3></div>
+      <div class="c-body">
+        <pre class="code"><span class="cm">CacheController.handleGet(key)</span>
+  └─ CacheService.get(key)
+       1  entry = store.get(key)          <span class="cm">// ConcurrentHashMap / routed</span>
+            null? → stats.recordMiss() → return null   <span class="cm">// 404</span>
+       2  entry.isExpired()?              <span class="cm">// lazy TTL</span>
+            yes → store.remove(key)
+                  eviction.remove(key)
+                  stats.recordMiss() → return null     <span class="cm">// 404</span>
+       3  entry.touch()                   <span class="cm">// lastAccessedAt, frequency++</span>
+       4  eviction.onGet(key)             <span class="cm">// LRU→head · LFU→freq+1</span>
+       5  stats.recordHit()
+       6  return entry.getValue()
+  └─ [200 OK]</pre>
+        <p class="muted">Lazy expiration is Redis's trick: don't scan for expired keys, just evict them the moment they're touched. The eviction strategy is notified <i>after</i> the value is confirmed valid.</p>
+      </div>
+    </div>
+
+    <div class="collapsible open">
+      <div class="c-head"><h3>put(key, value, ttl) &nbsp;→&nbsp; insert with capacity eviction</h3></div>
+      <div class="c-body">
+        <pre class="code"><span class="cm">CacheController.handlePut(key, value, ttlSeconds)</span>
+  └─ CacheService.put(key, value, ttlSeconds)
+       1  store.contains(key)?            <span class="cm">// update vs insert</span>
+            no + store.size() &gt;= maxSize → evictOne():
+                 victim = eviction.evict()   <span class="cm">// policy picks</span>
+                 store.remove(victim)
+                 stats.recordEviction()
+       2  CacheEntry.builder().key(key).value(value)
+              .ttlSeconds(ttl &gt; 0 ? ttl : config default).build()
+       3  store.put(key, entry)
+       4  eviction.onPut(key, entry)      <span class="cm">// register in index</span>
+       5  stats.recordPut()
+  └─ [201 Created]</pre>
+        <p class="muted">Capacity is checked only for a genuine insert — updating an existing key never evicts. The victim is chosen by whichever <code>EvictionStrategy</code> is wired; the service never knows which.</p>
+      </div>
+    </div>
+
+    <div class="collapsible">
+      <div class="c-head"><h3>distributed put &nbsp;→&nbsp; routing through the Proxy</h3></div>
+      <div class="c-body">
+        <pre class="code"><span class="cm">CacheService.put(...)  → store is a NodeAwareCacheStore</span>
+  └─ NodeAwareCacheStore.put(key, entry)          <span class="cm">// «Proxy»</span>
+       1  target = hashingStrategy.getNode(key, nodes)
+             ConsistentHashStrategy:
+               h = hash(key)                       <span class="cm">// MD5 → int</span>
+               vnode = ring.ceilingEntry(h)        <span class="cm">// or firstEntry()</span>
+               target = vnode.getPhysicalNode()    <span class="cm">// e.g. node-2</span>
+       2  nodeStores.get(target.getNodeId())       <span class="cm">// its InMemoryCacheStore</span>
+             .put(key, entry)
+       3  target.incrementAssignedKeys()           <span class="cm">// per-node stats</span>
+       (opt) ReplicationService.replicateToFollowers(key, entry, ...)
+  └─ caller sees a single cache — topology hidden</pre>
+        <p class="muted">The Proxy implements <code>CacheStore</code>, so <code>CacheService</code> is identical in single-node and distributed mode — only what <code>AppConfig</code> wires in changes.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- F · DESIGN PATTERNS -->
+  <section>
+    <div class="sec-h"><span class="n">F</span><h2>Design patterns used</h2><span class="tag">GoF-categorized · 8 patterns</span></div>
+    <div class="grid g3">
+      <div class="card">
+        <div class="kicker">Creational</div>
+        <ul class="tight">
+          <li><b>Builder</b> — <code>CacheEntry.builder()</code> &amp; <code>CacheConfig.builder()</code>. Readable construction of 7-field objects; can't swap <code>createdAt</code> and <code>lastAccessedAt</code>.</li>
+          <li><b>Factory</b> — <code>AppConfig</code> is the composition root; a <code>switch</code> on <code>EvictionPolicy</code> creates the strategy. The only class that says <code>new</code>.</li>
+          <li><b>Singleton (conceptual)</b> — one immutable <code>CacheConfig</code> shared by every component; no duplicated magic numbers.</li>
+        </ul>
+      </div>
+      <div class="card">
+        <div class="kicker">Behavioral</div>
+        <ul class="tight">
+          <li><b>Strategy ×2</b> — <code>EvictionStrategy</code> (LRU/LFU/TTL) and <code>HashingStrategy</code> (Consistent/Mod). Two independently variable axes — the centrepiece.</li>
+          <li><b>Observer</b> — <code>CacheStats</code> records hit/miss/eviction/put via <code>AtomicLong</code>, keeping metrics out of the service.</li>
+        </ul>
+      </div>
+      <div class="card">
+        <div class="kicker">Structural</div>
+        <ul class="tight">
+          <li><b>Facade</b> — <code>CacheService</code> hides store + eviction + stats + TTL behind get / put / delete.</li>
+          <li><b>Proxy</b> — <code>NodeAwareCacheStore</code> looks like a CacheStore but routes each op to the right node via consistent hashing.</li>
+          <li><b>Repository</b> — <code>CacheStore</code> / <code>CacheRepository</code> decouple logic from storage; swap in Redis with no service change.</li>
+        </ul>
+      </div>
+    </div>
+    <div class="callout"><b>Why they cluster:</b> Strategy + Factory + Facade + Repository together deliver the Open-Closed Principle — new eviction policies, hashing algorithms, and storage backends are <i>additions</i>, never edits. Observer keeps metrics orthogonal; Proxy makes the jump from one node to many invisible to the Facade; Builder keeps entities immutable and thread-safe; the <code>ConcurrentHashMap</code> store and per-strategy <code>ReentrantLock</code> keep the hot path lock-light. <span class="run">→ CAP, replication &amp; hot-key trade-offs on canvas 3</span></div>
+  </section>
+
+  <!-- RUN IT -->
+  <section>
+    <div class="sec-h"><span class="n">▶</span><h2>Run it — repo file map</h2><span class="tag">concept → actual Java class</span></div>
+    <table>
+      <thead><tr><th>Concept above</th><th>File in <code>07-distributed-cache/src/main/java/…/cache/</code></th></tr></thead>
+      <tbody>
+        <tr><td>Composition root / factory wiring</td><td><code>config/AppConfig.java</code></td></tr>
+        <tr><td>REST-like endpoints</td><td><code>controller/CacheController.java</code></td></tr>
+        <tr><td>Facade orchestrator (§E)</td><td><code>service/CacheService.java</code></td></tr>
+        <tr><td>Strategy context + replication</td><td><code>service/EvictionService.java</code> · <code>service/ReplicationService.java</code></td></tr>
+        <tr><td>Eviction contract (§C)</td><td><code>strategy/eviction/EvictionStrategy.java</code></td></tr>
+        <tr><td>Eviction policies (§B, §C)</td><td><code>strategy/eviction/LRUEvictionStrategy.java</code> · <code>LFUEvictionStrategy.java</code> · <code>TTLEvictionStrategy.java</code></td></tr>
+        <tr><td>Hashing contract + impls (§B)</td><td><code>strategy/hashing/HashingStrategy.java</code> · <code>ConsistentHashStrategy.java</code> · <code>ModHashStrategy.java</code></td></tr>
+        <tr><td>Storage contract + impls (Proxy)</td><td><code>store/CacheStore.java</code> · <code>InMemoryCacheStore.java</code> · <code>NodeAwareCacheStore.java</code></td></tr>
+        <tr><td>Backing store (cache-aside)</td><td><code>repository/CacheRepository.java</code> · <code>InMemoryCacheRepository.java</code></td></tr>
+        <tr><td>Domain models (§D)</td><td><code>model/CacheEntry.java</code> · <code>CacheNode.java</code> · <code>VirtualNode.java</code> · <code>CacheConfig.java</code> · <code>CacheStats.java</code></td></tr>
+        <tr><td>Stats display</td><td><code>display/CacheStatsDisplay.java</code></td></tr>
+        <tr><td>Exceptions</td><td><code>exception/CacheException.java</code> · <code>CacheFullException.java</code> · <code>KeyNotFoundException.java</code> · <code>NodeUnavailableException.java</code></td></tr>
+        <tr><td>Runnable demo (main)</td><td><code>DistributedCacheApp.java</code></td></tr>
+      </tbody>
+    </table>
+    <div class="callout tip"><b>Run the demo</b> (Gradle <code>application</code> plugin, mainClass <code>DistributedCacheApp</code>, no framework):<br><pre class="code">./gradlew :07-distributed-cache:run</pre>It wires a single-node cache, exercises get / put / eviction, fills to capacity to trigger LRU eviction, then spins up a distributed cache to show consistent-hashing key distribution and a runtime LRU→LFU policy switch.</div>
+  </section>
+
+  <!-- GLOSSARY -->
+  <section>
+    <div class="sec-h"><span class="n">§</span><h2>Glossary — one-liners</h2><span class="tag">terms used above</span></div>
+    <div class="grid g2">
+      <div class="card"><table><tbody>
+        <tr><td><b>Strategy pattern</b></td><td>family of interchangeable algorithms behind one interface, chosen at runtime</td></tr>
+        <tr><td><b>Facade pattern</b></td><td>one class (CacheService) hiding a multi-part subsystem behind simple methods</td></tr>
+        <tr><td><b>Proxy pattern</b></td><td>a stand-in with the same interface that transparently routes to real objects</td></tr>
+        <tr><td><b>LRU</b></td><td>evict the least-recently-used key; O(1) via HashMap + doubly-linked list</td></tr>
+        <tr><td><b>LFU</b></td><td>evict the least-frequently-used key; O(1) via frequency buckets + minFreq</td></tr>
+      </tbody></table></div>
+      <div class="card"><table><tbody>
+        <tr><td><b>Consistent hashing</b></td><td>hash keys onto a ring; a node change moves only ~1/N keys</td></tr>
+        <tr><td><b>Virtual node</b></td><td>150 ring points per physical node to smooth distribution / avoid hotspots</td></tr>
+        <tr><td><b>Lazy expiration</b></td><td>TTL checked on access, not by scanning — evict expired keys as they're touched</td></tr>
+        <tr><td><b>Sentinel node</b></td><td>dummy head/tail in the DLL so add/remove need no null-checks</td></tr>
+        <tr><td><b>ConcurrentHashMap</b></td><td>lock-striped map giving safe concurrent reads/writes to the store</td></tr>
+      </tbody></table></div>
+    </div>
+  </section>
+
+  <footer>
+    <p>Use case 07 · Distributed Cache — Canvas 2 of 3 (LLD). Grounded in <code>07-distributed-cache/docs/lld/</code>, <code>docs/patterns/</code>, and the Java under <code>src/main/java/com/systemdesign/cache</code>.</p>
+    <p class="run">This use case: <a href="hld.html">Canvas 1 · HLD</a> · LLD · <a href="deepdive.html">Canvas 3 · Deep-dive &amp; Trade-offs</a> &nbsp;|&nbsp; Next → <a href="deepdive.html">Canvas 3 · Deep-dive &amp; Trade-offs</a> &nbsp;|&nbsp; <a href="../index.html">Hub</a></p>
+  </footer>
+
+</div>
+<script src="../assets/canvas.js"></script>
+</body>
+</html>

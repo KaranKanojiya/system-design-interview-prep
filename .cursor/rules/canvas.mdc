@@ -1,0 +1,168 @@
+---
+description: How to build interactive system-design study canvases in canvas/
+globs: canvas/**
+alwaysApply: false
+---
+
+# System Design Study Canvases — build recipe
+
+You are building **interactive HTML study canvases** for system-design interview prep.
+Everything is self-contained, offline, and prints to PDF (Cmd/Ctrl+P). No build step.
+
+## Where things live
+```
+canvas/
+  index.html                 hub grid (foundations + 20 use-case tiles)
+  assets/canvas.css          shared design system + interactive-layer styles
+  assets/canvas.js           vanilla JS interactivity (see hooks below)
+  assets/logos/{aws,gcp,azure}.svg     provider brand logos
+  assets/logos/services/*.svg          per-service icons (ONLY use ones that exist)
+  f1-cap-consistency.html  f2-must-know-algorithms.html  f3-estimation-numbers.html
+  NN-slug/{hld,lld,deepdive}.html      one folder per use case, 3 canvases each
+```
+Canvas HTML files reference assets via `../assets/...` (foundations are flat, use `assets/...`).
+
+## Status
+- **DONE (13/20):** 01 url-shortener, 02 rate-limiter, 03 notification-system, 04 chat-system,
+  05 social-media-feed, 06 parking-lot, 07 distributed-cache, 08 ride-sharing,
+  09 search-autocomplete, 11 payment-system, 12 news-feed, 13 video-streaming,
+  20 distributed-message-queue. Plus foundations F1–F3.
+- **PENDING (7), priority order:**
+  1. `15-file-storage`, `19-api-gateway-service-mesh`, `10-ecommerce`, `17-distributed-task-scheduler`
+  2. `18-observability-platform`, `16-stock-trading`, `14-realtime-collaboration`
+
+## The exemplar — ALWAYS copy its structure
+`canvas/01-url-shortener/{hld,lld,deepdive}.html` is the reference. Match its layout, class
+names, section order, and interactive wiring exactly. Do not invent a new structure.
+
+## Grounding — read the real project docs before writing
+For use case `NN-slug`, read that project's `NN-slug/docs/{hld,lld,patterns,tradeoffs,caching,tech,cloud}/`,
+its `NN-slug/revision/`, and `NN-slug/src/` (real Java classes). Every claim, class name, and
+algorithm on a canvas must be grounded in those files — not invented.
+
+## Each use case = 3 canvases
+1. **hld.html** — functional/non-functional requirements, estimation chips, an interactive SVG
+   architecture diagram with clickable `[data-node]` components (each reveals a `.node-detail`),
+   a numbered write/read `.flow` stepper (arrows numbered 1..N, no gaps/dupes), and a cloud
+   mapping `table.cloudtable` (columns: Component | AWS | GCP | Azure; provider logos in headers,
+   per-service `svcicon` `<img>` on white chips).
+2. **lld.html** — clickable class map of the REAL Java classes, core algorithm in
+   `<pre class="code">`, tabs/collapsibles, and a "Run it" file map.
+3. **deepdive.html** — scaling tabs, bottleneck collapsibles, CAP analysis, a trade-offs table,
+   and an interview-walkthrough timing strip.
+
+Every canvas ends with `§ Glossary — one-liners` and a walkthrough footer nav.
+
+## JS interactive hooks (already in assets/canvas.js — wire the HTML to these)
+Use the EXACT attribute names below — the JS reads these literal strings. Any deviation
+(e.g. `data-tabpanel` instead of `data-panel`) silently breaks the click handler.
+
+- **Tabs:** MUST use this exact 3-level structure:
+  ```html
+  <div data-tabscope>              <!-- WRAPPER — data-tabscope goes HERE, NOT on .tabs -->
+    <div class="tabs">
+      <button class="tab active" data-tab="alpha">…</button>
+      <button class="tab"        data-tab="beta">…</button>
+    </div>
+    <div class="tabpanel active" data-panel="alpha">…</div>
+    <div class="tabpanel"        data-panel="beta">…</div>
+  </div>
+  ```
+  Rules: (a) `data-tabscope` on the OUTER wrapper that contains BOTH `.tabs` and the panels —
+  never on the `.tabs` element itself (breaks `closest('[data-tabscope]')` panel lookup).
+  (b) every `data-tab` on a `<button>` MUST equal a `data-panel` on a sibling `.tabpanel`
+  (attribute is `data-panel`, not `data-tabpanel`). (c) exactly one `.tab.active` and one
+  `.tabpanel.active` per group for the initial state.
+- **Collapsibles:** `<div class="card collapsible">` → child `<div class="c-head">` (clickable header)
+  + `<div class="c-body">` (content). Add `open` on the card to start expanded.
+- **Diagram:** `<svg class="arch">` (or wrap in `<div class="arch">`) with clickable groups
+  `<g data-node data-title="…" data-detail="… HTML …">`; a sibling `<div class="node-detail">`
+  with `<span class="nd-title">` and `<div class="nd-body">` receives the content.
+- **Flow stepper:** wrap the section in `[data-flowscope]`. Arrows: `<line class="arrow" data-flow="produce" data-produce="N" data-desc-produce="…">`.
+  Controls: `<div data-flowctl>` with `<button data-flow="produce">` path buttons and
+  `<button data-flowstep="prev">` / `data-flowstep="next"` step buttons. Optional
+  `<div data-flowlabel>` shows the current step's description.
+- **Estimator / converter:** IDs `est-dau`, `est-actions`, `est-rw`, `est-payload`, `est-retention`
+  → outputs `o-writesday`, `o-readsday`, `o-wqps`, `o-rqps`, `o-tqps`, `o-peak`, `o-storeday`,
+  `o-storetotal`, `o-bw`. Converter: `cv-val`, `cv-unit`, `cv-B..cv-PB`, `[data-base="1024|1000"]`.
+
+**Symptoms → likely causes:**
+- Tab click does nothing ⇒ (1) `data-tabpanel` instead of `data-panel` on the panel, OR
+  (2) `data-tabscope` sits on the `.tabs` element itself instead of a wrapper containing both
+  `.tabs` and the panels — `tabs.closest('[data-tabscope]')` then returns the tabs div and no
+  panels are found inside it.
+- Node click doesn't reveal detail ⇒ `.node-detail` is not a sibling of the `.arch` container.
+- Flow "Next ▶" does nothing ⇒ arrow is missing `data-<pathName>="N"`, or arrow is outside the
+  `[data-flowscope]` section.
+
+## Cloud icons — HARD CONSTRAINT
+Only reference service icons that ALREADY exist in `canvas/assets/logos/services/`. Available:
+aws-apigw, aws-cloudfront, aws-dynamodb, aws-ecs, aws-elasticache, aws-elb, aws-media, aws-msk,
+aws-opensearch, aws-rds, aws-redshift, aws-s3, aws-sns, aws-sqs, azure-aks, azure-apim,
+azure-appgw, azure-blob, azure-cdn, azure-cosmos, azure-eventhubs, azure-media, azure-notifhub,
+azure-redis, azure-search, azure-servicebus, azure-sql, azure-synapse, gcp-apigw, gcp-bigquery,
+gcp-bigtable, gcp-cloudcdn, gcp-cloudsql, gcp-cloudstorage, gcp-elb, gcp-media, gcp-memorystore,
+gcp-pubsub, gcp-run.
+If a canvas needs a service with no icon, either reuse the closest existing one or fall back to
+the provider brand logo + text — never reference a missing file (broken image).
+
+## SVG diagram layout — HARD RULES (no overlaps, no orphans)
+
+Every clickable SVG diagram (HLD architecture map, LLD class map) MUST follow these rules.
+Violations produce hidden boxes, mystery-orphan nodes, and unreadable canvases.
+
+### Rule A — Column-grid layout (no eyeballing coordinates)
+Use a fixed 4-column grid. Every node's `x` MUST be one of these column starts:
+  - Col 1: x=20   (width up to 150)
+  - Col 2: x=205  (width up to 130)
+  - Col 3: x=395  (width up to 130)
+  - Col 4: x=620  (width up to 150)
+Between columns leave ≥ 25 px of empty gutter for arrows.
+Every node's `y` MUST land on a 60-px row grid: y ∈ {26, 86, 150, 210, 270, 330, 390, 450 …}.
+Row height (rect `height`) ≤ 50 px so a ≥ 10 px vertical gap remains between stacked rows.
+
+### Rule B — Explicit non-overlap check (do this BEFORE finishing)
+For every pair of `<rect>` nodes, verify NO overlap:
+  `x1 + w1 ≤ x2  OR  x2 + w2 ≤ x1  OR  y1 + h1 ≤ y2  OR  y2 + h2 ≤ y1`
+Any pair that fails must be moved to a different column or row before you write the file.
+If two nodes conceptually belong at the same coordinate, split into 2 rows or shrink one.
+
+### Rule C — No orphan nodes (every `[data-node]` needs an arrow)
+Every `<g data-node>` MUST have at least ONE `<line class="arrow">` or `<path class="arrow">`
+that starts OR ends within 12 px of one of its edges. If a node exists conceptually but has
+no relationship arrow, remove the node — floating boxes look like bugs, not design choices.
+Include repository blocks, metadata stores, offset stores, metrics/utility boxes — no exceptions.
+
+### Rule D — viewBox sizing
+`viewBox` height MUST equal `bottom-most (y + height) + 20 px` minimum. Never let the last
+row's bottom equal or exceed the viewBox height; the `.node-detail` panel will collide.
+
+### Rule E — Arrow legibility
+- Solid arrows = core wiring / request path. Dashed (`stroke-dasharray="4 3"`) = "uses / implements / references".
+- Never route an arrow straight through the interior of a non-endpoint node — go around, or use a curved `<path>`.
+- Label ambiguous arrows with a tiny `<text fill="var(--faint)" font-size="9">` beside the midpoint (e.g. "topic meta", "commit offset").
+- Flow-stepper arrows are numbered via `data-write="N"` / `data-read="N"` — sequence 1..N with no gaps or duplicates.
+
+## Self-check before finishing a canvas
+Run through this checklist explicitly; do not skip:
+- [ ] All asset paths use `../assets/` (foundations use `assets/`).
+- [ ] Every interactive hook is wired and works.
+- [ ] Flow arrows numbered 1..N, no gaps/dupes.
+- [ ] Every `svcicon` `src` points to a file that exists in `assets/logos/services/`.
+- [ ] Java class references are real (exist in `NN-slug/src/`).
+- [ ] `§ Glossary` present + footer walkthrough nav present.
+- [ ] **Layout Rule A** — every node sits on the column/row grid.
+- [ ] **Layout Rule B** — pairwise rect-overlap check passes for every diagram.
+- [ ] **Layout Rule C** — every `[data-node]` has ≥ 1 arrow touching it (no orphans).
+- [ ] **Layout Rule D** — viewBox height ≥ bottom-most node bottom + 20 px.
+- [ ] **Layout Rule E** — no arrow crosses through a non-endpoint node's interior.
+- [ ] **Interactivity smoke-test** — for every `.tabs` block, confirm each `data-tab` value has a
+      matching `data-panel` (NOT `data-tabpanel`) inside the same `[data-tabscope]`. For every
+      `[data-node]`, confirm a sibling `.node-detail` exists. For every `[data-flowctl]` path
+      button, confirm at least one arrow has `data-<path>="1"` inside the same `[data-flowscope]`.
+      Grep is enough: `data-tab="[^"]+"` should equal `data-panel="[^"]+"` sets.
+
+## After building a batch
+1. Wire the finished tiles into `canvas/index.html`: replace the `.tile.soon` markup with
+   `<a class="tile" href="NN-slug/hld.html">…</a>` (copy a "ready" tile's markup).
+2. Build one use case at a time (or one small batch), then verify in browser before moving on.

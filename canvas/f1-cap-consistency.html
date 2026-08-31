@@ -1,0 +1,324 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>F1 · CAP &amp; Consistency</title>
+<link rel="stylesheet" href="assets/canvas.css">
+</head>
+<body>
+<div class="wrap">
+
+  <header class="hero">
+    <h1>CAP &amp; Consistency</h1>
+    <div class="sub">Foundation reference — the one theorem every distributed-systems interview circles back to. Partitions are inevitable, so you never really pick "two of three": you pick <b>CP or AP</b>. Click the triangle, walk the consistency spectrum, and learn which of the repo use-cases lands where.</div>
+    <div class="badges">
+      <span class="badge lvl">Foundation · F1 of 3</span>
+      <span class="badge">System Design Basics</span>
+      <span class="badge">interactive</span>
+      <span class="badge">CP vs AP</span>
+    </div>
+    <div class="legend">
+      <span><i class="dot" style="background:var(--eden)"></i> consistency (C)</span>
+      <span><i class="dot" style="background:var(--survivor)"></i> availability (A)</span>
+      <span><i class="dot" style="background:var(--old)"></i> partition tolerance (P)</span>
+      <span><i class="dot" style="background:var(--gc)"></i> formulas / quorum</span>
+      <span><i class="dot" style="background:var(--warn)"></i> gotchas</span>
+    </div>
+  </header>
+
+  <!-- A · CAP TRIANGLE (INTERACTIVE) -->
+  <section>
+    <div class="sec-h"><span class="n">A</span><h2>The CAP theorem in one picture</h2><span class="tag">click a corner-pair</span></div>
+    <p class="muted">You can guarantee at most <b>two</b> of Consistency, Availability, Partition&nbsp;tolerance. Each edge of the triangle is a real pairing. Click one to see the trade-off and which databases live there.</p>
+    <div class="arch">
+      <div class="grid g3">
+        <div class="card" data-node data-title="CP · Consistency + Partition tolerance"
+             data-detail="<b>Sacrifice availability during a partition.</b> If a node cannot confirm it has the most-recent write, it returns an error or blocks rather than serve stale data. Reads may need to reach the leader or a quorum.<br><br><b>Choose when</b> stale/incorrect data is worse than a brief outage: money, inventory, locks, unique IDs.<br><br><b>Real databases:</b> HBase, MongoDB (default, primary-only reads), Redis, ZooKeeper, etcd, Google Spanner.<br><br><i>etcd returns an error if the leader is unreachable — correctness over uptime.</i>">
+          <div class="kicker" style="color:var(--eden)">edge 1</div>
+          <h3 style="margin:2px 0">CP</h3>
+          <p class="muted" style="margin:0">C + P — refuse to answer if you can't be correct. <b>Sacrifices A.</b></p>
+        </div>
+        <div class="card" data-node data-title="AP · Availability + Partition tolerance"
+             data-detail="<b>Sacrifice consistency during a partition.</b> Every non-failing node still answers, but may return stale data; replicas reconcile later (eventual consistency, read-repair, CRDTs).<br><br><b>Choose when</b> a slightly stale answer is fine but downtime is not: feeds, caches, presence, analytics, product catalogs.<br><br><b>Real databases:</b> Cassandra, Amazon DynamoDB, Riak, CouchDB, Voldemort.<br><br><i>DynamoDB returns data from any replica — uptime over freshness.</i>">
+          <div class="kicker" style="color:var(--survivor)">edge 2</div>
+          <h3 style="margin:2px 0">AP</h3>
+          <p class="muted" style="margin:0">A + P — always answer, maybe stale. <b>Sacrifices C.</b></p>
+        </div>
+        <div class="card" data-node data-title="CA · Consistency + Availability (not truly distributed)"
+             data-detail="<b>Only possible with no partitions — i.e. a single node.</b> A lone PostgreSQL server is &quot;CA&quot;: consistent and available, because there is no network between replicas to partition.<br><br>The moment you add a second node, the network <i>can</i> partition, and you are forced back onto the CP/AP edge. So in any real distributed system, <b>CA is a myth</b> — it's the corner you can't actually stand on.<br><br><b>Real examples:</b> a single-instance PostgreSQL / MySQL, a single Redis (no replication).">
+          <div class="kicker" style="color:var(--old)">the myth</div>
+          <h3 style="margin:2px 0">CA</h3>
+          <p class="muted" style="margin:0">C + A — single node only. <b>Not a distributed system.</b></p>
+        </div>
+      </div>
+    </div>
+    <div class="node-detail"><span class="nd-title">Click a corner-pair above</span><div class="nd-body">CP, AP and "CA" each explain what you keep and what you give up when the network splits.</div></div>
+    <div class="callout tip"><b>The 10-second version:</b> "CAP says pick two. But P is non-negotiable in a distributed system, so the real question is <b>CP or AP</b> — do you drop availability (block/error) or consistency (serve stale) when nodes can't talk?"</div>
+  </section>
+
+  <!-- B · WHAT C, A, P MEAN -->
+  <section>
+    <div class="sec-h"><span class="n">B</span><h2>What C, A, P each mean</h2><span class="tag">precise definitions</span></div>
+    <div class="grid g3">
+      <div class="card">
+        <div class="kicker" style="color:var(--eden)">C · Consistency</div>
+        <p>Every read receives the <b>most recent write</b> — or an error. This is <b>linearizability</b>, the strong kind, <i>not</i> "eventual consistency."</p>
+        <p class="muted">The system behaves as if there is one single copy of the data and all operations are atomic and instantaneous.</p>
+      </div>
+      <div class="card">
+        <div class="kicker" style="color:var(--survivor)">A · Availability</div>
+        <p>Every request to a <b>non-failing node</b> gets a response — with no guarantee that it is the most recent value.</p>
+        <p class="muted">"A response, not necessarily the right one." A timeout or an error is <i>not</i> available.</p>
+      </div>
+      <div class="card">
+        <div class="kicker" style="color:var(--old)">P · Partition tolerance</div>
+        <p>The system keeps operating despite <b>arbitrary message loss</b> between nodes — the network splitting into groups that can't talk.</p>
+        <p class="muted">Not optional: cables cut, switches fail, GC pauses look like partitions. You must tolerate them.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- C · THE REAL RULE -->
+  <section>
+    <div class="sec-h"><span class="n">C</span><h2>The real rule — you choose CP vs AP, not "two of three"</h2><span class="tag">partitions are a given</span></div>
+    <div class="grid g2">
+      <div class="card">
+        <div class="kicker">why CA can't exist</div>
+        <pre class="code"><span class="cm">// Two nodes A, B. A partition sits between them.</span>
+Client writes  x = 1  to A
+Client reads   x      from B
+
+<span class="cm">// B cannot contact A. It must either…</span>
+CONSISTENT  &rarr; B errors / waits  <span class="cm">// not Available</span>
+AVAILABLE   &rarr; B returns x = 0    <span class="cm">// not Consistent</span>
+
+<span class="cm">// You cannot have both C and A during a partition.</span>
+<span class="cm">// And partitions happen. So: pick CP or AP.</span></pre>
+      </div>
+      <div class="card">
+        <ul class="tight">
+          <li><b>P is not a choice</b> — in a distributed system the network <i>will</i> split. You only choose what to do when it does.</li>
+          <li><b>CP</b> = when partitioned, drop <b>A</b>: block or error rather than serve possibly-stale data.</li>
+          <li><b>AP</b> = when partitioned, drop <b>C</b>: keep answering, reconcile later.</li>
+          <li><b>"CA"</b> = a single node with no network to partition (one Postgres box). Add a replica and you're back on the CP/AP edge.</li>
+          <li><b>CAP is per-operation, not per-system.</b> One service can be CP for writes and AP for reads — e.g. E-Commerce inventory (CP) vs product catalog (AP).</li>
+        </ul>
+      </div>
+    </div>
+    <div class="callout"><b>Nuance that scores points:</b> CAP is not binary or system-wide. Say "the <i>order book</i> is CP" not "the whole system is CP." Different components make different choices.</div>
+  </section>
+
+  <!-- D · PACELC -->
+  <section>
+    <div class="sec-h"><span class="n">D</span><h2>PACELC — the trade-off you live with every day</h2><span class="tag">beyond CAP</span></div>
+    <p class="muted">CAP only describes behaviour <i>during a partition</i>. But partitions are rare — most of the time the system is healthy. PACELC (Abadi, 2012) adds the <b>Else</b> case: with no partition, you still trade <b>Latency vs Consistency</b> on <i>every</i> request.</p>
+    <pre class="code"><span class="cm">if (Partition)  choose  A  or  C   // same as CAP</span>
+<span class="cm">else            choose  L  or  C   // the new, everyday tradeoff</span>
+
+P A C  E L C
+│ └─┴─ during partition: Availability vs Consistency
+└───── Else (no partition): Latency vs Consistency</pre>
+    <table>
+      <thead><tr><th>System</th><th>During partition</th><th>Else (normal op)</th><th>Class</th><th>Read behaviour</th></tr></thead>
+      <tbody>
+        <tr><td>DynamoDB</td><td>AP</td><td>EL — low latency</td><td><b>PA/EL</b></td><td>reads from any replica (fast, maybe stale)</td></tr>
+        <tr><td>Cassandra</td><td>AP</td><td>EL — tunable</td><td><b>PA/EL</b></td><td>tunable quorum; default favours latency</td></tr>
+        <tr><td>MongoDB</td><td>CP (primary)</td><td>EC — strong reads</td><td><b>PC/EC</b></td><td>reads via primary for freshness</td></tr>
+        <tr><td>Spanner</td><td>CP</td><td>EC — TrueTime</td><td><b>PC/EC</b></td><td>reads through Paxos leader (higher latency)</td></tr>
+        <tr><td>etcd</td><td>CP</td><td>EC — Raft leader reads</td><td><b>PC/EC</b></td><td>leader read = always latest</td></tr>
+        <tr><td>Cosmos DB</td><td>Tunable</td><td>Tunable</td><td><b>Tunable</b></td><td>5 named consistency levels</td></tr>
+      </tbody>
+    </table>
+    <div class="callout tip"><b>Interview upgrade:</b> "I'd choose an AP system" is incomplete. Add the Else clause: "…and during normal operation I prioritise <b>latency over consistency (EL)</b> because this is a read-heavy feed." That's PACELC, and it impresses.</div>
+  </section>
+
+  <!-- E · CONSISTENCY SPECTRUM -->
+  <section>
+    <div class="sec-h"><span class="n">E</span><h2>Consistency-models spectrum — strong → eventual</h2><span class="tag">expand each</span></div>
+    <p class="muted">"Consistency" is not one thing. It's a ladder: stronger models are easier to reason about but harder and slower to scale; weaker models scale freely but push complexity onto your app. Top of the list is strongest.</p>
+    <div class="collapsible open">
+      <div class="c-head"><h3>1 · Linearizability (strong) — <span style="color:var(--eden)">strongest</span></h3></div>
+      <div class="c-body">Behaves as if there is <b>one single copy</b> of the data; every operation appears atomic and instantaneous at some point between its call and return. A read always sees the latest completed write, respecting real-time order. This is the "C" in CAP. <b>Cost:</b> coordination on every write (Raft/Paxos leader, quorum) → higher latency, no availability during partitions. Used by etcd, ZooKeeper, Spanner.</div>
+    </div>
+    <div class="collapsible">
+      <div class="c-head"><h3>2 · Sequential consistency</h3></div>
+      <div class="c-body">There exists <b>one total order</b> of all operations that every process agrees on, and each process's own operations keep their program order — but that global order need <b>not</b> match real (wall-clock) time. Weaker than linearizability precisely because it drops the real-time requirement.</div>
+    </div>
+    <div class="collapsible">
+      <div class="c-head"><h3>3 · Causal consistency</h3></div>
+      <div class="c-body">Preserves the order of <b>causally related</b> operations (if A happened-before B, everyone sees A before B), while <b>concurrent</b> operations may be seen in different orders by different nodes. Enough to make comment-reply threads and chat make sense without full coordination. Implemented with vector clocks / dependency tracking.</div>
+    </div>
+    <div class="collapsible">
+      <div class="c-head"><h3>4 · Read-your-writes (session)</h3></div>
+      <div class="c-body">A session guarantee: after <b>you</b> write a value, <b>your</b> subsequent reads always reflect it (you never lose your own update), though other users might still see the old value briefly. This is how "you see your own tweet immediately" is delivered on an otherwise-eventual feed.</div>
+    </div>
+    <div class="collapsible">
+      <div class="c-head"><h3>5 · Monotonic reads</h3></div>
+      <div class="c-body">Time never appears to go backwards for a reader: once you've seen a value, later reads never return an <b>older</b> version. Prevents the "refresh and the new item vanishes, refresh again and it's back" flicker caused by hitting replicas with different lag.</div>
+    </div>
+    <div class="collapsible">
+      <div class="c-head"><h3>6 · Eventual consistency — <span style="color:var(--warn)">weakest</span></h3></div>
+      <div class="c-body">The weakest useful model: if no new writes happen, all replicas <b>eventually</b> converge to the same value. No bound on "eventually" — but in practice milliseconds to seconds. Reads can be stale in the meantime. The default for AP stores (Cassandra, DynamoDB) and the norm for feeds, caches, and click counts.</div>
+    </div>
+  </section>
+
+  <!-- F · REPLICATION & QUORUM -->
+  <section>
+    <div class="sec-h"><span class="n">F</span><h2>Replication &amp; quorum — how CP/AP is actually tuned</h2><span class="tag">W + R &gt; N</span></div>
+    <div class="grid g2">
+      <div class="card">
+        <div class="kicker">sync vs async replication</div>
+        <table>
+          <thead><tr><th></th><th>Synchronous</th><th>Asynchronous</th></tr></thead>
+          <tbody>
+            <tr><td>Ack after</td><td>replicas confirm</td><td>leader only</td></tr>
+            <tr><td>On failover</td><td>no data loss</td><td>may lose recent writes</td></tr>
+            <tr><td>Write latency</td><td>higher</td><td>lower</td></tr>
+            <tr><td>Leans</td><td><b>CP / consistency</b></td><td><b>AP / availability</b></td></tr>
+          </tbody>
+        </table>
+        <p class="muted">Leaderless stores (Dynamo-style) skip a leader entirely and use <b>quorums</b> to tune where they sit on the CP↔AP line.</p>
+      </div>
+      <div class="card">
+        <div class="kicker">the quorum rule</div>
+        <pre class="code"><span class="cm">N = total replicas</span>
+<span class="cm">W = nodes that must ACK a write</span>
+<span class="cm">R = nodes that must respond to a read</span>
+
+<span class="kw">W + R &gt; N</span>   <span class="cm">// read &amp; write sets overlap</span>
+              <span class="cm">// &rarr; read always sees latest write</span></pre>
+        <table>
+          <thead><tr><th>W</th><th>R</th><th>N</th><th>Result</th></tr></thead>
+          <tbody>
+            <tr><td>2</td><td>2</td><td>3</td><td>4&gt;3 — <b>strong</b> (default)</td></tr>
+            <tr><td>1</td><td>1</td><td>3</td><td>2≯3 — stale possible (<b>AP</b>)</td></tr>
+            <tr><td>3</td><td>1</td><td>3</td><td>fast reads, slow writes</td></tr>
+            <tr><td>1</td><td>3</td><td>3</td><td>fast writes, slow reads</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+    <div class="card">
+      <div class="kicker">worked example — N=3, W=2, R=2</div>
+      <pre class="code"><span class="cm">// Write x=5 — need W=2 ACKs</span>
+Write x=5 &rarr; {A, B} ACK   <span class="cm">// C still has old x=3</span>
+
+<span class="cm">// Read — need R=2 responses</span>
+Read &larr; {B, C}
+   B returns x=5   <span class="cm">// fresh</span>
+   C returns x=3   <span class="cm">// stale</span>
+&rArr; client keeps newest version (by timestamp/version) = <span class="kw">x=5</span> &check;
+
+<span class="cm">// Why it works: write set {A,B} and read set {B,C}</span>
+<span class="cm">// overlap at B. R+W = 4 &gt; N = 3 guarantees ≥1 shared node</span>
+<span class="cm">// that holds the latest write. That overlap = strong reads.</span></pre>
+    </div>
+    <div class="callout"><b>Sloppy quorum</b> trades this away: if a designated node is down, write to <i>any</i> live node (a "hint") and hand off later. Boosts availability (more AP) but the R+W&gt;N overlap may not hold, so reads can go stale.</div>
+  </section>
+
+  <!-- G · CP vs AP DATABASES -->
+  <section>
+    <div class="sec-h"><span class="n">G</span><h2>CP vs AP — real databases</h2><span class="tag">name-drop correctly</span></div>
+    <div class="grid g2">
+      <table>
+        <thead><tr><th>CP store</th><th>How it stays consistent</th></tr></thead>
+        <tbody>
+          <tr><td>HBase</td><td>single region-server per region; strong reads</td></tr>
+          <tr><td>MongoDB <span class="muted">(default)</span></td><td>reads/writes via primary; replica failover</td></tr>
+          <tr><td>Redis</td><td>single primary per shard; sync-ish replication</td></tr>
+          <tr><td>ZooKeeper</td><td>ZAB atomic broadcast; majority quorum</td></tr>
+          <tr><td>etcd</td><td>Raft; errors if leader unreachable</td></tr>
+          <tr><td>Google Spanner</td><td>Paxos + TrueTime; external consistency</td></tr>
+        </tbody>
+      </table>
+      <table>
+        <thead><tr><th>AP store</th><th>How it stays available</th></tr></thead>
+        <tbody>
+          <tr><td>Cassandra</td><td>leaderless, tunable quorum, read-repair</td></tr>
+          <tr><td>Amazon DynamoDB</td><td>any-replica reads; eventual by default</td></tr>
+          <tr><td>Riak</td><td>Dynamo-style; vector clocks for conflicts</td></tr>
+          <tr><td>CouchDB</td><td>multi-master; async replication</td></tr>
+          <tr><td>Voldemort</td><td>Dynamo-style key-value, quorum tunable</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <div class="callout tip"><b>Careful:</b> many are <i>tunable</i>. Cassandra with <code>QUORUM</code>/<code>QUORUM</code> reads acts CP-ish; DynamoDB offers strongly-consistent reads on demand. State the <i>configuration</i>, not just the product name.</div>
+  </section>
+
+  <!-- H · REPO USE-CASES: CP vs AP -->
+  <section>
+    <div class="sec-h"><span class="n">H</span><h2>Which repo use-case is CP vs AP?</h2><span class="tag">per component</span></div>
+    <p class="muted">CAP is per-component. The same system routinely has a CP core and AP edges. Grounded in the repo's per-project CAP analysis.</p>
+    <table>
+      <thead><tr><th>Use-case</th><th>Component</th><th>CAP</th><th>Why</th></tr></thead>
+      <tbody>
+        <tr><td>Payment System</td><td>Ledger / balance / idempotency</td><td><b>CP</b></td><td>can't double-charge or lose money; stale balance = overdraft</td></tr>
+        <tr><td>E-Commerce</td><td>Inventory</td><td><b>CP</b></td><td>cannot oversell a limited stock</td></tr>
+        <tr><td>E-Commerce</td><td>Product catalog</td><td>AP</td><td>a stale description is harmless</td></tr>
+        <tr><td>Chat System</td><td>Message store</td><td><b>CP</b></td><td>messages must not be lost or reordered</td></tr>
+        <tr><td>Chat System</td><td>Presence (online/offline)</td><td>AP</td><td>stale presence is fine</td></tr>
+        <tr><td>Ride Sharing</td><td>Ride assignment</td><td><b>CP</b></td><td>can't assign one driver to two rides</td></tr>
+        <tr><td>Ride Sharing</td><td>Driver location</td><td>AP</td><td>slightly stale GPS is fine</td></tr>
+        <tr><td>Stock Trading</td><td>Order book</td><td><b>CP</b></td><td>trades must be exactly ordered</td></tr>
+        <tr><td>Task Scheduler</td><td>Task assignment</td><td><b>CP</b></td><td>tasks must not be double-executed</td></tr>
+        <tr><td>File Storage</td><td>File metadata</td><td><b>CP</b></td><td>file must not be lost/corrupted</td></tr>
+        <tr><td>Social Media Feed</td><td>Feed timeline / cache</td><td>AP</td><td>5–10s stale is invisible; must always load</td></tr>
+        <tr><td>News Feed</td><td>Feed generation</td><td>AP</td><td>stale feed acceptable</td></tr>
+        <tr><td>URL Shortener</td><td>URL mapping store</td><td>AP</td><td>redirect must always work; 1–2s propagation OK</td></tr>
+        <tr><td>URL Shortener</td><td>Custom alias creation</td><td><b>CP</b>-ish</td><td>duplicate alias unacceptable → conditional write / LWT</td></tr>
+        <tr><td>Rate Limiter</td><td>Counter store</td><td>AP</td><td>approximate counts are sufficient</td></tr>
+        <tr><td>Distributed Cache</td><td>Cache entries</td><td>AP</td><td>miss = fall back to DB, fine</td></tr>
+        <tr><td>Notification System</td><td>Notification queue</td><td>AP</td><td>delayed/duplicate beats lost</td></tr>
+        <tr><td>Real-time Collab</td><td>Document state (CRDT)</td><td>AP</td><td>CRDTs converge without coordination</td></tr>
+        <tr><td>Observability</td><td>Metrics store</td><td>AP</td><td>approximate metrics acceptable</td></tr>
+        <tr><td>Observability</td><td>Alert state</td><td><b>CP</b></td><td>must not miss/duplicate critical alerts</td></tr>
+      </tbody>
+    </table>
+    <div class="callout"><b>The 30-second framework:</b> (1) name the exact data, (2) "what if a read is stale?" — money/corruption → CP, minor UX → AP, (3) "what if it's unavailable?" — revenue/safety loss → lean AP, (4) state the PACELC Else clause.</div>
+  </section>
+
+  <!-- GLOSSARY -->
+  <section>
+    <div class="sec-h"><span class="n">§</span><h2>Glossary — one-liners</h2><span class="tag">terms used above</span></div>
+    <div class="grid g2">
+      <div class="card">
+        <table>
+          <tbody>
+            <tr><td><b>CAP theorem</b></td><td>at most 2 of Consistency, Availability, Partition-tolerance</td></tr>
+            <tr><td><b>Partition</b></td><td>network split — nodes can't exchange messages</td></tr>
+            <tr><td><b>CP</b></td><td>on partition, sacrifice availability (block/error) to stay correct</td></tr>
+            <tr><td><b>AP</b></td><td>on partition, sacrifice consistency (serve stale) to stay up</td></tr>
+            <tr><td><b>"CA"</b></td><td>single node only; not achievable in a distributed system</td></tr>
+            <tr><td><b>PACELC</b></td><td>if Partition: A vs C; Else: Latency vs Consistency</td></tr>
+            <tr><td><b>Linearizability</b></td><td>strongest model: acts like one copy, real-time order</td></tr>
+            <tr><td><b>Eventual consistency</b></td><td>replicas converge if writes stop; stale meanwhile</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="card">
+        <table>
+          <tbody>
+            <tr><td><b>Causal consistency</b></td><td>causally-related ops seen in order; concurrent ops may differ</td></tr>
+            <tr><td><b>Read-your-writes</b></td><td>your own writes are always visible to your later reads</td></tr>
+            <tr><td><b>Monotonic reads</b></td><td>you never see data go backwards in time</td></tr>
+            <tr><td><b>Quorum</b></td><td>minimum nodes that must respond; W+R&gt;N ⇒ strong reads</td></tr>
+            <tr><td><b>N / W / R</b></td><td>replicas / write-acks / read-responses</td></tr>
+            <tr><td><b>Sync vs async repl.</b></td><td>ack after replicas (CP) vs after leader (AP)</td></tr>
+            <tr><td><b>Sloppy quorum</b></td><td>write to any live node + hinted handoff — more AP</td></tr>
+            <tr><td><b>Read-repair</b></td><td>fix stale replicas detected during a quorum read</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+
+  <footer>
+    <p>Foundation F1 of 3 · System Design Basics — CAP &amp; Consistency. Grounded in <code>docs/DISTRIBUTED_SYSTEMS_FUNDAMENTALS.md</code> §8 and per-project <code>CAP_THEOREM.md</code> files.</p>
+    <p class="run">Foundations: F1 · CAP &amp; Consistency · <a href="f2-must-know-algorithms.html">F2 · Must-Know Algorithms</a> · <a href="f3-estimation-numbers.html">F3 · Estimation &amp; Numbers</a> &nbsp;|&nbsp; <a href="index.html">→ Use-case canvases (hub)</a> &nbsp;·&nbsp; <a href="f2-must-know-algorithms.html">Next → F2 · Must-Know Algorithms</a></p>
+  </footer>
+
+</div>
+<script src="assets/canvas.js"></script>
+</body>
+</html>

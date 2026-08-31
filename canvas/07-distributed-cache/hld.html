@@ -1,0 +1,253 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>07 · Distributed Cache — HLD</title>
+<link rel="stylesheet" href="../assets/canvas.css">
+</head>
+<body>
+<div class="wrap">
+
+  <header class="hero">
+    <h1>Distributed Cache — High-Level Design</h1>
+    <div class="sub">Use case 07 · Canvas 1 of 3. The big picture: requirements, back-of-envelope numbers, and an <b>interactive architecture diagram</b> — click a component to see its role, then step through the write (PUT) and read (GET / cache-aside) request flows.</div>
+    <div class="badges">
+      <span class="badge lvl">Use case 07 · HLD</span>
+      <span class="badge">Canvas 1 of 3</span>
+      <span class="badge">interactive</span>
+      <span class="badge">AP · read-heavy 10:1</span>
+    </div>
+    <div class="legend">
+      <span><i class="dot" style="background:var(--eden)"></i> click a component</span>
+      <span><i class="dot" style="background:var(--survivor)"></i> routing / hash ring</span>
+      <span><i class="dot" style="background:var(--eden)"></i> current step</span>
+      <span><i class="dot" style="background:var(--old)"></i> cache &amp; data stores</span>
+      <span><i class="dot" style="background:var(--warn)"></i> control plane / off hot-path</span>
+    </div>
+  </header>
+
+  <!-- A · PROBLEM & REQUIREMENTS -->
+  <section>
+    <div class="sec-h"><span class="n">A</span><h2>Problem &amp; requirements</h2><span class="tag">clarify first</span></div>
+    <p class="muted" style="margin:0 0 12px">A <b>distributed cache</b> stores key-value data across many in-memory nodes to serve sub-millisecond reads, shield the database from load, and scale horizontally. It sits between the application and the database; the database stays the source of truth.</p>
+    <div class="grid g2">
+      <div class="card">
+        <div class="kicker">functional</div>
+        <ul class="tight">
+          <li><b>Put / Get / Delete</b> a key-value pair; optional per-key <b>TTL</b> (expired keys never returned).</li>
+          <li><b>Eviction</b> when a node hits its memory limit — LRU, LFU, or random.</li>
+          <li><b>Bulk</b> multi-get / multi-put; lightweight <b>exists</b> probe; atomic <b>CAS</b>.</li>
+          <li>Spread data across nodes and <b>rebalance</b> as nodes join / leave.</li>
+        </ul>
+      </div>
+      <div class="card">
+        <div class="kicker">non-functional</div>
+        <ul class="tight">
+          <li><b>Read latency</b> &lt; 1 ms p99 · <b>write latency</b> &lt; 2 ms p99 — 10–100× faster than the DB.</li>
+          <li><b>Availability</b> 99.99% — a cache outage cascades load onto the DB (→ AP system).</li>
+          <li><b>Hit rate</b> &gt; 95% · <b>even spread</b> &lt; 10% variance across nodes.</li>
+          <li>Survive a single-node failure with <b>auto-failover</b>; scale <b>linearly</b> by adding nodes.</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <!-- B · ESTIMATION -->
+  <section>
+    <div class="sec-h"><span class="n">B</span><h2>Back-of-envelope estimation</h2><span class="tag">200M keys · 10:1 read-heavy</span></div>
+    <div class="chips">
+      <div class="chip"><span class="k">Read QPS</span><span class="v">~500K/s</span></div>
+      <div class="chip"><span class="k">Write QPS</span><span class="v">~50K/s</span></div>
+      <div class="chip"><span class="k">Unique keys</span><span class="v">~200M</span></div>
+      <div class="chip"><span class="k">Avg value</span><span class="v">~1 KB</span></div>
+      <div class="chip"><span class="k">Dataset</span><span class="v">~230 GB</span></div>
+      <div class="chip"><span class="k">With RF 2</span><span class="v">~460 GB</span></div>
+      <div class="chip"><span class="k">Cluster</span><span class="v">5 × 64 GB</span></div>
+      <div class="chip"><span class="k">VNodes / node</span><span class="v">150</span></div>
+      <div class="chip"><span class="k">Hit rate</span><span class="v">&gt; 95%</span></div>
+      <div class="chip"><span class="k">Entry overhead</span><span class="v">~5%</span></div>
+    </div>
+    <div class="callout tip"><b>Derivation:</b> 200M keys × (64 B key + 1 KB value + ~56 B metadata) ≈ <b>230 GB</b>; replication factor 2 → ~460 GB; 5 nodes × 64 GB = 320 GB per replica set fits comfortably. Metadata (TTL, LRU pointers, version) ≈ 56 B / ~1,144 B ≈ 4.9% overhead. By Pareto, <b>20% of keys serve 80% of traffic</b>; an L1 Caffeine cache in the app absorbs 50–80% of reads before Redis. <span class="run">→ full math on canvas 3 · Estimation</span></div>
+  </section>
+
+  <!-- C · INTERACTIVE ARCHITECTURE -->
+  <section data-flowscope>
+    <div class="sec-h"><span class="n">C</span><h2>Architecture — click components, then step the flows</h2><span class="tag">the design, from the diagram</span></div>
+    <div>
+      <div class="arch">
+        <svg viewBox="0 0 840 384" width="100%" style="max-width:840px" role="img" aria-label="Distributed cache architecture">
+          <defs>
+            <marker id="ah" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" fill="var(--muted)"></path></marker>
+          </defs>
+
+          <!-- arrows (drawn first, under the boxes) -->
+          <line class="arrow" x1="116" y1="176" x2="150" y2="176" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"
+                data-flow="write read" data-write="1" data-read="1"
+                data-desc-write="App calls put(key, value, ttl). The embedded cache client hashes the key (murmur3) and walks the consistent-hash ring to find the owning node." data-desc-read="App calls get(key). After an L1 (Caffeine) miss, the client hashes the key and walks the ring to the owning node."></line>
+          <line class="arrow" x1="272" y1="176" x2="342" y2="176" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"
+                data-flow="write read" data-write="2" data-read="2"
+                data-desc-write="Client borrows a pooled TCP connection (8 per node) and sends PUT to the owning master node." data-desc-read="Client borrows a pooled TCP connection and sends GET to the owning master node."></line>
+          <line class="arrow" x1="406" y1="200" x2="406" y2="298" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"
+                data-flow="write" data-write="3"
+                data-desc-write="Master stores the entry (insert at LRU head; evict the LRU tail if over maxmemory), then asynchronously replicates to its replica."></line>
+          <path class="arrow" d="M342,162 C 250,108 150,108 74,152" fill="none" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"
+                data-flow="write read" data-write="4" data-read="3"
+                data-desc-write="Master acks STORED — async replication returns immediately (DB is the source of truth), so the client returns success to the app." data-desc-read="Cache HIT: master returns the value from its in-memory HashMap and bumps LRU recency — sub-millisecond."></path>
+          <line class="arrow" x1="470" y1="170" x2="658" y2="170" stroke="var(--muted)" stroke-width="2" stroke-dasharray="4 3" marker-end="url(#ah)"
+                data-flow="read" data-read="4"
+                data-desc-read="Cache MISS: the app falls through to the database (source of truth) to load the value."></line>
+          <line class="arrow" x1="658" y1="188" x2="470" y2="188" stroke="var(--muted)" stroke-width="2" stroke-dasharray="4 3" marker-end="url(#ah)"
+                data-flow="read" data-read="5"
+                data-desc-read="Cache-aside backfill: the app writes the DB result back into the cache with a TTL, so the next read is a hit."></line>
+
+          <!-- control-plane (not part of the numbered flow) -->
+          <line x1="406" y1="92" x2="406" y2="150" stroke="var(--muted)" stroke-width="2" stroke-dasharray="4 3" marker-end="url(#ah)"></line>
+          <text x="416" y="126" fill="var(--faint)" font-size="9">heartbeats · topology</text>
+          <text x="486" y="210" fill="var(--faint)" font-size="9">on miss</text>
+
+          <!-- nodes -->
+          <g data-node style="cursor:pointer" data-title="App Server (+ L1 cache)" data-detail="<b>Role:</b> the application. Runs business logic and embeds the cache client library.<br><b>L1 cache:</b> a tiny in-process Caffeine cache absorbs 50–80% of reads for hot keys before any network hop.<br><b>Pattern:</b> cache-aside — the app owns reads/writes to cache and DB."><rect x="16" y="152" width="100" height="48" rx="9" fill="var(--panel-2)" stroke="var(--eden)"></rect><text x="66" y="176" text-anchor="middle" fill="var(--eden)" font-size="12" font-weight="600">App Server</text><text x="66" y="191" text-anchor="middle" fill="var(--faint)" font-size="10">+ L1 Caffeine</text></g>
+          <g data-node style="cursor:pointer" data-title="Cache Client Library" data-detail="<b>Role:</b> lightweight library in every app server that routes each key to the right node.<br><b>How:</b> keeps a local copy of the consistent-hash ring (murmur3, 750 vnodes) and does an O(log V) lookup; manages a connection pool (8 conns/node); retries &amp; failover; serialization (JSON / Protobuf / Kryo).<br><b>Why here:</b> smart client = no proxy hop, so latency stays sub-ms."><rect x="150" y="152" width="122" height="48" rx="9" fill="var(--panel-2)" stroke="var(--survivor)"></rect><text x="211" y="172" text-anchor="middle" fill="var(--survivor)" font-size="12" font-weight="600">Cache Client</text><text x="211" y="188" text-anchor="middle" fill="var(--faint)" font-size="10">hash ring · pool</text></g>
+          <g data-node style="cursor:pointer" data-title="Cache Node — MASTER" data-detail="<b>Role:</b> a standalone process holding an in-memory <code>HashMap&lt;String, CacheEntry&gt;</code>.<br><b>Eviction:</b> pluggable — LRU (doubly-linked list), LFU (frequency buckets), or TTL (lazy on read + active sampling every 100 ms).<br><b>Memory manager:</b> tracks used vs max; triggers eviction when full.<br><b>Owns:</b> the key ranges assigned to its 150 virtual nodes on the ring."><rect x="342" y="152" width="128" height="48" rx="9" fill="var(--panel-2)" stroke="var(--old)"></rect><text x="406" y="176" text-anchor="middle" fill="var(--old)" font-size="12" font-weight="600">Cache Node</text><text x="406" y="191" text-anchor="middle" fill="var(--faint)" font-size="10">MASTER · in-memory</text></g>
+          <g data-node style="cursor:pointer" data-title="Replica" data-detail="<b>Role:</b> an async copy of its master's data for high availability.<br><b>Replication:</b> master returns to the client before the replica confirms (async) — a cache can afford to lose the last few writes because the DB is authoritative.<br><b>Failover:</b> on a missed heartbeat, the replica is promoted to master and the ring is updated (~17 s)."><rect x="342" y="300" width="128" height="48" rx="9" fill="var(--panel-2)" stroke="var(--old)"></rect><text x="406" y="324" text-anchor="middle" fill="var(--old)" font-size="12" font-weight="600">Replica</text><text x="406" y="339" text-anchor="middle" fill="var(--faint)" font-size="10">async · RF 2</text></g>
+          <g data-node style="cursor:pointer" data-title="Cluster Manager" data-detail="<b>Role:</b> the control plane. Runs health checks (heartbeats), detects node failure after 3 misses (~15 s), promotes replicas, and pushes ring / topology updates to all clients.<br><b>Not on the hot path:</b> reads and writes never wait on it."><rect x="342" y="44" width="128" height="48" rx="9" fill="var(--panel-2)" stroke="var(--warn)"></rect><text x="406" y="68" text-anchor="middle" fill="var(--warn)" font-size="12" font-weight="600">Cluster Manager</text><text x="406" y="83" text-anchor="middle" fill="var(--faint)" font-size="10">health · topology</text></g>
+          <g data-node style="cursor:pointer" data-title="Database (source of truth)" data-detail="<b>Role:</b> the authoritative store (e.g. RDS PostgreSQL). Only touched on a cache miss or write.<br><b>Cache-aside:</b> on a miss the app reads the DB and backfills the cache; on a write the app updates the DB and <b>invalidates</b> (deletes) the cache key to avoid stale-write races."><rect x="660" y="152" width="124" height="48" rx="9" fill="var(--panel-2)" stroke="var(--old)"></rect><text x="722" y="176" text-anchor="middle" fill="var(--old)" font-size="12" font-weight="600">Database</text><text x="722" y="191" text-anchor="middle" fill="var(--faint)" font-size="10">source of truth</text></g>
+        </svg>
+      </div>
+      <div class="node-detail"><span class="nd-title">Click any component</span><div class="nd-body">Its role, tech choice, and scaling note appear here. Then use the buttons below to step through a request flow.</div></div>
+
+      <div class="flowctl" data-flowctl>
+        <button class="btn" data-flow="write">Write path (PUT)</button>
+        <button class="btn" data-flow="read">Read path (GET · cache-aside)</button>
+        <span style="flex:1"></span>
+        <button class="btn" data-flowstep="prev">◀ Prev</button>
+        <button class="btn" data-flowstep="next">Next ▶</button>
+      </div>
+      <div class="flowlabel" data-flowlabel>Pick <b>Write</b> or <b>Read</b>, then press “Next ▶” to walk the numbered request flow one hop at a time.</div>
+
+      <div class="cloudmap">
+        <div class="kicker" style="margin-top:4px">Managed-service mapping — the same components on each cloud</div>
+        <table class="cloudtable">
+          <thead><tr>
+            <th>Component</th>
+            <th><span class="hdrlogo"><span class="logochip"><img src="../assets/logos/aws.svg" alt="AWS"></span>AWS</span></th>
+            <th><span class="hdrlogo"><span class="logochip"><img src="../assets/logos/gcp.svg" alt="GCP"></span>GCP</span></th>
+            <th><span class="hdrlogo"><span class="logochip"><img src="../assets/logos/azure.svg" alt="Azure"></span>Azure</span></th>
+          </tr></thead>
+          <tbody>
+            <tr><td>Load Balancer</td><td><img class="svcicon" src="../assets/logos/services/aws-elb.svg" alt="">ALB / NLB</td><td><img class="svcicon" src="../assets/logos/services/gcp-elb.svg" alt="">Cloud Load Balancing</td><td><img class="svcicon" src="../assets/logos/services/azure-appgw.svg" alt="">App Gateway</td></tr>
+            <tr><td>App Servers</td><td><img class="svcicon" src="../assets/logos/services/aws-ecs.svg" alt="">ECS Fargate / EKS</td><td><img class="svcicon" src="../assets/logos/services/gcp-run.svg" alt="">Cloud Run / GKE</td><td><img class="svcicon" src="../assets/logos/services/azure-aks.svg" alt="">AKS / App Service</td></tr>
+            <tr><td>Cache nodes (Redis)</td><td><img class="svcicon" src="../assets/logos/services/aws-elasticache.svg" alt="">ElastiCache (cluster mode)</td><td><img class="svcicon" src="../assets/logos/services/gcp-memorystore.svg" alt="">Memorystore for Redis</td><td><img class="svcicon" src="../assets/logos/services/azure-redis.svg" alt="">Cache for Redis</td></tr>
+            <tr><td>Database (source of truth)</td><td><img class="svcicon" src="../assets/logos/services/aws-rds.svg" alt="">RDS PostgreSQL</td><td><img class="svcicon" src="../assets/logos/services/gcp-cloudsql.svg" alt="">Cloud SQL</td><td><img class="svcicon" src="../assets/logos/services/azure-sql.svg" alt="">Azure SQL</td></tr>
+            <tr><td>CDN (outermost cache)</td><td><img class="svcicon" src="../assets/logos/services/aws-cloudfront.svg" alt="">CloudFront</td><td><img class="svcicon" src="../assets/logos/services/gcp-cloudcdn.svg" alt="">Cloud CDN</td><td><img class="svcicon" src="../assets/logos/services/azure-cdn.svg" alt="">Azure CDN / Front Door</td></tr>
+            <tr><td>Write-behind stream</td><td><img class="svcicon" src="../assets/logos/services/aws-msk.svg" alt="">MSK / Kinesis</td><td><img class="svcicon" src="../assets/logos/services/gcp-pubsub.svg" alt="">Pub/Sub</td><td><img class="svcicon" src="../assets/logos/services/azure-eventhubs.svg" alt="">Event Hubs</td></tr>
+            <tr><td>Monitoring</td><td>CloudWatch</td><td>Cloud Monitoring</td><td>Azure Monitor</td></tr>
+          </tbody>
+        </table>
+        <p class="muted" style="margin:8px 0 0">Managed Redis (ElastiCache / Memorystore / Cache for Redis) already gives you cluster-mode sharding — hash slots that behave like consistent hashing — plus Multi-AZ replicas and auto-failover, so you rarely build the ring yourself in production.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- D · API -->
+  <section>
+    <div class="sec-h"><span class="n">D</span><h2>API design</h2><span class="tag">thin key-value verbs</span></div>
+    <table>
+      <thead><tr><th>Endpoint</th><th>Purpose</th><th>Response</th></tr></thead>
+      <tbody>
+        <tr><td><code>PUT /api/v1/cache/{key}</code></td><td>store (body: value, ttl_seconds, if_not_exists)</td><td>200 STORED / <b>409</b> EXISTS (if_not_exists &amp; present)</td></tr>
+        <tr><td><code>GET /api/v1/cache/{key}</code></td><td>read (the hot path)</td><td><b>200</b> HIT + value + ttl_remaining / <b>404</b> MISS</td></tr>
+        <tr><td><code>DELETE /api/v1/cache/{key}</code></td><td>delete / invalidate</td><td>200 DELETED / 404 NOT_FOUND</td></tr>
+        <tr><td><code>POST /api/v1/cache/bulk-get</code></td><td>multi-get (body: keys[]) — fewer round-trips</td><td>200 + results map + hits / misses</td></tr>
+        <tr><td><code>PUT /api/v1/cache/{key}/cas</code></td><td>compare-and-swap (expected → new)</td><td>200 SWAPPED / <b>409</b> CAS_CONFLICT</td></tr>
+        <tr><td><code>GET /api/v1/cache/cluster/health</code></td><td>topology &amp; per-node memory / key counts</td><td>200 + node list + replication_lag_ms</td></tr>
+      </tbody>
+    </table>
+    <div class="callout"><b>Reality check:</b> production caches speak a compact binary protocol (Redis RESP / Memcached binary) over a single TCP command, not HTTP. This REST surface is for illustration — the latency budget (&lt; 1 ms) would not survive HTTP parsing per request.</div>
+  </section>
+
+  <!-- E · DATA MODEL -->
+  <section>
+    <div class="sec-h"><span class="n">E</span><h2>Data model</h2><span class="tag">in-memory structures</span></div>
+    <div class="grid g2">
+      <div class="card">
+        <div class="kicker">CacheEntry (stored per key)</div>
+        <pre class="code">key         String   <span class="cm">// ≤ 256 B</span>
+value       byte[]   <span class="cm">// ≤ 1 MB, serialized</span>
+created_at  long     <span class="cm">// epoch ms</span>
+ttl_ms      long     <span class="cm">// expiration</span>
+last_access long     <span class="cm">// for LRU</span>
+frequency   int      <span class="cm">// for LFU</span>
+version     long     <span class="cm">// for CAS</span>
+size_bytes  int      <span class="cm">// memory tracking</span>
+prev, next  CacheEntry <span class="cm">// LRU DLL pointers</span></pre>
+        <p class="muted">Metadata ≈ 56 B on a ~1,144 B entry ≈ <b>4.9%</b> overhead. Maps to <code>CacheEntry.java</code>.</p>
+      </div>
+      <div class="card">
+        <div class="kicker">CacheNode + HashRingEntry</div>
+        <pre class="code">node_id       String  <span class="cm">// "node-01"</span>
+host / port
+status        enum    <span class="cm">// UP / DOWN / DRAINING</span>
+max_memory    long
+used_memory   long
+key_count     long
+virtual_nodes List    <span class="cm">// 150 ring positions</span>
+role          enum    <span class="cm">// MASTER / REPLICA</span>
+master_id     String  <span class="cm">// if replica</span>
+last_heartbeat long
+
+<span class="cm">// HashRingEntry</span>
+ring_position int     <span class="cm">// 0 .. 2^31-1</span>
+physical_node String
+virtual_id    int     <span class="cm">// 0 .. 149</span></pre>
+        <p class="muted">Ring = sorted array → O(log V) lookup. Maps to <code>CacheNode.java</code>, <code>VirtualNode.java</code>.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- F · KEY CHOICES -->
+  <section>
+    <div class="sec-h"><span class="n">F</span><h2>Key design choices (deep-dived on canvas 3)</h2><span class="tag">defend these</span></div>
+    <div class="grid g3">
+      <div class="card"><div class="kicker">partitioning</div><h3>Consistent hashing + 150 vnodes</h3><p class="muted">Only K/N keys move when a node joins/leaves (vs ~80% for <code>hash % N</code>); vnodes keep spread within ~2%. <span class="run">→ canvas 2 · LLD</span></p></div>
+      <div class="card"><div class="kicker">eviction</div><h3>LRU + TTL (default)</h3><p class="muted">LRU handles memory pressure, TTL handles staleness (Redis <code>allkeys-lru</code>). LFU for stable hot keys. <span class="run">→ canvas 3</span></p></div>
+      <div class="card"><div class="kicker">consistency</div><h3>AP · async replication</h3><p class="muted">A cache must never block on durability — DB is authoritative, so losing the last few writes on failover is fine. <span class="run">→ canvas 3</span></p></div>
+      <div class="card"><div class="kicker">layered caching</div><h3>L1 Caffeine → Redis → CDN</h3><p class="muted">Each tier is faster and closer; L1 absorbs 50–80% of reads before a Redis round-trip.</p></div>
+      <div class="card"><div class="kicker">write pattern</div><h3>Cache-aside + invalidate</h3><p class="muted">On write, update DB then <b>delete</b> the key (not update) — deleting avoids concurrent-write races leaving stale data.</p></div>
+      <div class="card"><div class="kicker">resilience</div><h3>Stampede &amp; hot keys</h3><p class="muted">Thundering herd on expiry → request coalescing / logical TTL; a viral key → L1 cache + replica reads. <span class="run">→ canvas 3</span></p></div>
+    </div>
+  </section>
+
+  <!-- GLOSSARY -->
+  <section>
+    <div class="sec-h"><span class="n">§</span><h2>Glossary — one-liners</h2><span class="tag">terms used above</span></div>
+    <div class="grid g2">
+      <div class="card"><table><tbody>
+        <tr><td><b>Consistent hashing</b></td><td>keys &amp; nodes on a ring; a key goes to the next node clockwise, so adding/removing a node moves only K/N keys</td></tr>
+        <tr><td><b>Virtual node (vnode)</b></td><td>many ring positions per physical node (150) so load spreads evenly</td></tr>
+        <tr><td><b>Cache-aside</b></td><td>app checks cache first; on miss reads the DB and backfills the cache</td></tr>
+        <tr><td><b>LRU</b></td><td>evict the least-recently-used entry — HashMap + doubly-linked list, O(1)</td></tr>
+        <tr><td><b>LFU</b></td><td>evict the least-frequently-used entry — frequency buckets + min-freq pointer</td></tr>
+        <tr><td><b>TTL</b></td><td>per-key time-to-live; expired keys are lazily (on read) + actively (sampling) removed</td></tr>
+      </tbody></table></div>
+      <div class="card"><table><tbody>
+        <tr><td><b>AP (CAP)</b></td><td>favour Availability + Partition-tolerance; a cache stays up even if slightly stale</td></tr>
+        <tr><td><b>Async replication</b></td><td>master acks before the replica confirms — fast, risks losing the last few writes</td></tr>
+        <tr><td><b>CAS</b></td><td>compare-and-swap; write only if the current value matches the expected one</td></tr>
+        <tr><td><b>Hit rate</b></td><td>fraction of reads served from cache; below ~95% the cache earns its keep poorly</td></tr>
+        <tr><td><b>Thundering herd</b></td><td>many requests stampede the DB when a hot key expires at once</td></tr>
+        <tr><td><b>L1 cache</b></td><td>in-process cache (Caffeine) inside the app, in front of the distributed cache</td></tr>
+      </tbody></table></div>
+    </div>
+  </section>
+
+  <footer>
+    <p>Use case 07 · Distributed Cache — Canvas 1 of 3 (HLD). Grounded in <code>07-distributed-cache/docs/hld/</code> and <code>docs/cloud/</code>.</p>
+    <p class="run">This use case: HLD · <a href="lld.html">Canvas 2 · LLD</a> · <a href="deepdive.html">Canvas 3 · Deep-dive &amp; Trade-offs</a> &nbsp;|&nbsp; Next → <a href="lld.html">Canvas 2 · LLD</a> &nbsp;|&nbsp; <a href="../index.html">Hub</a></p>
+  </footer>
+
+</div>
+<script src="../assets/canvas.js"></script>
+</body>
+</html>
