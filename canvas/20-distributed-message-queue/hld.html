@@ -1,0 +1,349 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>20 · Distributed Message Queue — HLD</title>
+<link rel="stylesheet" href="../assets/canvas.css">
+</head>
+<body>
+<div class="wrap">
+
+  <header class="hero">
+    <h1>Distributed Message Queue — High-Level Design</h1>
+    <div class="sub">Use case 20 · Canvas 1 of 3. A Kafka-style message queue: an <b>append-only commit log per partition</b>, producers append at O(1), consumers read by offset. The big picture: requirements, back-of-envelope numbers, and an <b>interactive architecture</b> — click a component to see its role, then step through the <b>produce</b> and <b>consume+commit</b> flows. Stars of the interview: <b>partitioning</b>, <b>ISR replication + ack modes</b>, <b>consumer groups &amp; rebalancing</b>, <b>offsets &amp; delivery semantics</b>.</div>
+    <div class="badges">
+      <span class="badge lvl">Use case 20 · HLD</span>
+      <span class="badge">Canvas 1 of 3</span>
+      <span class="badge">interactive</span>
+      <span class="badge">CP-tunable · configurable</span>
+      <span class="badge">commit log</span>
+    </div>
+    <div class="legend">
+      <span><i class="dot" style="background:var(--eden)"></i> click a component</span>
+      <span><i class="dot" style="background:var(--survivor)"></i> produce path</span>
+      <span><i class="dot" style="background:var(--eden)"></i> current step</span>
+      <span><i class="dot" style="background:var(--old)"></i> data stores</span>
+      <span><i class="dot" style="background:var(--warn)"></i> replication / control</span>
+    </div>
+  </header>
+
+  <!-- A · PROBLEM & REQUIREMENTS -->
+  <section>
+    <div class="sec-h"><span class="n">A</span><h2>Problem &amp; requirements</h2><span class="tag">clarify first</span></div>
+    <div class="grid g2">
+      <div class="card">
+        <div class="kicker">functional</div>
+        <ul class="tight">
+          <li><b>Topics + partitions</b> — create a topic with N partitions and RF replicas. Partition count is the max parallelism.</li>
+          <li><b>Produce</b> — send with optional <code>key</code> (routes to a partition), optional explicit <code>partition</code>, and <code>ackMode</code> (0/1/all).</li>
+          <li><b>Consume</b> — poll from committed offset for <code>(group, topic, partition)</code>; does NOT auto-advance offset.</li>
+          <li><b>Commit offset</b> — explicit; drives at-most-once vs at-least-once semantics.</li>
+          <li><b>Consumer groups</b> — subscribe / unsubscribe; range rebalance on membership change.</li>
+          <li><b>Retention</b> — time-based (delete &gt; retention.ms) OR log compaction (latest value per key).</li>
+          <li><b>Cluster</b> — register / deregister brokers; elect controller (lowest ID); handle failures.</li>
+          <li><b>Lag &amp; metrics</b> — per-topic throughput, per-group lag <code>= latestOffset − committedOffset</code>.</li>
+        </ul>
+      </div>
+      <div class="card">
+        <div class="kicker">non-functional</div>
+        <ul class="tight">
+          <li><b>Throughput</b> 1 M+ msg/s per cluster, horizontally scalable.</li>
+          <li><b>Latency</b> p99 &lt; 10 ms (acks=1), &lt; 50 ms (acks=all).</li>
+          <li><b>Durability</b> zero loss with <code>acks=all + min.insync.replicas ≥ 2 + RF ≥ 3</code>.</li>
+          <li><b>Availability</b> 99.99% — survive a single broker without data loss.</li>
+          <li><b>Ordering</b> strict within a partition (monotonic offset); <b>no global order</b>.</li>
+          <li><b>Scalability</b> linear — add partitions for throughput, brokers for storage/compute.</li>
+          <li><b>Retention</b> configurable per-topic (ms, bytes, or compaction).</li>
+          <li><b>Lag monitoring</b> real-time, sub-second granularity — the #1 ops metric.</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <!-- B · ESTIMATION -->
+  <section>
+    <div class="sec-h"><span class="n">B</span><h2>Back-of-envelope estimation</h2><span class="tag">LinkedIn-scale · 7 T msg/day</span></div>
+    <div class="chips">
+      <div class="chip"><span class="k">Msg/s (large)</span><span class="v">~81 M/s</span></div>
+      <div class="chip"><span class="k">Avg msg size</span><span class="v">~500 B</span></div>
+      <div class="chip"><span class="k">Ingress</span><span class="v">~40 GB/s</span></div>
+      <div class="chip"><span class="k">RF × 3</span><span class="v">~120 GB/s write</span></div>
+      <div class="chip"><span class="k">Broker throughput</span><span class="v">~600 MB/s seq</span></div>
+      <div class="chip"><span class="k">Brokers needed</span><span class="v">~200+</span></div>
+      <div class="chip"><span class="k">Storage / day</span><span class="v">~3.4 PB</span></div>
+      <div class="chip"><span class="k">7 d × RF3</span><span class="v">~71 PB</span></div>
+      <div class="chip"><span class="k">Partitions</span><span class="v">10K–millions</span></div>
+      <div class="chip"><span class="k">Consumer groups</span><span class="v">50–10K</span></div>
+    </div>
+    <div class="callout tip"><b>Why sequential I/O is the whole point:</b> commit log = append-only ⇒ pure sequential writes. Sequential HDD ≈ <b>600 MB/s</b>, random HDD ≈ <b>100 KB/s</b>. That's a <b>6000×</b> advantage. Combined with page cache + <code>sendfile()</code> zero-copy, one broker can shove ~600 MB/s at hardware limits without JVM heap pressure.</div>
+    <div class="callout"><b>Rule of thumb — partition count:</b> <code>partitions = max(target_throughput / per_partition_throughput, target_throughput / per_consumer_throughput)</code>. Per-partition ≈ 10 MB/s. Err on <b>more</b> — you cannot easily reduce partitions after creation (would break key→partition hash).</div>
+  </section>
+
+  <!-- C · INTERACTIVE ARCHITECTURE -->
+  <section data-flowscope>
+    <div class="sec-h"><span class="n">C</span><h2>Architecture — click components, then step the flows</h2><span class="tag">the design, from the diagram</span></div>
+    <div>
+      <div class="arch">
+        <svg viewBox="0 0 900 460" width="100%" style="max-width:900px" role="img" aria-label="Distributed message queue architecture">
+          <defs>
+            <marker id="ah" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" fill="var(--muted)"></path></marker>
+          </defs>
+
+          <!-- arrows -->
+          <!-- Producer -> Router -->
+          <line class="arrow" x1="100" y1="55" x2="248" y2="55" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"
+                data-flow="produce" data-produce="1"
+                data-desc-produce="Producer sends ProducerRecord{topic, key, value, partition?, ackMode} to any broker. Broker acts as the entry point."></line>
+          <!-- Router -> Partition Leader (CommitLog) -->
+          <line class="arrow" x1="378" y1="55" x2="508" y2="140" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"
+                data-flow="produce" data-produce="2"
+                data-desc-produce="MessageRouter resolves partition — cascade: explicit partition ▸ hash(key) % N ▸ round-robin. Deterministic per-key routing."></line>
+          <!-- Partition Leader -> CommitLog append -->
+          <line class="arrow" x1="560" y1="180" x2="560" y2="240" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"
+                data-flow="produce" data-produce="3"
+                data-desc-produce="Leader appends to its CommitLog — O(1) sequential write. currentOffset.getAndIncrement() assigns the monotonic offset."></line>
+          <!-- Leader -> Follower (replication) -->
+          <line class="arrow" x1="620" y1="160" x2="748" y2="160" stroke="var(--muted)" stroke-width="2" stroke-dasharray="4 3" marker-end="url(#ah)"
+                data-flow="produce" data-produce="4"
+                data-desc-produce="ReplicationEngine ships to ISR followers. acks=0 → return now. acks=1 → return after leader write. acks=all → wait for every ISR replica."></line>
+          <!-- Follower -> Leader (ack) -->
+          <line class="arrow" x1="748" y1="180" x2="620" y2="180" stroke="var(--muted)" stroke-width="2" stroke-dasharray="4 3" marker-end="url(#ah)"
+                data-flow="produce" data-produce="5"
+                data-desc-produce="Follower(s) acknowledge. If ISR &lt; min.insync.replicas → NotEnoughReplicasException (producer retries)."></line>
+          <!-- Producer <- ack -->
+          <path class="arrow" d="M508,80 C 300,20 160,20 62,40" fill="none" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"
+                data-flow="produce" data-produce="6"
+                data-desc-produce="Producer receives {topic, partition, offset}. Success. Idempotent producer uses (producerId, seqNumber) so retries don't dup."></path>
+
+          <!-- Consumer -> Coordinator (subscribe) -->
+          <line class="arrow" x1="100" y1="360" x2="248" y2="360" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"
+                data-flow="consume" data-consume="1"
+                data-desc-consume="Consumer subscribes to a topic under a groupId. ConsumerGroupCoordinator adds member and triggers a range rebalance across current members."></line>
+          <!-- Coordinator -> Consumer (assignments) -->
+          <path class="arrow" d="M248,380 C 180,410 140,410 100,390" fill="none" stroke="var(--muted)" stroke-width="2" stroke-dasharray="4 3" marker-end="url(#ah)"
+                data-flow="consume" data-consume="2"
+                data-desc-consume="Coordinator computes range assignment: partitionsPerConsumer = N/M, first (N%M) consumers get one extra. Each consumer sees its assigned partitions."></path>
+          <!-- Consumer -> Partition read -->
+          <line class="arrow" x1="378" y1="360" x2="508" y2="290" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"
+                data-flow="consume" data-consume="3"
+                data-desc-consume="Consumer polls — ConsumerService gets committedOffset from Coordinator, then CommitLog.read(offset, maxMessages) — O(1) seek + O(k) read."></line>
+          <!-- Deliver -->
+          <path class="arrow" d="M508,280 C 300,340 160,380 100,370" fill="none" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"
+                data-flow="consume" data-consume="4"
+                data-desc-consume="DeliveryStrategy hands ConsumerRecords to the app. AtLeastOnce retries up to 3× on missing ack. ExactlyOnce dedups by message.id."></path>
+          <!-- Commit -->
+          <line class="arrow" x1="100" y1="410" x2="248" y2="410" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"
+                data-flow="consume" data-consume="5"
+                data-desc-consume="After processing, consumer commits new offset. Coordinator stores it under key='groupId-topic-partition'. Next poll starts here — at-least-once."></line>
+          <!-- Retention -->
+          <line class="arrow" x1="620" y1="260" x2="748" y2="290" stroke="var(--muted)" stroke-width="2" stroke-dasharray="4 3" marker-end="url(#ah)"></line>
+          <text x="740" y="325" fill="var(--faint)" font-size="9">retention cleaner ⟶</text>
+
+          <!-- Controller line -->
+          <line class="arrow" x1="620" y1="60" x2="748" y2="90" stroke="var(--muted)" stroke-width="2" stroke-dasharray="4 3" marker-end="url(#ah)"></line>
+          <text x="710" y="55" fill="var(--faint)" font-size="9">metadata / leader election</text>
+
+          <!-- MessageRouter → Metadata Store  (topic partition count lookup) -->
+          <line class="arrow" x1="313" y1="82" x2="313" y2="140" stroke="var(--muted)" stroke-width="2" stroke-dasharray="4 3" marker-end="url(#ah)"></line>
+          <text x="318" y="115" fill="var(--faint)" font-size="9">topic meta</text>
+
+          <!-- Group Coordinator ↔ Offset Store  (commit / read committed offsets) -->
+          <line class="arrow" x1="313" y1="335" x2="313" y2="282" stroke="var(--muted)" stroke-width="2" stroke-dasharray="4 3" marker-end="url(#ah)"></line>
+          <text x="318" y="315" fill="var(--faint)" font-size="9">commit offset</text>
+
+          <!-- Controller → Metadata Store  (leader assignments) -->
+          <line class="arrow" x1="748" y1="60" x2="378" y2="160" stroke="var(--muted)" stroke-width="1.5" stroke-dasharray="4 3" marker-end="url(#ah)"></line>
+
+          <!-- Partition Leader → Offset Store  (offset advance signalling not needed; skipped) -->
+          <!-- CommitLog data flow to Retention Cleaner  (already dashed arrow above) -->
+
+          <!-- ============ NODES ============ -->
+          <g data-node style="cursor:pointer" data-title="Producer clients" data-detail="<b>Role:</b> app code sending <code>ProducerRecord{topic, key, value, headers, partition?, ackMode}</code>.<br><b>Batching:</b> <code>linger.ms</code> + <code>batch.size</code> — accumulate messages then send as one request. 5–100 ms linger with 100 KB–1 MB batches is typical for high throughput.<br><b>Idempotent producer:</b> (producerId, seqNumber) header lets the broker dedup retries. <b>Compression:</b> lz4 / zstd end-to-end (producer → broker on disk → consumer)."><rect x="12" y="30" width="88" height="52" rx="9" fill="var(--panel-2)" stroke="var(--eden)"></rect><text x="56" y="54" text-anchor="middle" fill="var(--eden)" font-size="12" font-weight="600">Producers</text><text x="56" y="69" text-anchor="middle" fill="var(--faint)" font-size="10">batch · compress</text></g>
+
+          <g data-node style="cursor:pointer" data-title="Consumer clients" data-detail="<b>Role:</b> apps polling messages under a <code>groupId</code>. Same groupId → load-balanced; different groupId → independent progress on the same topic (multi-subscriber).<br><b>Loop:</b> poll → process → commit. Order = commit AFTER = at-least-once. Commit BEFORE = at-most-once. <br><b>Heartbeat:</b> <code>heartbeat.interval.ms</code> = 3 s; if no heartbeat for <code>session.timeout.ms</code> = 45 s, coordinator evicts + rebalances."><rect x="12" y="335" width="88" height="52" rx="9" fill="var(--panel-2)" stroke="var(--eden)"></rect><text x="56" y="359" text-anchor="middle" fill="var(--eden)" font-size="12" font-weight="600">Consumers</text><text x="56" y="374" text-anchor="middle" fill="var(--faint)" font-size="10">poll · process · commit</text></g>
+
+          <g data-node style="cursor:pointer" data-title="MessageRouter (partitioner cascade)" data-detail="<b>Role:</b> resolves a ProducerRecord to a target partition.<br><b>Cascade:</b> (1) explicit <code>record.partition</code> if set. (2) key present → <code>Math.abs(key.hashCode()) % partitionCount</code> — deterministic per-key ordering. (3) key null → round-robin via <code>AtomicInteger.getAndIncrement()</code>.<br>Java <code>hashCode</code> in code; Kafka uses Murmur2 in prod for better distribution."><rect x="248" y="30" width="130" height="52" rx="9" fill="var(--panel-2)" stroke="var(--border)"></rect><text x="313" y="54" text-anchor="middle" fill="var(--text)" font-size="12" font-weight="600">MessageRouter</text><text x="313" y="69" text-anchor="middle" fill="var(--faint)" font-size="10">explicit ▸ hash ▸ RR</text></g>
+
+          <g data-node style="cursor:pointer" data-title="ConsumerGroupCoordinator" data-detail="<b>Role:</b> group lifecycle + rebalancing + offset tracking. Two maps: <code>Map&lt;groupId, ConsumerGroup&gt; groups</code>, <code>Map&lt;String, Long&gt; committedOffsets</code> keyed by <code>&quot;groupId-topic-partition&quot;</code>.<br><b>Range rebalance:</b> sort consumers → give first (N%M) one extra partition. Deterministic. Kafka's <code>RangeAssignor</code>. Production uses <code>CooperativeSticky</code> for incremental (no stop-the-world) rebalance.<br><b>Lag:</b> <code>latestOffset − committedOffset</code>."><rect x="248" y="335" width="130" height="52" rx="9" fill="var(--panel-2)" stroke="var(--border)"></rect><text x="313" y="359" text-anchor="middle" fill="var(--text)" font-size="12" font-weight="600">Group Coordinator</text><text x="313" y="374" text-anchor="middle" fill="var(--faint)" font-size="10">rebalance · offsets</text></g>
+
+          <g data-node style="cursor:pointer" data-title="Partition Leader — Broker + CommitLog" data-detail="<b>Every partition:</b> exactly ONE leader (reads &amp; writes) + N−1 followers.<br><b>CommitLog:</b> append-only per partition. <code>synchronized long append(msg)</code> → <code>currentOffset.getAndIncrement()</code> + <code>log.add(msg)</code>. O(1) amortised.<br><b>read(fromOffset, max):</b> <code>log.subList(from, from+max)</code> — O(1) seek + O(k) copy. In prod: segment files + sparse index + zero-copy sendfile().<br><b>Latest offset</b> = high watermark. <b>Earliest offset</b> may be &gt; 0 after retention truncation."><rect x="508" y="110" width="112" height="72" rx="9" fill="var(--panel-2)" stroke="var(--survivor)"></rect><text x="564" y="136" text-anchor="middle" fill="var(--survivor)" font-size="12" font-weight="600">Partition Leader</text><text x="564" y="152" text-anchor="middle" fill="var(--survivor)" font-size="12" font-weight="600">CommitLog</text><text x="564" y="170" text-anchor="middle" fill="var(--faint)" font-size="10">append-only · O(1)</text></g>
+
+          <g data-node style="cursor:pointer" data-title="Partition (data)" data-detail="Same CommitLog viewed from the consume side. <code>read(fromOffset, maxMessages)</code> — bounds-checked, returns an immutable slice.<br><b>ConsumerRecord</b> is the immutable snapshot handed to the app (topic, partition, offset, key, value, headers, timestamp).<br>Consumption does NOT delete — the commit log is retained until retention.ms or log compaction kicks in."><rect x="508" y="240" width="112" height="52" rx="9" fill="var(--panel-2)" stroke="var(--survivor)"></rect><text x="564" y="264" text-anchor="middle" fill="var(--survivor)" font-size="12" font-weight="600">CommitLog</text><text x="564" y="279" text-anchor="middle" fill="var(--faint)" font-size="10">read(offset, max)</text></g>
+
+          <g data-node style="cursor:pointer" data-title="ISR replicas (followers)" data-detail="<b>ISR = In-Sync Replicas:</b> followers within <code>replica.lag.time.max.ms</code> (10 s) of the leader.<br><b>Fall behind &gt; 10 s → removed from ISR.</b> Catch up → re-added.<br><b>Leader election on failure:</b> controller picks the next replica from the ISR (deterministic). <code>unclean.leader.election.enable=false</code> ⇒ CP (partition offline if ISR empty). <code>=true</code> ⇒ AP (out-of-sync replica takes over, data loss).<br><b>Zero-loss config:</b> RF=3, min.insync.replicas=2, acks=all."><rect x="748" y="110" width="130" height="72" rx="9" fill="var(--panel-2)" stroke="var(--warn)"></rect><text x="813" y="136" text-anchor="middle" fill="var(--warn)" font-size="12" font-weight="600">ISR Followers</text><text x="813" y="152" text-anchor="middle" fill="var(--warn)" font-size="12" font-weight="600">(replicas)</text><text x="813" y="170" text-anchor="middle" fill="var(--faint)" font-size="10">RF=3 · min.isr=2</text></g>
+
+          <g data-node style="cursor:pointer" data-title="Controller broker" data-detail="<b>Role:</b> the one broker responsible for partition leader election, topic creation, replica assignment.<br><b>Election:</b> lowest brokerId among alive nodes wins (deterministic in this code). In prod: KRaft Raft consensus (Kafka 3.3+) or ZooKeeper ephemeral znode.<br><b>Failure detection:</b> heartbeats + timeout → controller re-elects and reassigns partition leadership. Typical failover &lt; 1 s."><rect x="748" y="30" width="130" height="52" rx="9" fill="var(--panel-2)" stroke="var(--warn)"></rect><text x="813" y="54" text-anchor="middle" fill="var(--warn)" font-size="12" font-weight="600">Controller</text><text x="813" y="69" text-anchor="middle" fill="var(--faint)" font-size="10">KRaft / ZK</text></g>
+
+          <g data-node style="cursor:pointer" data-title="Retention / Compaction cleaner" data-detail="<b>Background thread:</b> per-topic <code>cleanup.policy</code>.<br><b>delete</b> (default) → drop messages where <code>now − timestamp &gt; retentionMs</code> (7 d default) — in prod deletes whole segment files.<br><b>compact</b> → keep only the latest value per key. Null-value = tombstone (marks for deletion). Null-key messages always retained.<br><b>compact + delete</b> → both. Used for <code>__consumer_offsets</code>."><rect x="748" y="240" width="130" height="52" rx="9" fill="var(--panel-2)" stroke="var(--warn)"></rect><text x="813" y="264" text-anchor="middle" fill="var(--warn)" font-size="12" font-weight="600">Retention Cleaner</text><text x="813" y="279" text-anchor="middle" fill="var(--faint)" font-size="10">delete · compact</text></g>
+
+          <g data-node style="cursor:pointer" data-title="Metadata store — KRaft / ZooKeeper" data-detail="<b>Role:</b> topic metadata (partition count, RF), broker liveness, partition leader assignments, ACLs.<br><b>KRaft</b> (Kafka 3.3+) — self-managed Raft quorum among ~3–5 controllers. Millions of partitions. No external dependency. In our code: <code>InMemoryTopicRepository</code> + <code>InMemoryBrokerRepository</code>.<br><b>ZooKeeper</b> (legacy) — external ensemble of 3/5 nodes."><rect x="248" y="140" width="130" height="52" rx="9" fill="var(--panel-2)" stroke="var(--old)"></rect><text x="313" y="164" text-anchor="middle" fill="var(--old)" font-size="12" font-weight="600">Metadata Store</text><text x="313" y="179" text-anchor="middle" fill="var(--faint)" font-size="10">KRaft / ZooKeeper</text></g>
+
+          <g data-node style="cursor:pointer" data-title="Offset store — __consumer_offsets" data-detail="<b>Where committed offsets live:</b> in Kafka, a special compacted topic <code>__consumer_offsets</code> (50 partitions, RF=3).<br><b>Key:</b> <code>groupId|topic|partition</code>. <b>Value:</b> <code>{offset, timestamp}</code>. Compaction ⇒ only the latest offset per key survives.<br>Self-bootstrapping — no external DB needed. In our code: <code>InMemoryOffsetRepository</code> ConcurrentHashMap."><rect x="248" y="230" width="130" height="52" rx="9" fill="var(--panel-2)" stroke="var(--old)"></rect><text x="313" y="254" text-anchor="middle" fill="var(--old)" font-size="12" font-weight="600">Offset Store</text><text x="313" y="269" text-anchor="middle" fill="var(--faint)" font-size="10">compacted topic</text></g>
+
+        </svg>
+      </div>
+      <div class="node-detail"><span class="nd-title">Click any component</span><div class="nd-body">Its role, tech, and scaling note appear here. Then use the buttons below to step through the <b>produce</b> and <b>consume+commit</b> flows one hop at a time.</div></div>
+
+      <div class="flowctl" data-flowctl>
+        <button class="btn" data-flow="produce">Produce path</button>
+        <button class="btn" data-flow="consume">Consume + commit path</button>
+        <span style="flex:1"></span>
+        <button class="btn" data-flowstep="prev">◀ Prev</button>
+        <button class="btn" data-flowstep="next">Next ▶</button>
+      </div>
+      <div class="flowlabel" data-flowlabel>Pick <b>Produce</b> or <b>Consume+Commit</b>, then press "Next ▶" to walk the numbered request flow one hop at a time.</div>
+
+      <div class="cloudmap">
+        <div class="kicker" style="margin-top:4px">Managed-service mapping — the same commit-log design on each cloud</div>
+        <table class="cloudtable">
+          <thead><tr>
+            <th>Component</th>
+            <th><span class="hdrlogo"><span class="logochip"><img src="../assets/logos/aws.svg" alt="AWS"></span>AWS</span></th>
+            <th><span class="hdrlogo"><span class="logochip"><img src="../assets/logos/gcp.svg" alt="GCP"></span>GCP</span></th>
+            <th><span class="hdrlogo"><span class="logochip"><img src="../assets/logos/azure.svg" alt="Azure"></span>Azure</span></th>
+          </tr></thead>
+          <tbody>
+            <tr><td>Managed Kafka</td><td><img class="svcicon" src="../assets/logos/services/aws-msk.svg" alt="">MSK / MSK Serverless</td><td><img class="svcicon" src="../assets/logos/services/gcp-pubsub.svg" alt="">Confluent Cloud on GKE</td><td><img class="svcicon" src="../assets/logos/services/azure-eventhubs.svg" alt="">Event Hubs (Kafka endpoint)</td></tr>
+            <tr><td>Native pub/sub</td><td><img class="svcicon" src="../assets/logos/services/aws-sns.svg" alt="">SNS + SQS</td><td><img class="svcicon" src="../assets/logos/services/gcp-pubsub.svg" alt="">Cloud Pub/Sub</td><td><img class="svcicon" src="../assets/logos/services/azure-servicebus.svg" alt="">Service Bus</td></tr>
+            <tr><td>Task queue</td><td><img class="svcicon" src="../assets/logos/services/aws-sqs.svg" alt="">SQS</td><td><img class="svcicon" src="../assets/logos/services/gcp-pubsub.svg" alt="">Pub/Sub (pull sub)</td><td><img class="svcicon" src="../assets/logos/services/azure-servicebus.svg" alt="">Service Bus Queues</td></tr>
+            <tr><td>Broker compute</td><td><img class="svcicon" src="../assets/logos/services/aws-ecs.svg" alt="">EKS (self-managed)</td><td><img class="svcicon" src="../assets/logos/services/gcp-run.svg" alt="">GKE</td><td><img class="svcicon" src="../assets/logos/services/azure-aks.svg" alt="">AKS</td></tr>
+            <tr><td>Tiered log storage</td><td><img class="svcicon" src="../assets/logos/services/aws-s3.svg" alt="">S3 (MSK tiered)</td><td><img class="svcicon" src="../assets/logos/services/gcp-cloudstorage.svg" alt="">Cloud Storage</td><td><img class="svcicon" src="../assets/logos/services/azure-blob.svg" alt="">Blob Storage</td></tr>
+            <tr><td>Metadata quorum</td><td><img class="svcicon" src="../assets/logos/services/aws-msk.svg" alt="">KRaft on MSK</td><td><img class="svcicon" src="../assets/logos/services/gcp-cloudsql.svg" alt="">etcd / ZK on GKE</td><td><img class="svcicon" src="../assets/logos/services/azure-cosmos.svg" alt="">KRaft on Event Hubs</td></tr>
+            <tr><td>Analytics sink</td><td><img class="svcicon" src="../assets/logos/services/aws-redshift.svg" alt="">Redshift / Athena</td><td><img class="svcicon" src="../assets/logos/services/gcp-bigquery.svg" alt="">BigQuery</td><td><img class="svcicon" src="../assets/logos/services/azure-synapse.svg" alt="">Synapse</td></tr>
+            <tr><td>Search / observ.</td><td><img class="svcicon" src="../assets/logos/services/aws-opensearch.svg" alt="">OpenSearch</td><td><img class="svcicon" src="../assets/logos/services/gcp-bigquery.svg" alt="">BigQuery / Log Analytics</td><td><img class="svcicon" src="../assets/logos/services/azure-search.svg" alt="">Cognitive Search</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+
+  <!-- D · API -->
+  <section>
+    <div class="sec-h"><span class="n">D</span><h2>API design</h2><span class="tag">produce · consume · commit · admin</span></div>
+    <table>
+      <thead><tr><th>Endpoint</th><th>Purpose</th><th>Response</th></tr></thead>
+      <tbody>
+        <tr><td><code>POST /topics</code></td><td>create topic (name, partitions, replicationFactor)</td><td>201 + Topic</td></tr>
+        <tr><td><code>POST /topics/{topic}/messages</code></td><td>produce (key, value, headers, partition?, ackMode)</td><td>200 + <code>{topic, partition, offset, timestamp}</code></td></tr>
+        <tr><td><code>GET /topics/{topic}/messages?groupId=X&amp;partition=Y&amp;max=100</code></td><td>consume — reads from group's committed offset (does NOT auto-advance)</td><td>200 + list of ConsumerRecords</td></tr>
+        <tr><td><code>POST /topics/{topic}/commit</code></td><td>commit offset for (groupId, partition, offset)</td><td>200 OK</td></tr>
+        <tr><td><code>POST /consumer-groups/subscribe</code></td><td>join group (groupId, consumerId, topic) → triggers rebalance</td><td>200 + assigned partitions</td></tr>
+        <tr><td><code>GET /dashboard</code></td><td>brokers alive, per-topic throughput + lag</td><td>200 + metrics JSON</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <!-- E · DATA MODEL -->
+  <section>
+    <div class="sec-h"><span class="n">E</span><h2>Data model</h2><span class="tag">7 core entities</span></div>
+    <div class="grid g2">
+      <div class="card">
+        <div class="kicker">Message (in-memory + on-disk record)</div>
+        <pre class="code">Message
+  id         String   <span class="cm">// UUID</span>
+  key        String   <span class="cm">// nullable → RR partition</span>
+  value      String   <span class="cm">// payload</span>
+  headers    Map&lt;S,S&gt; <span class="cm">// correlation / trace ids</span>
+  topic      String
+  partition  int      <span class="cm">// set by router</span>
+  offset     long     <span class="cm">// set by CommitLog.append</span>
+  timestamp  Instant
+  producerId String</pre>
+        <p class="muted">Built via <code>Message.Builder</code> — enforces required (topic, value), defaults optional. <code>offset</code> and <code>partition</code> start at −1 and are stamped broker-side.</p>
+      </div>
+      <div class="card">
+        <div class="kicker">Partition + ISR</div>
+        <pre class="code">Partition
+  topicName, partitionId
+  leaderId          String
+  replicaIds        List&lt;String&gt;
+  inSyncReplicaIds  List&lt;String&gt;   <span class="cm">// ISR</span>
+  addToIsr / removeFromIsr / isLeader
+
+CommitLog                            <span class="cm">// 1 per partition</span>
+  List&lt;Message&gt; log
+  AtomicLong currentOffset            <span class="cm">// high watermark</span>
+  append(msg) → offset                <span class="cm">// synchronized O(1)</span>
+  read(fromOffset, max) → List        <span class="cm">// bounds-checked</span>
+  truncateBefore(offset)              <span class="cm">// retention</span></pre>
+      </div>
+    </div>
+    <div class="grid g2" style="margin-top:14px">
+      <div class="card">
+        <div class="kicker">Topic + retention</div>
+        <pre class="code">Topic
+  name              String  <span class="cm">// unique</span>
+  partitionCount    int     <span class="cm">// hard to change</span>
+  replicationFactor int     <span class="cm">// RF, typ. 3</span>
+  retentionMs       long    <span class="cm">// default 7d</span>
+  config            Map     <span class="cm">// overrides</span>
+
+RetentionPolicy
+  retentionMs, retentionBytes
+  cleanupPolicy: DELETE | COMPACT | COMPACT_DELETE</pre>
+      </div>
+      <div class="card">
+        <div class="kicker">ConsumerGroup + Offset</div>
+        <pre class="code">ConsumerGroup
+  groupId               String
+  subscribedTopics      Set&lt;String&gt;
+  members               Map&lt;consumerId, ConsumerInstance&gt;
+  assignments           Map&lt;consumerId, List&lt;PartitionAssignment&gt;&gt;
+
+Offset                                       <span class="cm">// per (group,topic,part)</span>
+  groupId, topicName, partitionId
+  committedOffset  long   <span class="cm">// −1 = start from beginning</span>
+  lastCommitTime   Instant
+  commit(newOffset)</pre>
+        <p class="muted">Composite key <code>groupId-topic-partition</code>. In Kafka the value lives inside the compacted <code>__consumer_offsets</code> topic.</p>
+      </div>
+    </div>
+    <div class="callout tip"><b>The offset is the API:</b> committed offset = "I've processed everything below this". Lag = <code>latestOffset − committedOffset</code>. Move the offset back = replay. Move it forward = skip. That's the entire consumer contract.</div>
+  </section>
+
+  <!-- F · KEY CHOICES -->
+  <section>
+    <div class="sec-h"><span class="n">F</span><h2>Key design choices (deep-dived on canvas 3)</h2><span class="tag">defend these</span></div>
+    <div class="grid g3">
+      <div class="card"><div class="kicker">core data structure</div><h3>Append-only commit log</h3><p class="muted">O(1) append, O(1) seek by offset, sequential I/O (~600 MB/s). NOT deleted on consumption ⇒ replay + multi-consumer for free. <span class="run">→ canvas 3 · Commit Log</span></p></div>
+      <div class="card"><div class="kicker">partitioning</div><h3>Hash on key ▸ round-robin</h3><p class="muted">Same key → same partition → per-key ordering (userId → user activity ordered). Null key → RR for max throughput (metrics). <span class="run">→ canvas 2 · LLD</span></p></div>
+      <div class="card"><div class="kicker">durability</div><h3>ISR + <code>acks=all</code> + <code>min.isr=2</code></h3><p class="muted">Zero loss with RF=3. <code>acks=1</code> loses data on leader crash before replication. <code>acks=0</code> = fire-and-forget. Configurable per producer. <span class="run">→ canvas 3</span></p></div>
+      <div class="card"><div class="kicker">consumer coord.</div><h3>Range rebalance</h3><p class="muted">One partition → one consumer within a group. Sort + divide + remainder-first. Kafka default; prod uses CooperativeSticky for incremental.</p></div>
+      <div class="card"><div class="kicker">delivery</div><h3>At-least-once (default)</h3><p class="muted">Commit AFTER processing → duplicates possible → consumer must be idempotent. Exactly-once = idempotent producer + dedup on consumer.</p></div>
+      <div class="card"><div class="kicker">retention</div><h3>Time-based OR compaction</h3><p class="muted">Time-based (delete &gt; 7 d) for events / logs. Compaction (latest per key) for changelogs, CDC, materialized views. Strategy pattern — swap at runtime.</p></div>
+    </div>
+  </section>
+
+  <!-- GLOSSARY -->
+  <section>
+    <div class="sec-h"><span class="n">§</span><h2>Glossary — one-liners</h2><span class="tag">terms used above</span></div>
+    <div class="grid g2">
+      <div class="card"><table><tbody>
+        <tr><td><b>Commit log</b></td><td>append-only, offset-indexed, retained-after-read sequence per partition</td></tr>
+        <tr><td><b>Partition</b></td><td>unit of parallelism &amp; ordering — one leader, N−1 followers</td></tr>
+        <tr><td><b>Offset</b></td><td>monotonic 64-bit position within a partition; assigned at append time</td></tr>
+        <tr><td><b>High watermark</b></td><td>next offset that will be assigned = latest known committed to all ISR</td></tr>
+        <tr><td><b>Consumer group</b></td><td>a set of consumers cooperatively reading a topic — 1 partition per consumer</td></tr>
+        <tr><td><b>Rebalance</b></td><td>redistribute partitions when a consumer joins / leaves / dies</td></tr>
+      </tbody></table></div>
+      <div class="card"><table><tbody>
+        <tr><td><b>ISR</b></td><td>In-Sync Replicas — followers within replica.lag.time.max.ms of the leader</td></tr>
+        <tr><td><b>acks 0/1/all</b></td><td>producer waits for: nothing / leader only / every ISR replica</td></tr>
+        <tr><td><b>min.insync.replicas</b></td><td>lower bound on ISR needed for acks=all to succeed</td></tr>
+        <tr><td><b>Log compaction</b></td><td>retain only the latest message per key; tombstones (null value) delete a key</td></tr>
+        <tr><td><b>Controller</b></td><td>the broker doing leader elections + topic mgmt; elected by KRaft / ZK</td></tr>
+        <tr><td><b>Consumer lag</b></td><td>latestOffset − committedOffset — the #1 operational metric</td></tr>
+      </tbody></table></div>
+    </div>
+  </section>
+
+  <footer>
+    <p>Use case 20 · Distributed Message Queue — Canvas 1 of 3 (HLD). Grounded in <code>20-distributed-message-queue/docs/hld/HIGH_LEVEL_DESIGN.md</code> and the real Java under <code>20-distributed-message-queue/src/</code>.</p>
+    <p class="run">This use case: HLD · <a href="lld.html">Canvas 2 · LLD</a> · <a href="deepdive.html">Canvas 3 · Deep-dive &amp; Trade-offs</a> &nbsp;|&nbsp; Next → <a href="lld.html">20 · LLD</a> &nbsp;|&nbsp; <a href="../index.html">Hub</a></p>
+  </footer>
+
+</div>
+<script src="../assets/canvas.js"></script>
+</body>
+</html>

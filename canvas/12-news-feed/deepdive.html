@@ -1,0 +1,488 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>12 · News Feed — Deep-dive &amp; Trade-offs</title>
+<link rel="stylesheet" href="../assets/canvas.css">
+</head>
+<body>
+<div class="wrap">
+
+  <header class="hero">
+    <h1>News Feed — Deep-dive &amp; Trade-offs</h1>
+    <div class="sub">Use case 12 · Canvas 3 of 3. The hard parts: <b>fan-out</b> (push vs pull vs hybrid — with the math that kills pure push), <b>ranking</b> and the two-pass pipeline, <b>cursor pagination</b> with gap detection, the <b>bottlenecks</b> (celebrity thundering herd, fan-out lag, hot Redis shard) and their fixes, why this is an <b>AP</b> system (with social graph as the <b>CP</b> exception), and a phase-by-phase <b>interview walkthrough</b>. <b>Switch the sharding / fan-out tabs</b> and <b>open the bottleneck cards</b>.</div>
+    <div class="badges">
+      <span class="badge lvl">Use case 12 · Deep-dive</span>
+      <span class="badge">Canvas 3 of 3</span>
+      <span class="badge">interactive</span>
+      <span class="badge">AP feed · CP social graph</span>
+    </div>
+    <div class="legend">
+      <span><i class="dot" style="background:var(--eden)"></i> switch a tab</span>
+      <span><i class="dot" style="background:var(--old)"></i> open a bottleneck</span>
+      <span><i class="dot" style="background:var(--survivor)"></i> chosen option</span>
+      <span><i class="dot" style="background:var(--warn)"></i> failure / risk</span>
+      <span><i class="dot" style="background:var(--gc)"></i> fix / mitigation</span>
+    </div>
+  </header>
+
+  <!-- A · SCALING STRATEGY -->
+  <section>
+    <div class="sec-h"><span class="n">A</span><h2>Scaling strategy</h2><span class="tag">what to shard &amp; how</span></div>
+    <div class="grid g3">
+      <div class="card"><div class="kicker">app tier</div><h3>Stateless → horizontal</h3><p class="muted">Post / Feed / Engagement / Ranking / SocialGraph all stateless. Auto-scale by CPU + p99. Feed peak ~175 K/s ÷ ~1 K rps/instance → ~200 Feed pods.</p></div>
+      <div class="card"><div class="kicker">timeline cache</div><h3>Redis Cluster · 40 shards</h3><p class="muted">Hash-slot sharding on <code>timeline:{user_id}</code>. 500 M DAU × 40 KB ≈ 20 TB → ~40 masters × 512 GB (+ replicas → 80 nodes). Add nodes with <code>MIGRATE</code>: only 1/N keys move.</p></div>
+      <div class="card"><div class="kicker">fan-out workers</div><h3>Kafka consumer group · 32 → 256</h3><p class="muted">Auto-scale on Kafka lag. Lag &gt; 100 K → +8 workers. Emergency at 500 K → +32. Cooldown 10 min. Max = 4× partitions.</p></div>
+    </div>
+
+    <div data-tabscope style="margin-top:16px">
+      <div class="kicker">database sharding — pick a partition strategy</div>
+      <div class="tabs">
+        <button class="tab active" data-tab="hash">Hash on user_id</button>
+        <button class="tab" data-tab="range">Range on post_id</button>
+        <button class="tab" data-tab="chash">Consistent hashing</button>
+      </div>
+
+      <div class="tabpanel active" data-panel="hash">
+        <div class="grid g2">
+          <div class="card">
+            <h3>Hash on user_id (posts table)</h3>
+            <p class="muted">Cassandra's default. Partition key <code>user_id</code> co-locates all of a user's posts on one node — enables the O(1) celebrity pull (<code>ZREVRANGE user_timeline:{celeb} 0 4</code>).</p>
+            <pre class="code">CREATE TABLE posts (
+  post_id BIGINT, user_id BIGINT, ...,
+  PRIMARY KEY (<b>user_id</b>, post_id)
+) WITH CLUSTERING ORDER BY (post_id DESC);</pre>
+          </div>
+          <div class="card">
+            <div class="kicker">verdict — chosen for posts</div>
+            <ul class="tight">
+              <li><b>Even load</b> — 1 B random user_ids hash uniformly.</li>
+              <li>Free ordering within a partition (clustering on post_id DESC).</li>
+              <li><span style="color:var(--warn)">Hot partition on celebrities:</span> Elon's row gets slammed by the pull path. Fix with L1 Caffeine + read replicas.</li>
+            </ul>
+          </div>
+        </div>
+      </div>
+
+      <div class="tabpanel" data-panel="range">
+        <div class="grid g2">
+          <div class="card">
+            <h3>Range on post_id (Snowflake time-sortable)</h3>
+            <p class="muted">Post IDs are Snowflake → monotonically increasing. Range-based means all new posts hit the newest shard.</p>
+            <pre class="code">shard 1: post_id 0..2^62
+shard 2: post_id 2^62..2^63
+<span class="cm">// today's writes → only shard 2. hot!</span></pre>
+          </div>
+          <div class="card">
+            <div class="kicker">verdict — avoid</div>
+            <ul class="tight">
+              <li><span style="color:var(--warn)">Hot write shard:</span> Snowflake is time-sortable → today's 6 K writes/s all land on one shard.</li>
+              <li>Good for range scans, which the feed never needs — the read pattern is point look-ups by user_id or post_id.</li>
+              <li>Interview red flag: "range partitioning on time-sortable keys = hot shard."</li>
+            </ul>
+          </div>
+        </div>
+      </div>
+
+      <div class="tabpanel" data-panel="chash">
+        <div class="grid g2">
+          <div class="card">
+            <h3>Consistent hashing <span class="run">← the Redis / Cassandra default</span></h3>
+            <p class="muted">Ring of virtual nodes. Add or lose a node → only ~1/N keys move (not the whole keyspace). Redis Cluster uses 16 384 hash slots; Cassandra uses vnodes. Same idea both places.</p>
+            <pre class="code">slot = CRC16(<span class="st">"timeline:user_123"</span>) % 16384
+node = slotOwner(slot)
+<span class="cm">// re-shard: MIGRATE moves slots, keys keep their homes.</span></pre>
+          </div>
+          <div class="card">
+            <div class="kicker">verdict</div>
+            <ul class="tight">
+              <li><b>Elastic:</b> add capacity for a spike without a rehash storm.</li>
+              <li>Virtual nodes smooth out uneven arcs.</li>
+              <li>Same technique used by the Redis cluster <i>and</i> Cassandra partitioner — one mental model.</li>
+            </ul>
+          </div>
+        </div>
+      </div>
+
+      <div class="callout tip"><b>Fan-out auto-scaling in practice:</b> monitor <code>aggregate_lag = produced − consumed</code>. Lag &gt; 100 K for 2 min → +8 workers. Lag &lt; 10 K for 10 min → −4 workers. Emergency at 500 K → +32 &amp; page. During a major event (election night, ~170 K posts/s = 10× baseline), workers scale 64 → 256 in 2–3 min; feed becomes 30–60 s stale during the ramp — users see the "N new posts" banner and move on.</div>
+    </div>
+  </section>
+
+  <!-- B · FAN-OUT DEEP-DIVE -->
+  <section>
+    <div class="sec-h"><span class="n">B</span><h2>Fan-out deep-dive — the star of the interview</h2><span class="tag">push · pull · hybrid — with the math</span></div>
+    <div class="grid g3">
+      <div class="card">
+        <div class="kicker">Push (Fan-out on Write)</div>
+        <h3>Great for normals</h3>
+        <ul class="tight">
+          <li><b>Publish:</b> O(N followers) — Redis pipeline of <code>ZADD</code>.</li>
+          <li><b>Read:</b> O(1) — single <code>ZREVRANGEBYSCORE</code>.</li>
+          <li>Bounded for a user with 300 followers (~1–2 ms pipelined).</li>
+        </ul>
+      </div>
+      <div class="card">
+        <div class="kicker">Pull (Fan-out on Read)</div>
+        <h3>Great for celebs</h3>
+        <ul class="tight">
+          <li><b>Publish:</b> O(1) — post lands only in author's user timeline.</li>
+          <li><b>Read:</b> O(C) — for each celeb followed, pull latest 5.</li>
+          <li>Reader-side cost, but bounded (~5–20 celebs / user).</li>
+        </ul>
+      </div>
+      <div class="card">
+        <div class="kicker">Hybrid <span class="run">← chosen</span></div>
+        <h3>Best of both</h3>
+        <ul class="tight">
+          <li><code>if (author.isCelebrity()) pull else push</code>.</li>
+          <li>99.99% of users → push. 0.01% → pull.</li>
+          <li>Adds ~5–15 ms to reads; eliminates ~2.5 T writes/day.</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="callout"><b>The math that kills pure push:</b>
+      Celebrity with 50 M followers posts. Redis pipeline @ 100 K <code>ZADD</code>/s ⇒ <b>50 M / 100 K = 500 s ≈ 8 min</b> of fan-out per post. Times 10 posts/day = <b>83 min/day of fan-out from one user</b> — during which workers back up and everyone else's feed goes stale.
+      Across ~100 K celebrities × 5 posts/day × 5 M avg followers = <b>2.5 trillion writes/day</b> just for celebrities. <span class="run">Hybrid deletes all of them.</span>
+    </div>
+
+    <div class="grid g2" style="margin-top:14px">
+      <div class="card">
+        <div class="kicker">read-path timing (hybrid)</div>
+        <pre class="code">Feed read: viewer opens app
+  ├─ 1–2 ms   ZREVRANGEBYSCORE timeline:{u}  (500 IDs)
+  ├─ 5–15 ms  parallel pull ~12 celebrities
+  ├─ 10–20 ms rank 560 candidates
+  ├─ 1–2 ms   diversity injection
+  ├─ 15–30 ms hydrate 20 posts (batch, parallel)
+  └─ 2–5 ms   serialise + return
+Total server:  ~35–75 ms
++ network:    ~20–40 ms RTT
+<b>p99 &lt; 200 ms budget</b>: met with room to spare.</pre>
+      </div>
+      <div class="card">
+        <div class="kicker">write-path timing</div>
+        <pre class="code">Publish: sync path (in code)
+  ├─ 5–15 ms  Cassandra QUORUM write (posts + posts_by_id)
+  ├─ 1–2 ms   HSET post:{id} cache
+  ├─ 1–2 ms   Kafka publish
+  └─ 2–5 ms   serialise + return
+Total sync:   ~9–24 ms  (client sees 201 in ~60 ms with RTT)
+
+Async fan-out (Kafka consumer)
+  ├─ hybrid: celebrity? YES → skip. NO → follower-list pipeline
+  ├─ 300 followers: ~1–2 ms pipelined ZADD
+  └─ 10 M followers via <i>push</i> would take ~100 s — <i>skipped</i></pre>
+      </div>
+    </div>
+  </section>
+
+  <!-- C · CACHING & FEATURE STORE -->
+  <section>
+    <div class="sec-h"><span class="n">C</span><h2>Caching &amp; feature store — where 200 ms lives</h2><span class="tag">L1 · L2 · feature</span></div>
+    <div class="grid g3">
+      <div class="card">
+        <div class="kicker">L1 · local (Caffeine)</div>
+        <h3>Celeb timelines &amp; hot posts</h3>
+        <p class="muted">Per Feed Service node: 10 K entries, 10 s TTL. <b>10 M concurrent celeb reads → ~600 Redis reads</b> after coalescing across 100 nodes.</p>
+        <pre class="code">Caffeine.newBuilder()
+  .maximumSize(<span class="st">10_000</span>)
+  .expireAfterWrite(<span class="st">10</span>, SECONDS)
+  .refreshAfterWrite(<span class="st">5</span>, SECONDS);</pre>
+      </div>
+      <div class="card">
+        <div class="kicker">L2 · timeline &amp; post cache (Redis)</div>
+        <h3>ZSET + Hash</h3>
+        <p class="muted">Timeline: sorted set per user, cap 500, 7 d TTL. Post content: <code>post:{id}</code> Hash, 24 h TTL — hot hydration.<br>Cache-aside on read; write-through on publish.</p>
+        <pre class="code">ZADD timeline:{u} score post_id
+ZREMRANGEBYRANK timeline:{u} 0 -501
+EXPIRE timeline:{u} 604800
+HSET post:{id} content author ... EX 86400</pre>
+      </div>
+      <div class="card">
+        <div class="kicker">Feature store (Redis)</div>
+        <h3>Pre-computed ranker inputs</h3>
+        <p class="muted">Score 560 candidates in &lt;20 ms only if features are already there. Hashes:</p>
+        <pre class="code">user_features:{u}       <span class="cm">// daily</span>
+affinity:{viewer}:{author}   <span class="cm">// 30d TTL</span>
+post_features:{p}       <span class="cm">// updated on engagement</span></pre>
+      </div>
+    </div>
+    <div class="callout tip"><b>Cache warming:</b> after a Redis shard restart, first requests trigger a rebuild — pull last ~20 posts from each followed user, rank, populate <code>timeline:{u}</code>. First page is 200–500 ms instead of ~2 ms — one-time cost, transparent to the user. On new-user signup: cold-start pulls latest from onboarding follows + trending fillers so the feed isn't empty.</div>
+  </section>
+
+  <!-- D · BOTTLENECKS & SOLUTIONS -->
+  <section>
+    <div class="sec-h"><span class="n">D</span><h2>Bottlenecks &amp; solutions</h2><span class="tag">click a card to open</span></div>
+    <div class="grid" style="gap:10px">
+
+      <div class="card collapsible open">
+        <div class="c-head"><h3>Celebrity fan-out (the classic)</h3></div>
+        <div class="c-body">
+          <p><b style="color:var(--warn)">Impact:</b> pure push to 50 M followers = 500 s of ZADD, saturates Kafka workers, delays everyone else's fan-out.</p>
+          <p><b style="color:var(--gc)">Fix:</b> <b>HybridFanoutStrategy</b> — skip fan-out when <code>author.isCelebrity()</code>. Post lives in author's user timeline; <code>FeedService</code> pulls it at read time. 2.5 T daily writes eliminated. In our code: <code>User.CELEBRITY_THRESHOLD = 10_000</code>, ~1 M in production.</p>
+        </div>
+      </div>
+
+      <div class="card collapsible">
+        <div class="c-head"><h3>Thundering herd on a celebrity post</h3></div>
+        <div class="c-body">
+          <p><b style="color:var(--warn)">Impact:</b> celeb posts → 10 M followers refresh in 60 s → 10 M reads target the same celebrity user_timeline key.</p>
+          <p><b style="color:var(--gc)">Fix (layered):</b> (1) L1 Caffeine on each Feed Service node (10 s TTL) → 10 M requests coalesce to ~600 Redis reads across 100 nodes; (2) <b>singleflight</b> — same-key concurrent misses share one downstream call; (3) Redis read replicas for hot celeb keys; (4) preemptive cache warming when the celebrity posts.</p>
+        </div>
+      </div>
+
+      <div class="card collapsible">
+        <div class="c-head"><h3>Fan-out queue depth during major events</h3></div>
+        <div class="c-body">
+          <p><b style="color:var(--warn)">Impact:</b> election night — post rate 10× (17 K/s → 170 K/s). Kafka lag balloons; feeds go stale.</p>
+          <p><b style="color:var(--gc)">Fix:</b> auto-scale on lag — 64 → 256 workers in 2–3 min. Feed is 30–60 s stale during the ramp; the "N new posts available" banner absorbs the perceived UX cost. Scale-down with 10-min cooldown to avoid oscillation.</p>
+        </div>
+      </div>
+
+      <div class="card collapsible">
+        <div class="c-head"><h3>Hot Redis shard (celebrity timeline or viral post)</h3></div>
+        <div class="c-body">
+          <p><b style="color:var(--warn)">Impact:</b> one shard saturated while others idle. Feed p99 spikes.</p>
+          <p><b style="color:var(--gc)">Fix:</b> Redis Cluster distributes reads across replicas natively for celeb timelines; L1 Caffeine absorbs the top ~10 K hot posts with a 5–10 s TTL. For truly viral posts, key-replicate the entry across shards.</p>
+        </div>
+      </div>
+
+      <div class="card collapsible">
+        <div class="c-head"><h3>Cache stampede on TTL expiry</h3></div>
+        <div class="c-body">
+          <p><b style="color:var(--warn)">Impact:</b> when <code>timeline:{u}</code> or <code>post:{id}</code> expires under load, thousands of misses race to the DB.</p>
+          <p><b style="color:var(--gc)">Fix:</b> singleflight lock — <code>SET lock:{key} NX EX 5</code>. First request rebuilds and populates; the rest sleep 50 ms and re-GET. TTL jitter (±10%) prevents synchronised expiry across the fleet.</p>
+        </div>
+      </div>
+
+      <div class="card collapsible">
+        <div class="c-head"><h3>Concurrent likes on a viral post (lost updates)</h3></div>
+        <div class="c-body">
+          <p><b style="color:var(--warn)">Impact:</b> 1 000 users like the same post in 1 s. Naive read-modify-write loses updates.</p>
+          <p><b style="color:var(--gc)">Fix:</b> two-layer counter. <b>Redis <code>INCR post_likes:{id}</code></b> (atomic, sub-ms, single-threaded → serialised) for the display count that feeds the ranker, plus a <b>Cassandra counter</b> for durability. Dedup with <code>SADD post_likers:{id}</code>. In code: <code>Post.likeCount</code> is <code>AtomicInteger</code>; <code>engagementRepository.hasLiked</code> is the idempotency check.</p>
+        </div>
+      </div>
+
+      <div class="card collapsible">
+        <div class="c-head"><h3>Deep-scroll fallback (page 26+)</h3></div>
+        <div class="c-body">
+          <p><b style="color:var(--warn)">Impact:</b> timeline cache holds only 500 entries. Page 26 exhausts it.</p>
+          <p><b style="color:var(--gc)">Fix:</b> fall back to Cassandra range query on <code>posts</code> partitioned by follower's <code>following</code> list, ordered by <code>created_at DESC</code>. Latency jumps ~2 ms → ~50–100 ms — acceptable because &lt;0.1% of feed requests reach page 26. Optionally maintain a compressed <code>archive_timeline:{u}</code> ZSET (posts 501–2000) for power users.</p>
+        </div>
+      </div>
+
+      <div class="card collapsible">
+        <div class="c-head"><h3>Redis Cluster node loss</h3></div>
+        <div class="c-body">
+          <p><b style="color:var(--warn)">Impact:</b> a master fails → ~1/N of timelines vanish; the replica must promote.</p>
+          <p><b style="color:var(--gc)">Fix:</b> Redis Cluster promotes replica in &lt;30 s. Feed degrades gracefully: L1 Caffeine serves what it has; complete cache miss falls back to fan-out-on-read against Cassandra (~200–500 ms — slower but functional). Cache warming rebuilds organically as new posts fan out.</p>
+        </div>
+      </div>
+
+    </div>
+  </section>
+
+  <!-- E · CAP & CONSISTENCY -->
+  <section>
+    <div class="sec-h"><span class="n">E</span><h2>CAP &amp; consistency — AP feed, CP social graph</h2><span class="tag">the exception matters</span></div>
+    <div class="grid g2">
+      <div class="card">
+        <div class="kicker">the choice</div>
+        <p class="muted"><b>P is mandatory.</b> Between A and C for the feed: <b>A wins</b>. At 175 K feed reads/s, 1 s of errors = 175 K failed impressions and directly hits ad revenue. A 5–10 s stale feed is invisible to users.</p>
+        <ul class="tight">
+          <li><b>AP for feed / timeline / counts</b> — eventually consistent.</li>
+          <li><b>PACELC → PA/EL:</b> partition → A; else → L. Fast reads always.</li>
+          <li><b>Read-your-writes for the poster:</b> client-side optimistic render — 201 response is inserted at the top locally until the server copy arrives via fan-out.</li>
+        </ul>
+      </div>
+      <div class="card">
+        <div class="kicker">the CP exception — social graph</div>
+        <p class="muted">Follow / unfollow must be strongly consistent. A stale follower list means fan-out includes an ex-follower ("why am I seeing their posts?") or misses a fresh follower.</p>
+        <pre class="code"><span class="cm">// atomic follow</span>
+BEGIN
+  INSERT INTO following (a, b);
+  INSERT INTO followers (b, a);
+COMMIT
+MULTI
+  SADD followers:b a
+  SADD following:a b
+EXEC</pre>
+        <p class="muted">Postgres source of truth + synchronous Redis Set update. No Kafka on the follow path.</p>
+      </div>
+    </div>
+    <table style="margin-top:12px">
+      <thead><tr><th>Component</th><th>Model</th><th>Staleness OK</th><th>Reasoning</th></tr></thead>
+      <tbody>
+        <tr><td>News feed timeline</td><td>Eventual</td><td>5–10 s</td><td>Fan-out is async; users don't notice a few seconds</td></tr>
+        <tr><td>Like / comment counts</td><td>Eventual</td><td>10–30 s</td><td>"12.3 K likes" — approximation is fine</td></tr>
+        <tr><td>Post creation</td><td>Strong (write-ack)</td><td>0 s</td><td>Author must see their post immediately (optimistic UI)</td></tr>
+        <tr><td><b>Follow / unfollow</b></td><td><b>Strong · CP</b></td><td>0 s</td><td>Drives fan-out correctness; ex-follower must not receive posts</td></tr>
+        <tr><td>Celebrity detection</td><td>Eventual</td><td>minutes</td><td>Nightly batch + dynamic reclassification</td></tr>
+        <tr><td>Ranking scores</td><td>Eventual</td><td>1–5 min</td><td>Ranking is inherently approximate; features refresh daily</td></tr>
+      </tbody>
+    </table>
+    <div class="callout tip"><b>Post deletion is soft:</b> flip <code>is_deleted=true</code> in Cassandra; the post lingers in 300+ follower timelines and ages out naturally. Trying to eagerly <code>ZREM</code> from every follower's cache is infeasible at 50 M followers. Filter <code>is_deleted</code> during hydration in <code>FeedService</code> step 5. Same idea for unfollow: <b>lazy filter</b> at read time — no cache scan.</div>
+  </section>
+
+  <!-- F · PAGINATION & REAL-TIME -->
+  <section>
+    <div class="sec-h"><span class="n">F</span><h2>Cursor pagination + real-time push</h2><span class="tag">why offset breaks · WebSocket banner</span></div>
+    <div class="grid g2">
+      <div class="card">
+        <div class="kicker">why NOT offset</div>
+        <pre class="code"><span class="cm">// Page 1: LIMIT 20 OFFSET 0    → A B C D ... T</span>
+<span class="cm">// User reads. 3 new posts (X Y Z) arrive above.</span>
+<span class="cm">// Page 2: LIMIT 20 OFFSET 20  → R S T U V W ...</span>
+<span class="cm">// PROBLEM: R S T were already on page 1. DUPLICATES.</span></pre>
+        <p class="muted">Offset shifts under real-time inserts. At 500 M posts/day this breaks constantly.</p>
+      </div>
+      <div class="card">
+        <div class="kicker">cursor: stable</div>
+        <pre class="code"><span class="cm">// cursor = {score}_{post_id}  (ties broken by post_id)</span>
+Page 1  → next_cursor = <span class="st">"5.42_post_724..."</span>
+Page 2  → ZREVRANGEBYSCORE timeline:{u}
+             (5.42 -inf LIMIT 0 20
+<span class="cm">// New posts get HIGHER scores → appear ABOVE cursor</span>
+<span class="cm">// Old posts stay in position relative to cursor</span>
+<span class="cm">// No duplicates. No misses within a page.</span></pre>
+        <p class="muted">In our code: <code>FeedCursor</code> = <code>{lastPostId, lastTimestamp, pageSize=20}</code>. <code>InMemoryTimelineCache.tailMap(cursorTs, false)</code> is the O(log N) skip.</p>
+      </div>
+    </div>
+
+    <div class="grid g3" style="margin-top:14px">
+      <div class="card">
+        <div class="kicker">gap detection</div>
+        <h3>"N new posts available"</h3>
+        <p class="muted">When serving page 2+, count posts with score &gt; page-1-max-score. If &gt;0 → <code>gap_detected=true, new_posts_count=N</code>. Client renders a banner instead of jumping.</p>
+      </div>
+      <div class="card">
+        <div class="kicker">WebSocket</div>
+        <h3>Push notification, not content</h3>
+        <p class="muted">Message = ~100 B: <code>{type:"NEW_POSTS", count:3}</code>. Content is fetched on the next feed request. 100 M concurrent connections across ~1 000 WS gateway nodes (100 K per node).</p>
+      </div>
+      <div class="card">
+        <div class="kicker">SSE / long-poll fallback</div>
+        <h3>For hostile networks</h3>
+        <p class="muted">Corporate firewalls or old browsers can't hold WebSockets. <code>GET /feed/stream</code> (Server-Sent Events) is one-way, HTTP-friendly. Long-polling as last resort.</p>
+      </div>
+    </div>
+    <div class="callout"><b>Banner vs auto-inject:</b> Facebook / LinkedIn use the <b>banner</b> — user controls when to refresh; no scroll jumps. Twitter historically auto-injects — great for a live event stream, bad for casual reading. <b>Choose banner by default.</b></div>
+  </section>
+
+  <!-- G · CLOUD MAPPING -->
+  <section>
+    <div class="sec-h"><span class="n">G</span><h2>Cloud mapping (AWS / GCP / Azure)</h2><span class="tag">same design, three clouds</span></div>
+    <table>
+      <thead><tr><th>Component</th><th>AWS</th><th>GCP</th><th>Azure</th></tr></thead>
+      <tbody>
+        <tr><td>API Gateway</td><td>API Gateway</td><td>Apigee / Cloud Endpoints</td><td>API Management</td></tr>
+        <tr><td>Load Balancer</td><td>ALB / NLB</td><td>Cloud Load Balancing</td><td>Application Gateway</td></tr>
+        <tr><td>Compute</td><td>ECS Fargate / EKS</td><td>Cloud Run / GKE</td><td>AKS / Container Apps</td></tr>
+        <tr><td>Timeline / feature cache</td><td>ElastiCache (Redis Cluster)</td><td>Memorystore</td><td>Azure Cache for Redis</td></tr>
+        <tr><td>Post store (KV)</td><td>Keyspaces (Cassandra) / DynamoDB</td><td>Bigtable</td><td>Cosmos DB (Cassandra API)</td></tr>
+        <tr><td>User DB / social graph SoT</td><td>RDS (PostgreSQL)</td><td>Cloud SQL</td><td>Azure DB for PostgreSQL</td></tr>
+        <tr><td>Event bus (Kafka)</td><td>MSK / Kinesis</td><td>Pub/Sub</td><td>Event Hubs (Kafka)</td></tr>
+        <tr><td>Object storage (media)</td><td>S3</td><td>Cloud Storage</td><td>Blob Storage</td></tr>
+        <tr><td>CDN</td><td>CloudFront</td><td>Cloud CDN</td><td>Azure CDN / Front Door</td></tr>
+        <tr><td>Video transcoding</td><td>MediaConvert</td><td>Transcoder API</td><td>Media Services</td></tr>
+        <tr><td>WebSocket gateway</td><td>API Gateway WS</td><td>Custom on GKE</td><td>Web PubSub</td></tr>
+        <tr><td>Push notifications</td><td>SNS + Pinpoint</td><td>Firebase Cloud Messaging</td><td>Notification Hubs</td></tr>
+        <tr><td>Feature store</td><td>SageMaker Feature Store</td><td>Vertex AI Feature Store</td><td>Custom on Redis</td></tr>
+      </tbody>
+    </table>
+    <div class="callout"><b>Hot vs cold split:</b> containers for Feed / Post / Fan-out (cold starts unacceptable at 175 K/s peak); serverless (Lambda / Cloud Functions) for engagement-count consumers, transcoding pipelines, nightly celebrity reclassification, feature-store updates.</div>
+  </section>
+
+  <!-- H · TRADE-OFFS SUMMARY -->
+  <section>
+    <div class="sec-h"><span class="n">H</span><h2>Trade-offs summary</h2><span class="tag">decision · chosen · alternative · why</span></div>
+    <table>
+      <thead><tr><th>Decision</th><th>Chosen</th><th>Alternative</th><th>Why this choice</th></tr></thead>
+      <tbody>
+        <tr><td>Fan-out strategy</td><td><b style="color:var(--survivor)">Hybrid (push + pull)</b></td><td>Pure push · Pure pull</td><td>Push fails for celebs (2.5 T writes/day); pull fails for readers (300 queries/feed)</td></tr>
+        <tr><td>Feed ranking</td><td><b style="color:var(--survivor)">Algorithmic (affinity × recency × engagement × type)</b></td><td>Chronological · Full ML</td><td>Chrono buries close-friend posts; full ML is over-engineered for an interview</td></tr>
+        <tr><td>Pagination</td><td><b style="color:var(--survivor)">Cursor {score}_{post_id}</b></td><td>Offset LIMIT/OFFSET</td><td>Offset breaks under real-time inserts (duplicates &amp; misses)</td></tr>
+        <tr><td>Real-time delivery</td><td><b style="color:var(--survivor)">WebSocket + banner</b></td><td>Auto-inject · Poll</td><td>Banner keeps scroll position; polling wastes server</td></tr>
+        <tr><td>Post store</td><td><b style="color:var(--survivor)">Cassandra (PK user_id, CK post_id DESC)</b></td><td>PostgreSQL · DynamoDB</td><td>PG can't shard 500 M writes/day; DDB costly &amp; 400 KB item limit</td></tr>
+        <tr><td>Timeline cache</td><td><b style="color:var(--survivor)">Redis Sorted Set</b></td><td>DynamoDB · Memcached</td><td>ZSET operations at ~0.5 ms; Memcached has no sorted sets</td></tr>
+        <tr><td>Like counting</td><td><b style="color:var(--survivor)">Redis INCR + Cassandra counter</b></td><td>DB counter only</td><td>Redis absorbs contention; Cassandra keeps the durable truth</td></tr>
+        <tr><td>Celebrity threshold</td><td><b style="color:var(--survivor)">Static 1 M + dynamic reclassify</b></td><td>Static only · Dynamic only</td><td>Static catches most; dynamic handles viral growth</td></tr>
+        <tr><td>Unfollow / delete cleanup</td><td><b style="color:var(--survivor)">Lazy filter at read</b></td><td>Eager cache scan</td><td>Scanning 500 entries × N timelines per action is prohibitive</td></tr>
+        <tr><td>Consistency model</td><td><b style="color:var(--survivor)">AP for feed · CP for social graph</b></td><td>Global CP</td><td>Blank feed at 175 K/s unacceptable; but graph must be exact</td></tr>
+        <tr><td>Ranking feature storage</td><td><b style="color:var(--survivor)">Redis feature store</b></td><td>On-the-fly compute</td><td>Scoring 960 candidates in &lt;20 ms requires pre-computed features</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <!-- I · INTERVIEW WALKTHROUGH -->
+  <section>
+    <div class="sec-h"><span class="n">I</span><h2>Interview walkthrough — timing strip</h2><span class="tag">35–45 min answer</span></div>
+    <div class="flow">
+      <div class="step eden"><div class="box">Opening</div><small>P1 clarify · 2–3 min<br>1 B users · 500 M DAU</small></div>
+      <div class="step eden"><div class="box">Estimation</div><small>P2 · 3–4 min<br>6K W/s · 60K R/s · 20 TB</small></div>
+      <div class="step surv"><div class="box">API + Data</div><small>P3 · 3–4 min<br>REST · WS · ZSET</small></div>
+      <div class="step surv"><div class="box">Architecture</div><small>P4 · 4–5 min<br>draw first, narrate flows</small></div>
+      <div class="step old"><div class="box">Fan-out ★</div><small>P5 · 10–12 min<br>hybrid + celeb math</small></div>
+      <div class="step old"><div class="box">Ranking ★</div><small>P6 · 6–8 min<br>affinity × rec × eng × type</small></div>
+      <div class="step dead"><div class="box">Pagination + WS</div><small>P7 · 3–4 min<br>cursor · gap · banner</small></div>
+      <div class="step dead"><div class="box">Scale + CAP</div><small>P8 · 3–5 min<br>AP + graph CP · tradeoffs</small></div>
+    </div>
+    <div class="grid g2" style="margin-top:14px">
+      <div class="card">
+        <div class="kicker">phase-by-phase</div>
+        <ul class="tight">
+          <li><b>P1 Clarify (2–3):</b> scope = feed + publish + engagement + real-time (not DM / ads / stories). 1 B / 500 M DAU. In vs out of scope.</li>
+          <li><b>P2 Estimate (3–4):</b> 500 M posts/day → 6 K W/s (peak 17 K), 5 B feed reads → 60 K R/s (peak 175 K), 100:1 read heavy, 20 TB timeline cache.</li>
+          <li><b>P3 API (2–3):</b> <code>POST /posts</code>, <code>GET /feed?cursor=X</code>, WS <code>/ws/feed</code>. Mention cursor over offset upfront.</li>
+          <li><b>P4 Architecture (4–5 · CORE):</b> Client → API GW → LB → Post/Feed → Kafka → Fan-out workers → Redis Timeline Cache + Cassandra + PG + Push. Draw first, narrate write + read.</li>
+          <li><b>P5 Fan-out (10–12 · STAR):</b> compare push / pull / hybrid; deliver the celebrity math (50 M × 100 K/s = 500 s); back-pressure &amp; auto-scaling; the celebrity thundering herd + L1 Caffeine fix.</li>
+        </ul>
+      </div>
+      <div class="card">
+        <div class="kicker">…and finish strong</div>
+        <ul class="tight">
+          <li><b>P6 Ranking (6–8 · DIFFERENTIATOR):</b> formula, worked example (best-friend beats stranger). Two-pass: candidate gen → scoring. Feature store in Redis.</li>
+          <li><b>P7 Pagination + WS (3–4):</b> why offset breaks; cursor = {score}_{post_id}; gap detection + banner; WebSocket sends the <i>notification</i>, not the content.</li>
+          <li><b>P8 Scale + DBs (3–5):</b> Redis Cluster hash-slot, Cassandra by user_id, fan-out auto-scaling on lag, cache warming after restart.</li>
+          <li><b>P9 Tradeoffs / CAP (2–3):</b> AP for feed; <b>CP exception for social graph</b>; soft delete + lazy filter; read-your-writes via optimistic client render.</li>
+          <li><b>P10 Edge cases:</b> deep-scroll fallback, viral like contention, Redis node loss degradation, new-user cold start.</li>
+        </ul>
+      </div>
+    </div>
+    <div class="callout tip"><b>Green flags:</b> you drive scoping · deliver the celebrity math without prompting · state AP + CP-exception explicitly · walk through the ranking formula with a worked example · address gap detection unasked · name-drop thundering herd + singleflight.<br><b>Red flags:</b> "just push to all" · offset pagination · treating feed and social graph with the same consistency model · schema before architecture · over-engineering with a full ML platform.</div>
+  </section>
+
+  <!-- GLOSSARY -->
+  <section>
+    <div class="sec-h"><span class="n">§</span><h2>Glossary — one-liners</h2><span class="tag">terms used above</span></div>
+    <div class="grid g2">
+      <div class="card"><table><tbody>
+        <tr><td><b>AP (CAP)</b></td><td>favour Availability + Partition-tolerance; feed stays up under partition</td></tr>
+        <tr><td><b>PACELC → PA/EL</b></td><td>on Partition pick Availability; Else pick Latency (fast reads always)</td></tr>
+        <tr><td><b>Hybrid fan-out</b></td><td>push for normal, pull for celebrity — the production answer</td></tr>
+        <tr><td><b>Celebrity threshold</b></td><td>followerCount cutoff (10 K in code, ~1 M in prod) that flips routing</td></tr>
+        <tr><td><b>Thundering herd</b></td><td>many concurrent misses stampede a downstream when a hot key expires or arrives</td></tr>
+        <tr><td><b>Singleflight</b></td><td>coalesce concurrent misses so only one call reaches the source</td></tr>
+      </tbody></table></div>
+      <div class="card"><table><tbody>
+        <tr><td><b>Cursor pagination</b></td><td>anchor by last-seen {score}_{post_id}; stable under real-time inserts</td></tr>
+        <tr><td><b>Gap detection</b></td><td>server tells client N new posts arrived above cursor → banner</td></tr>
+        <tr><td><b>Write amplification</b></td><td>one post → N cache writes; the reason celebrity push explodes</td></tr>
+        <tr><td><b>Snowflake ID</b></td><td>64-bit time-sortable, coordination-free unique post_id</td></tr>
+        <tr><td><b>Lazy filter</b></td><td>skip a soft-deleted / unfollowed post at read time instead of purging caches</td></tr>
+        <tr><td><b>Cache warming</b></td><td>proactive backfill after restart or new signup so the first read isn't cold</td></tr>
+      </tbody></table></div>
+    </div>
+  </section>
+
+  <footer>
+    <p>Use case 12 · News Feed — Canvas 3 of 3 (Deep-dive &amp; Trade-offs). Grounded in <code>12-news-feed/docs/tradeoffs/CAP_THEOREM.md · caching/CACHING_STRATEGY.md · tech/TECHNOLOGIES.md · cloud/CLOUD_SERVICES.md</code> and the fan-out sections of <code>docs/hld/HIGH_LEVEL_DESIGN.md</code>.</p>
+    <p class="run">This use case: <a href="hld.html">12a · HLD</a> · <a href="lld.html">12b · LLD</a> · Deep-dive &nbsp;|&nbsp; Next → <a href="../index.html">Hub</a></p>
+  </footer>
+
+</div>
+<script src="../assets/canvas.js"></script>
+</body>
+</html>

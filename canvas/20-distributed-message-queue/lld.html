@@ -1,0 +1,482 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>20 · Distributed Message Queue — LLD</title>
+<link rel="stylesheet" href="../assets/canvas.css">
+</head>
+<body>
+<div class="wrap">
+
+  <header class="hero">
+    <h1>Distributed Message Queue — Low-Level Design</h1>
+    <div class="sub">Use case 20 · Canvas 2 of 3. From boxes to classes: the actual Java object model. Start with the <b>interactive class map</b> — click a class to see its role and how <code>AppConfig → Controller → Services → Engines → Strategies / Repositories</code> is wired — then read the <b>CommitLog</b> (append + read), the <b>MessageRouter partition cascade</b>, the three <b>Strategy</b> families (partitioning · delivery · storage), and the produce / consume / rebalance sequences.</div>
+    <div class="badges">
+      <span class="badge lvl">Use case 20 · LLD</span>
+      <span class="badge">Canvas 2 of 3</span>
+      <span class="badge">interactive</span>
+      <span class="badge">Strategy × 3 · Builder · Facade · Repository × 4 · Factory · Singleton</span>
+    </div>
+    <div class="legend">
+      <span><i class="dot" style="background:var(--eden)"></i> entry / composition root</span>
+      <span><i class="dot" style="background:var(--survivor)"></i> interface / contract</span>
+      <span><i class="dot" style="background:var(--old)"></i> concrete implementation</span>
+      <span><i class="dot" style="background:var(--warn)"></i> domain model</span>
+      <span><i class="dot" style="background:var(--muted)"></i> click a class for its role</span>
+    </div>
+  </header>
+
+  <!-- A · CLASS MAP -->
+  <section>
+    <div class="sec-h"><span class="n">A</span><h2>Class design — click a class in the map</h2><span class="tag">the object model, wired</span></div>
+    <div>
+      <div class="arch">
+        <svg viewBox="0 0 900 500" width="100%" style="max-width:900px" role="img" aria-label="Message queue class map">
+          <defs>
+            <marker id="ah" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" fill="var(--muted)"></path></marker>
+          </defs>
+
+          <!-- ─── wiring arrows ─── -->
+          <!-- Col1: AppConfig → Controller → MessageQueueService (Facade) -->
+          <line class="arrow" x1="85" y1="70" x2="85" y2="110" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"></line>
+          <line class="arrow" x1="85" y1="154" x2="85" y2="200" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"></line>
+          <!-- MQService fanning out to services col2 -->
+          <line class="arrow" x1="150" y1="220" x2="203" y2="70" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"></line>
+          <line class="arrow" x1="150" y1="220" x2="203" y2="120" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"></line>
+          <line class="arrow" x1="150" y1="222" x2="203" y2="170" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"></line>
+          <line class="arrow" x1="150" y1="228" x2="203" y2="270" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"></line>
+          <line class="arrow" x1="150" y1="230" x2="203" y2="320" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"></line>
+          <line class="arrow" x1="150" y1="232" x2="203" y2="370" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"></line>
+          <!-- col2 services → col3 engines -->
+          <line class="arrow" x1="333" y1="55" x2="393" y2="55" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"></line>
+          <line class="arrow" x1="333" y1="110" x2="393" y2="120" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"></line>
+          <line class="arrow" x1="333" y1="160" x2="393" y2="180" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"></line>
+          <line class="arrow" x1="333" y1="270" x2="393" y2="240" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"></line>
+          <line class="arrow" x1="333" y1="120" x2="393" y2="300" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"></line>
+          <!-- col3 engines → col4 strategies (dashed = uses/impl) -->
+          <line class="arrow" x1="475" y1="60" x2="620" y2="60" stroke="var(--muted)" stroke-width="2" stroke-dasharray="4 3" marker-end="url(#ah)"></line>
+          <line class="arrow" x1="475" y1="180" x2="620" y2="140" stroke="var(--muted)" stroke-width="2" stroke-dasharray="4 3" marker-end="url(#ah)"></line>
+          <line class="arrow" x1="475" y1="240" x2="620" y2="200" stroke="var(--muted)" stroke-width="2" stroke-dasharray="4 3" marker-end="url(#ah)"></line>
+          <line class="arrow" x1="475" y1="300" x2="620" y2="260" stroke="var(--muted)" stroke-width="2" stroke-dasharray="4 3" marker-end="url(#ah)"></line>
+          <line class="arrow" x1="475" y1="120" x2="620" y2="380" stroke="var(--muted)" stroke-width="2" stroke-dasharray="4 3" marker-end="url(#ah)"></line>
+          <line class="arrow" x1="475" y1="120" x2="620" y2="430" stroke="var(--muted)" stroke-width="2" stroke-dasharray="4 3" marker-end="url(#ah)"></line>
+          <!-- MessageQueueService → MetricsService  (col1 down) -->
+          <line class="arrow" x1="85" y1="250" x2="85" y2="290" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"></line>
+          <!-- MetricsService → Domain models  (col1 down) -->
+          <line class="arrow" x1="85" y1="332" x2="85" y2="360" stroke="var(--muted)" stroke-width="2" stroke-dasharray="4 3" marker-end="url(#ah)"></line>
+          <!-- Services col2 → Repositories block  (dashed, "reads/writes via") -->
+          <line class="arrow" x1="270" y1="257" x2="270" y2="410" stroke="var(--muted)" stroke-width="2" stroke-dasharray="4 3" marker-end="url(#ah)"></line>
+          <!-- Coordinator (col3) → Repositories block -->
+          <line class="arrow" x1="460" y1="322" x2="460" y2="410" stroke="var(--muted)" stroke-width="2" stroke-dasharray="4 3" marker-end="url(#ah)"></line>
+
+          <text x="94" y="95" fill="var(--faint)" font-size="9">wires</text>
+          <text x="94" y="185" fill="var(--faint)" font-size="9">Facade</text>
+          <text x="94" y="278" fill="var(--faint)" font-size="9">metrics</text>
+          <text x="278" y="335" fill="var(--faint)" font-size="9">persist</text>
+
+          <!-- ============ Column 1: entry ============ -->
+          <g data-node style="cursor:pointer" data-title="AppConfig  (composition root)" data-detail="<b>Role:</b> the ONLY place where <code>new ConcreteClass()</code> appears. Poor-man's DI container / Factory + Singleton.<br><b>Layers, lazy-initialised:</b> (0) 4 repos — Topic, ConsumerGroup, Broker, Offset. (1) 4 engines — PartitionManager, ConsumerGroupCoordinator, MessageRouter, ReplicationEngine(RF=3). (2) 3 strategies with defaults — HashPartitioning, AtLeastOnceDelivery, TimeBasedRetention. (3) 7 services + MessageQueueService FACADE. (4) MessageQueueController + StatsDisplay.<br><b>Strategy setters</b> null out downstream services so the graph rebuilds on next access."><rect x="20" y="26" width="130" height="44" rx="9" fill="var(--panel-2)" stroke="var(--eden)"></rect><text x="85" y="46" text-anchor="middle" fill="var(--eden)" font-size="12" font-weight="600">AppConfig</text><text x="85" y="59" text-anchor="middle" fill="var(--faint)" font-size="10">composition root</text></g>
+
+          <g data-node style="cursor:pointer" data-title="MessageQueueController" data-detail="<b>Role:</b> framework-free stand-in for a Spring @RestController.<br><b>Handlers:</b> createTopic, produce, consume (poll), commit, subscribe, unsubscribe, getLag, dashboard.<br>Delegates directly to the <code>MessageQueueService</code> facade — no business logic here."><rect x="20" y="110" width="130" height="44" rx="9" fill="var(--panel-2)" stroke="var(--border)"></rect><text x="85" y="130" text-anchor="middle" fill="var(--text)" font-size="12" font-weight="600">MessageQueueController</text><text x="85" y="145" text-anchor="middle" fill="var(--faint)" font-size="10">REST endpoints</text></g>
+
+          <g data-node style="cursor:pointer" data-title="MessageQueueService  «Facade»" data-detail="<b>Role:</b> unified entry point orchestrating the 6 leaf services: TopicService, ProducerService, ConsumerService, BrokerService, RetentionService, MetricsService.<br><b>Facade pattern:</b> the only object visible outside the queue module. Everything else — engines, strategies, repos — is internal wiring.<br>Methods like <code>send(topic, key, value, ackMode)</code>, <code>poll(...)</code>, <code>createTopic(...)</code> compose 2–3 leaf-service calls."><rect x="20" y="200" width="130" height="50" rx="9" fill="var(--panel-2)" stroke="var(--border)"></rect><text x="85" y="222" text-anchor="middle" fill="var(--text)" font-size="12" font-weight="600">MessageQueueService</text><text x="85" y="237" text-anchor="middle" fill="var(--faint)" font-size="10">«Facade»</text></g>
+
+          <g data-node style="cursor:pointer" data-title="MetricsService + StatsDisplay" data-detail="<b>MetricsService:</b> per-topic <code>QueueMetrics</code> counters — messagesIn, messagesOut, byte counts, produce rate. Called by Producer/ConsumerService on every op. Standalone (no deps).<br><b>MessageQueueStatsDisplay:</b> formatted console dashboard — brokers alive, per-topic throughput, lag by group."><rect x="20" y="290" width="130" height="42" rx="9" fill="var(--panel-2)" stroke="var(--border)"></rect><text x="85" y="310" text-anchor="middle" fill="var(--text)" font-size="12" font-weight="600">MetricsService</text><text x="85" y="324" text-anchor="middle" fill="var(--faint)" font-size="10">+ StatsDisplay</text></g>
+
+          <g data-node style="cursor:pointer" data-title="Domain models" data-detail="<b>Message</b> — Builder pattern (topic, value required; key/headers/partition optional). offset assigned by CommitLog.append at write time. UUID id, Instant timestamp.<br><b>Topic</b> — name, partitionCount, replicationFactor, retentionMs, config.<br><b>Partition</b> — topicName, partitionId, leaderId, replicaIds, <b>inSyncReplicaIds (ISR)</b>. addToIsr / removeFromIsr / isLeader.<br><b>ConsumerGroup</b> — members Map, assignments Map, subscribedTopics set.<br><b>Offset</b> — (groupId, topic, partitionId, committedOffset, lastCommitTime).<br><b>BrokerNode</b> — brokerId, host, port, isController, partitionLeadership set, lastHeartbeat.<br>Enums: <b>AckMode</b> (NONE 0, LEADER 1, ALL −1), <b>DeliveryGuarantee</b> (AT_MOST/LEAST_ONCE, EXACTLY_ONCE).<br>+ ConsumerRecord, ProducerRecord, MessageBatch, PartitionAssignment, ConsumerInstance, QueueMetrics, RetentionPolicy."><rect x="20" y="360" width="150" height="42" rx="9" fill="var(--panel-2)" stroke="var(--warn)"></rect><text x="95" y="380" text-anchor="middle" fill="var(--warn)" font-size="12" font-weight="600">Domain models</text><text x="95" y="394" text-anchor="middle" fill="var(--faint)" font-size="10">Message · Topic · Partition · …</text></g>
+
+          <!-- ============ Column 2: services ============ -->
+          <g data-node style="cursor:pointer" data-title="TopicService" data-detail="<b>Role:</b> topic lifecycle. <code>createTopic(name, partitionCount, replicationFactor)</code>: validate unique name + partitions ≥ 1 → build <code>Topic</code> with retentionMs=7d → <code>topicRepository.save</code> → loop <code>partitionManager.createPartition(name, i)</code> for i in [0, partitionCount). Also delete, findByName, listAll."><rect x="205" y="30" width="130" height="42" rx="9" fill="var(--panel-2)" stroke="var(--border)"></rect><text x="270" y="50" text-anchor="middle" fill="var(--text)" font-size="12" font-weight="600">TopicService</text><text x="270" y="64" text-anchor="middle" fill="var(--faint)" font-size="10">create · delete</text></g>
+
+          <g data-node style="cursor:pointer" data-title="ProducerService  (write path)" data-detail="<b>Role:</b> WRITE-PATH orchestrator. <code>send(record, ackMode)</code>: (1) <code>topicRepo.findByName</code> → get partitionCount, (2) <b>resolvePartition</b> — explicit ▸ <code>partitioningStrategy.assignPartition(key, count)</code>, (3) <code>partitionManager.getPartition(topic, part)</code> → CommitLog, (4) build via <code>Message.Builder(topic, value).key(k).partition(p).headers(h).build()</code>, (5) <code>commitLog.append(msg)</code> — assigns offset, (6) <code>replicationEngine.replicate(msg, partition, ackMode)</code>, (7) return offset.<br>Also <code>sendBatch</code> for I/O efficiency."><rect x="205" y="85" width="130" height="52" rx="9" fill="var(--panel-2)" stroke="var(--border)"></rect><text x="270" y="107" text-anchor="middle" fill="var(--text)" font-size="12" font-weight="600">ProducerService</text><text x="270" y="122" text-anchor="middle" fill="var(--faint)" font-size="10">send · sendBatch</text></g>
+
+          <g data-node style="cursor:pointer" data-title="ConsumerService  (read path)" data-detail="<b>Role:</b> READ-PATH orchestrator. Three flows:<br><b>poll(groupId, topic, part, max)</b> — <code>coordinator.getCommittedOffset</code> → <code>commitLog.read(offset, max)</code> → map <code>Message → ConsumerRecord</code> (immutable). Does NOT advance offset.<br><b>commit(groupId, topic, part, offset)</b> — <code>coordinator.commitOffset(...)</code>.<br><b>subscribe(groupId, consumerId, topic, partitionCount)</b> — create group if absent → subscribe → <code>joinGroup</code> → <code>rebalance</code>.<br><b>getLag</b> — <code>commitLog.getLatestOffset() − committedOffset</code>."><rect x="205" y="150" width="130" height="52" rx="9" fill="var(--panel-2)" stroke="var(--border)"></rect><text x="270" y="172" text-anchor="middle" fill="var(--text)" font-size="12" font-weight="600">ConsumerService</text><text x="270" y="187" text-anchor="middle" fill="var(--faint)" font-size="10">poll · commit · subscribe</text></g>
+
+          <g data-node style="cursor:pointer" data-title="BrokerService" data-detail="<b>Role:</b> cluster membership + controller election.<br><code>registerBroker(brokerId, host, port)</code>, <code>heartbeat</code>, <code>markDead</code>, <code>findAlive(timeout)</code>.<br><b>electController():</b> clear existing controller flag → get alive brokers → pick <code>min by brokerId</code> → set isController=true. Deterministic; production uses KRaft Raft election or ZK ephemeral znodes."><rect x="205" y="215" width="130" height="42" rx="9" fill="var(--panel-2)" stroke="var(--border)"></rect><text x="270" y="235" text-anchor="middle" fill="var(--text)" font-size="12" font-weight="600">BrokerService</text><text x="270" y="249" text-anchor="middle" fill="var(--faint)" font-size="10">controller election</text></g>
+
+          <g data-node style="cursor:pointer" data-title="RetentionService" data-detail="<b>Role:</b> background cleaner — periodically walks every partition's CommitLog and applies the injected <code>StorageStrategy</code>.<br><b>runCleanup:</b> <code>storageStrategy.shouldRetain(msg, retentionMs)</code> per message → <code>commitLog.truncateBefore(offset)</code> of the first survivor.<br><b>runCompaction:</b> <code>storageStrategy.compact(messages)</code> — LogCompactionStrategy returns latest-per-key.<br>In production this runs on a segment cadence (delete whole segment files) rather than per-message."><rect x="205" y="270" width="130" height="42" rx="9" fill="var(--panel-2)" stroke="var(--border)"></rect><text x="270" y="290" text-anchor="middle" fill="var(--text)" font-size="12" font-weight="600">RetentionService</text><text x="270" y="304" text-anchor="middle" fill="var(--faint)" font-size="10">cleanup · compaction</text></g>
+
+          <g data-node style="cursor:pointer" data-title="Repositories  «interfaces» + InMemory impls" data-detail="<b>4 contracts:</b> <code>TopicRepository</code>, <code>ConsumerGroupRepository</code>, <code>BrokerRepository</code>, <code>OffsetRepository</code>.<br><b>InMemory impls</b> all use <code>ConcurrentHashMap</code>. Swap for persistent stores without touching services:<br>— TopicRepository → KRaft / ZooKeeper<br>— ConsumerGroupRepository + OffsetRepository → the compacted <code>__consumer_offsets</code> topic<br>— BrokerRepository → KRaft heartbeats"><rect x="205" y="410" width="330" height="42" rx="9" fill="var(--panel-2)" stroke="var(--survivor)"></rect><text x="370" y="430" text-anchor="middle" fill="var(--survivor)" font-size="12" font-weight="600">Repositories (Topic · ConsumerGroup · Broker · Offset)</text><text x="370" y="444" text-anchor="middle" fill="var(--faint)" font-size="10">«interfaces» · InMemory impls</text></g>
+
+          <!-- ============ Column 3: engines ============ -->
+          <g data-node style="cursor:pointer" data-title="PartitionManager" data-detail="<b>Role:</b> single source of truth for CommitLog lifecycle.<br><b>Storage:</b> <code>Map&lt;String, CommitLog&gt;</code> keyed by <code>&quot;topic-partitionId&quot;</code> (ConcurrentHashMap).<br><b>createPartition(topic, partId)</b> — <code>putIfAbsent(new CommitLog(topic, partId))</code>, idempotent.<br><b>getPartition</b> → Optional&lt;CommitLog&gt;. <b>getPartitionsForTopic</b> — scan and filter by topic name."><rect x="395" y="34" width="130" height="42" rx="9" fill="var(--panel-2)" stroke="var(--survivor)"></rect><text x="460" y="54" text-anchor="middle" fill="var(--survivor)" font-size="12" font-weight="600">PartitionManager</text><text x="460" y="68" text-anchor="middle" fill="var(--faint)" font-size="10">CommitLog registry</text></g>
+
+          <g data-node style="cursor:pointer" data-title="CommitLog  — the core data structure" data-detail="<b>The single most important class.</b> Append-only per partition.<br><b>Fields:</b> <code>List&lt;Message&gt; log</code>, <code>AtomicLong currentOffset</code>.<br><b>append(msg)</b> — <code>synchronized</code>. <code>offset = currentOffset.getAndIncrement(); msg.setOffset(offset); log.add(msg);</code> → returns offset. O(1) amortised.<br><b>read(fromOffset, max)</b> — bounds-check; <code>log.subList(from, min(from+max, size))</code>. O(1) seek + O(k) copy.<br><b>getLatestOffset</b> = high watermark. <b>getEarliestOffset</b> = first surviving message (0 or higher after retention).<br><b>truncateBefore(offset)</b> — <code>log.removeIf(m -&gt; m.getOffset() &lt; offset)</code>.<br>Production: segment files, sparse index, page cache, zero-copy sendfile()."><rect x="395" y="90" width="130" height="52" rx="9" fill="var(--panel-2)" stroke="var(--old)"></rect><text x="460" y="112" text-anchor="middle" fill="var(--old)" font-size="12" font-weight="600">CommitLog</text><text x="460" y="127" text-anchor="middle" fill="var(--faint)" font-size="10">append · read · O(1)</text></g>
+
+          <g data-node style="cursor:pointer" data-title="MessageRouter  (partition cascade)" data-detail="<b>Role:</b> resolve ProducerRecord → target partition.<br><b>Cascade in routeToPartition():</b><br>1) <code>if (record.getPartition() &gt;= 0) return record.getPartition()</code> — explicit override.<br>2) <code>if (key != null) return Math.abs(key.hashCode()) % partitionCount</code> — per-key ordering.<br>3) <code>Math.abs(counter.getAndIncrement()) % partitionCount</code> — round-robin via AtomicInteger.<br>Mirrors Kafka's <code>DefaultPartitioner</code> (which uses Murmur2 in prod)."><rect x="395" y="160" width="130" height="42" rx="9" fill="var(--panel-2)" stroke="var(--survivor)"></rect><text x="460" y="180" text-anchor="middle" fill="var(--survivor)" font-size="12" font-weight="600">MessageRouter</text><text x="460" y="194" text-anchor="middle" fill="var(--faint)" font-size="10">explicit ▸ hash ▸ RR</text></g>
+
+          <g data-node style="cursor:pointer" data-title="ReplicationEngine  (ISR + ack modes)" data-detail="<b>Role:</b> simulate replication per <code>AckMode</code>.<br><b>replicate(msg, partition, ackMode)</b>:<br>— <b>NONE</b> — return true immediately (fire-and-forget).<br>— <b>LEADER</b> — leader ack only, return true.<br>— <b>ALL</b> — for each broker in <code>partition.getInSyncReplicaIds()</code> await ack. If <code>isr.size &lt; replicationFactor</code> log WARNING (data durability at risk).<br>Constructor: <code>new ReplicationEngine(3)</code> in AppConfig — RF=3."><rect x="395" y="220" width="130" height="42" rx="9" fill="var(--panel-2)" stroke="var(--survivor)"></rect><text x="460" y="240" text-anchor="middle" fill="var(--survivor)" font-size="12" font-weight="600">ReplicationEngine</text><text x="460" y="254" text-anchor="middle" fill="var(--faint)" font-size="10">acks 0 / 1 / all</text></g>
+
+          <g data-node style="cursor:pointer" data-title="ConsumerGroupCoordinator" data-detail="<b>Role:</b> group lifecycle + rebalance + offset tracking.<br><b>State:</b> <code>Map&lt;groupId, ConsumerGroup&gt; groups</code>; <code>Map&lt;&quot;groupId-topic-partition&quot;, Long&gt; committedOffsets</code>.<br><b>createGroup / joinGroup / leaveGroup</b> — mutate the group.<br><b>rebalance(groupId, partitionCount)</b> — <b>range assignment</b>: sort consumerIds, <code>perConsumer = count / M</code>, first <code>count % M</code> get one extra.<br><b>commitOffset · getCommittedOffset · getLag(latestOffset − committed)</b>."><rect x="395" y="280" width="130" height="42" rx="9" fill="var(--panel-2)" stroke="var(--survivor)"></rect><text x="460" y="300" text-anchor="middle" fill="var(--survivor)" font-size="12" font-weight="600">ConsumerGroupCoordinator</text><text x="460" y="314" text-anchor="middle" fill="var(--faint)" font-size="10">rebalance · offsets</text></g>
+
+          <!-- ============ Column 4: strategies ============ -->
+          <g data-node style="cursor:pointer" data-title="PartitioningStrategy  «interface»" data-detail="<b>Contract:</b> <code>int assignPartition(String key, int partitionCount)</code>, <code>String getStrategyName()</code>.<br><b>2 impls:</b> <code>HashPartitioningStrategy</code> — <code>Math.abs(key.hashCode()) % count</code>, deterministic per-key ordering. <code>RoundRobinPartitioningStrategy</code> — <code>AtomicInteger counter.getAndIncrement() % count</code>, key ignored, max throughput.<br>ProducerService depends only on this interface — swap at runtime via <code>AppConfig.setPartitioningStrategy()</code>."><rect x="620" y="34" width="130" height="52" rx="9" fill="var(--panel-2)" stroke="var(--old)"></rect><text x="685" y="54" text-anchor="middle" fill="var(--old)" font-size="12" font-weight="600">PartitioningStrategy</text><text x="685" y="69" text-anchor="middle" fill="var(--faint)" font-size="10">Hash · RoundRobin</text></g>
+
+          <g data-node style="cursor:pointer" data-title="DeliveryStrategy  «interface»" data-detail="<b>Contract:</b> <code>boolean deliver(Message msg, String consumerId)</code>, <code>DeliveryGuarantee getGuarantee()</code>, <code>String getStrategyName()</code>.<br><b>2 impls:</b><br>— <b>AtLeastOnceDeliveryStrategy</b> — retry loop up to <code>MAX_RETRIES=3</code>; simulated <code>FAILURE_RATE=0.05</code>. Duplicates possible.<br>— <b>ExactlyOnceDeliveryStrategy</b> — <code>Set&lt;String&gt; deliveredIds</code> (ConcurrentHashMap.newKeySet()); <code>if contains(msg.id) skip; else add+deliver</code>. Idempotent consumer dedup."><rect x="620" y="110" width="130" height="60" rx="9" fill="var(--panel-2)" stroke="var(--old)"></rect><text x="685" y="132" text-anchor="middle" fill="var(--old)" font-size="12" font-weight="600">DeliveryStrategy</text><text x="685" y="147" text-anchor="middle" fill="var(--faint)" font-size="10">AtLeastOnce · ExactlyOnce</text></g>
+
+          <g data-node style="cursor:pointer" data-title="StorageStrategy  «interface»" data-detail="<b>Contract:</b> <code>boolean shouldRetain(Message msg, long retentionMs)</code>, <code>List&lt;Message&gt; compact(List&lt;Message&gt; msgs)</code>.<br><b>2 impls:</b><br>— <b>TimeBasedRetentionStrategy</b> — <code>now − msg.timestamp &lt;= retentionMs</code>. Default 7 d.<br>— <b>LogCompactionStrategy</b> — group by key, keep highest-offset entry per key. Null-key messages ALWAYS retained. Used for changelogs, CDC, materialized views, <code>__consumer_offsets</code>."><rect x="620" y="190" width="130" height="60" rx="9" fill="var(--panel-2)" stroke="var(--old)"></rect><text x="685" y="212" text-anchor="middle" fill="var(--old)" font-size="12" font-weight="600">StorageStrategy</text><text x="685" y="227" text-anchor="middle" fill="var(--faint)" font-size="10">TimeBased · LogCompaction</text></g>
+
+          <g data-node style="cursor:pointer" data-title="Message.Builder  «Builder»" data-detail="<b>Role:</b> constructs the 9-field Message safely.<br><b>Required:</b> topic, value (constructor). <b>Optional:</b> key, headers, partition, producerId (fluent setters).<br><b>build()</b> — stamps <code>id = UUID.randomUUID().toString()</code>, <code>timestamp = Instant.now()</code>, <code>offset = -1</code> (broker assigns), returns immutable Message.<br>Used by ProducerService.send() and demos."><rect x="620" y="270" width="130" height="42" rx="9" fill="var(--panel-2)" stroke="var(--warn)"></rect><text x="685" y="290" text-anchor="middle" fill="var(--warn)" font-size="12" font-weight="600">Message.Builder</text><text x="685" y="304" text-anchor="middle" fill="var(--faint)" font-size="10">«Builder»</text></g>
+
+          <g data-node style="cursor:pointer" data-title="AckMode  · DeliveryGuarantee  «enums»" data-detail="<b>AckMode:</b> <code>NONE(0)</code>, <code>LEADER(1)</code>, <code>ALL(-1)</code> — matches Kafka's acks config. Consumed by ReplicationEngine.<br><b>DeliveryGuarantee:</b> <code>AT_MOST_ONCE</code>, <code>AT_LEAST_ONCE</code>, <code>EXACTLY_ONCE</code>. Returned by <code>DeliveryStrategy.getGuarantee()</code>."><rect x="620" y="360" width="130" height="42" rx="9" fill="var(--panel-2)" stroke="var(--warn)"></rect><text x="685" y="380" text-anchor="middle" fill="var(--warn)" font-size="12" font-weight="600">AckMode · Guarantee</text><text x="685" y="394" text-anchor="middle" fill="var(--faint)" font-size="10">«enums»</text></g>
+
+          <g data-node style="cursor:pointer" data-title="RetentionPolicy  · CleanupPolicy" data-detail="<b>RetentionPolicy:</b> retentionMs, retentionBytes, cleanupPolicy.<br><b>CleanupPolicy enum:</b> <code>DELETE</code> (time/size), <code>COMPACT</code> (latest per key), <code>COMPACT_DELETE</code> (both — compact first, then delete old segments). Kafka setting: <code>cleanup.policy=compact,delete</code>."><rect x="620" y="410" width="130" height="42" rx="9" fill="var(--panel-2)" stroke="var(--warn)"></rect><text x="685" y="430" text-anchor="middle" fill="var(--warn)" font-size="12" font-weight="600">RetentionPolicy</text><text x="685" y="444" text-anchor="middle" fill="var(--faint)" font-size="10">DELETE · COMPACT · both</text></g>
+
+        </svg>
+      </div>
+      <div class="node-detail"><span class="nd-title">Click any class</span><div class="nd-body">Its responsibility, key methods, and how it is wired appear here. Dashed arrows are <i>implements</i> / <i>uses</i>; solid arrows are core wiring. Notice that services depend only on the <b>«interface»</b> boxes (PartitioningStrategy, DeliveryStrategy, StorageStrategy, Repositories) — that's what makes the partitioner, delivery guarantee, retention mode, and every persistence backend swappable via a setter on <code>AppConfig</code>.</div></div>
+    </div>
+  </section>
+
+  <!-- B · COMMIT LOG DEEP DIVE -->
+  <section>
+    <div class="sec-h"><span class="n">B</span><h2>The CommitLog — verbatim</h2><span class="tag">the single most important class</span></div>
+    <div class="grid g2">
+      <div class="card">
+        <div class="kicker">the code (append + read, from CommitLog.java)</div>
+        <pre class="code"><span class="kw">public class</span> <span class="ty">CommitLog</span> {
+  <span class="kw">private final</span> String topicName;
+  <span class="kw">private final int</span> partitionId;
+  <span class="kw">private final</span> List&lt;Message&gt; log;                <span class="cm">// append-only</span>
+  <span class="kw">private final</span> AtomicLong currentOffset;         <span class="cm">// next offset</span>
+
+  <span class="kw">public synchronized long</span> <span class="ty">append</span>(Message msg) {
+    <span class="kw">long</span> assigned = currentOffset.getAndIncrement();
+    msg.setOffset(assigned);
+    log.add(msg);
+    <span class="kw">return</span> assigned;                              <span class="cm">// O(1)</span>
+  }
+
+  <span class="kw">public synchronized</span> List&lt;Message&gt; <span class="ty">read</span>(
+          <span class="kw">long</span> fromOffset, <span class="kw">int</span> maxMessages) {
+    <span class="kw">if</span> (fromOffset &lt; 0 || fromOffset &gt;= log.size()
+        || maxMessages &lt;= 0) <span class="kw">return</span> emptyList();
+    <span class="kw">int</span> start = (<span class="kw">int</span>) fromOffset;
+    <span class="kw">int</span> end   = Math.min(start + maxMessages, log.size());
+    <span class="kw">return new</span> ArrayList&lt;&gt;(log.subList(start, end));
+  }
+
+  <span class="kw">public synchronized void</span> <span class="ty">truncateBefore</span>(<span class="kw">long</span> offset) {
+    log.removeIf(m -&gt; m.getOffset() &lt; offset);         <span class="cm">// retention</span>
+  }
+}</pre>
+      </div>
+      <div class="card">
+        <div class="kicker">why this shape</div>
+        <ul class="tight">
+          <li><b>Append-only</b> ⇒ pure sequential I/O. Sequential HDD ~600 MB/s vs random ~100 KB/s = <b>6000×</b>.</li>
+          <li><b>AtomicLong offset</b> ⇒ every message gets a strictly monotonic 64-bit id, no coordination beyond <code>synchronized</code> on the log.</li>
+          <li><b>Bounds-checked read</b> — no exception on past-tail reads; consumers poll an empty list and back off.</li>
+          <li><b>subList</b> = O(1) seek + O(k) copy. Production: sparse index maps offset → segment file byte position (~4 B per 4 KB batch).</li>
+          <li><b>truncateBefore</b> here uses <code>removeIf</code> (O(n)); production deletes whole segment files (O(1) per segment).</li>
+          <li><b>The log is the database of record</b> — nothing external stores the messages themselves. Only metadata (KRaft) and offsets (<code>__consumer_offsets</code> compacted topic) live outside the log.</li>
+          <li><b>Zero-copy consume</b> in prod — <code>sendfile()</code> shovels bytes from page cache → NIC without user-space copy or JVM heap allocation.</li>
+        </ul>
+      </div>
+    </div>
+    <div class="callout tip"><b>Complexity summary:</b> <code>append</code> O(1) · <code>read(fromOffset, k)</code> O(k) · <code>getLatestOffset</code> O(1) · <code>getEarliestOffset</code> O(1) · <code>truncateBefore</code> O(n) in-memory / O(segments) on-disk.</div>
+  </section>
+
+  <!-- C · PARTITION CASCADE + STRATEGIES -->
+  <section>
+    <div class="sec-h"><span class="n">C</span><h2>Partition routing cascade &amp; strategies</h2><span class="tag">Strategy pattern × 3</span></div>
+    <div data-tabscope>
+      <div class="tabs">
+        <button class="tab active" data-tab="hash">HashPartitioningStrategy</button>
+        <button class="tab" data-tab="rr">RoundRobinPartitioningStrategy</button>
+        <button class="tab" data-tab="router">MessageRouter cascade</button>
+      </div>
+      <div class="tabpanel active" data-panel="hash">
+        <div class="grid g2">
+          <div class="card">
+            <div class="kicker">code (verbatim)</div>
+            <pre class="code"><span class="kw">public class</span> <span class="ty">HashPartitioningStrategy</span>
+    <span class="kw">implements</span> PartitioningStrategy {
+
+  <span class="kw">public int</span> <span class="ty">assignPartition</span>(String key, <span class="kw">int</span> count) {
+    <span class="kw">if</span> (key == <span class="kw">null</span>) <span class="kw">return</span> 0;
+    <span class="kw">return</span> Math.abs(key.hashCode()) % count;
+  }
+}</pre>
+          </div>
+          <div class="card">
+            <div class="kicker">semantics</div>
+            <ul class="tight">
+              <li><b>Same key → same partition</b>, always. This is the whole reason for keys.</li>
+              <li>All events for <code>userId=alice</code> land in one partition ⇒ per-user ordering.</li>
+              <li>Uses Java <code>hashCode</code>; Kafka uses <b>Murmur2</b> for better distribution.</li>
+              <li><b>Failure mode:</b> hot key (viral user, one product) ⇒ hot partition. Salt the key or pick a compound key.</li>
+              <li><b>Cannot change partition count</b> after creation without breaking the mapping.</li>
+            </ul>
+          </div>
+        </div>
+      </div>
+      <div class="tabpanel" data-panel="rr">
+        <div class="grid g2">
+          <div class="card">
+            <div class="kicker">code (verbatim)</div>
+            <pre class="code"><span class="kw">public class</span> <span class="ty">RoundRobinPartitioningStrategy</span>
+    <span class="kw">implements</span> PartitioningStrategy {
+
+  <span class="kw">private final</span> AtomicInteger counter = <span class="kw">new</span> AtomicInteger(0);
+
+  <span class="kw">public int</span> <span class="ty">assignPartition</span>(String key, <span class="kw">int</span> count) {
+    <span class="kw">return</span> Math.abs(counter.getAndIncrement() % count);
+  }
+}</pre>
+          </div>
+          <div class="card">
+            <div class="kicker">semantics</div>
+            <ul class="tight">
+              <li><b>Even distribution</b>, key IGNORED (even if present).</li>
+              <li><b>Max throughput</b> — all partitions equally loaded.</li>
+              <li><b>NO ordering</b> — two events for the same entity may land on different partitions.</li>
+              <li><b>Use for</b> metrics collection, log aggregation, load-testing producers. Anywhere ordering ≺ throughput.</li>
+            </ul>
+          </div>
+        </div>
+      </div>
+      <div class="tabpanel" data-panel="router">
+        <div class="grid g2">
+          <div class="card">
+            <div class="kicker">code (from MessageRouter.routeToPartition)</div>
+            <pre class="code"><span class="cm">// Strategy 1 — explicit partition wins</span>
+<span class="kw">if</span> (record.getPartition() &gt;= 0)
+    <span class="kw">return</span> record.getPartition();
+
+<span class="cm">// Strategy 2 — key-based hash</span>
+<span class="kw">if</span> (record.getKey() != <span class="kw">null</span>)
+    <span class="kw">return</span> Math.abs(record.getKey().hashCode()) % partitionCount;
+
+<span class="cm">// Strategy 3 — round-robin fallback</span>
+<span class="kw">return</span> Math.abs(roundRobinCounter.getAndIncrement()) % partitionCount;</pre>
+          </div>
+          <div class="card">
+            <div class="kicker">why a cascade</div>
+            <ul class="tight">
+              <li><b>Explicit ▸ key ▸ RR</b> — most-specific first, most-general last.</li>
+              <li>Producers rarely set explicit partition — reserved for tests, replay, and rack-aware placement.</li>
+              <li>Key handling here duplicates <code>HashPartitioningStrategy</code> — <b>this is Kafka's DefaultPartitioner logic</b>, kept inside the router so plain <code>ProducerRecord</code> routing works without swapping strategies.</li>
+              <li>Round-robin uses its own <code>AtomicInteger</code> counter — no shared state with the standalone <code>RoundRobinPartitioningStrategy</code>.</li>
+            </ul>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- D · DELIVERY GUARANTEES -->
+  <section>
+    <div class="sec-h"><span class="n">D</span><h2>Delivery strategies — retries &amp; exactly-once</h2><span class="tag">DeliveryStrategy</span></div>
+    <div data-tabscope>
+    <div class="tabs">
+      <button class="tab active" data-tab="alo">AtLeastOnceDeliveryStrategy</button>
+      <button class="tab" data-tab="eo">ExactlyOnceDeliveryStrategy</button>
+      <button class="tab" data-tab="cmp">Comparison</button>
+    </div>
+    <div class="tabpanel active" data-panel="alo">
+      <div class="grid g2">
+        <div class="card">
+          <div class="kicker">code (verbatim)</div>
+          <pre class="code"><span class="kw">private static final int</span> MAX_RETRIES = 3;
+<span class="kw">private static final double</span> FAILURE_RATE = 0.05;
+
+<span class="kw">public boolean</span> <span class="ty">deliver</span>(Message msg, String consumerId) {
+  <span class="kw">for</span> (<span class="kw">int</span> attempt = 1; attempt &lt;= MAX_RETRIES; attempt++) {
+    <span class="kw">boolean</span> acked = ThreadLocalRandom.current().nextDouble() &gt;= FAILURE_RATE;
+    <span class="kw">if</span> (acked) <span class="kw">return true</span>;                      <span class="cm">// success</span>
+    <span class="cm">// no ack → retry; the consumer may see duplicates</span>
+  }
+  <span class="kw">return false</span>;                                    <span class="cm">// all attempts failed</span>
+}</pre>
+        </div>
+        <div class="card">
+          <div class="kicker">semantics</div>
+          <ul class="tight">
+            <li><b>Default guarantee.</b> Commit AFTER processing.</li>
+            <li>Retry until acked or MAX_RETRIES exhausted. Duplicates on retry are the consumer's problem.</li>
+            <li><b>Consumer must be idempotent</b> — dedup by <code>message.id</code> or database unique constraint.</li>
+            <li>Common pattern: consumer writes to a table with <code>UNIQUE(msg_id)</code> — duplicate insert fails silently.</li>
+          </ul>
+        </div>
+      </div>
+    </div>
+    <div class="tabpanel" data-panel="eo">
+      <div class="grid g2">
+        <div class="card">
+          <div class="kicker">code (verbatim)</div>
+          <pre class="code"><span class="kw">private final</span> Set&lt;String&gt; deliveredIds =
+    ConcurrentHashMap.newKeySet();
+
+<span class="kw">public boolean</span> <span class="ty">deliver</span>(Message msg, String consumerId) {
+  String id = msg.getId();
+  <span class="kw">if</span> (deliveredIds.contains(id)) {
+    <span class="cm">// DUPLICATE — silently skip (idempotent)</span>
+    <span class="kw">return true</span>;
+  }
+  deliveredIds.add(id);
+  <span class="cm">// first delivery — process it</span>
+  <span class="kw">return true</span>;
+}</pre>
+        </div>
+        <div class="card">
+          <div class="kicker">semantics</div>
+          <ul class="tight">
+            <li><b>Idempotent consumer</b> — dedup by <code>message.id</code> in a Set.</li>
+            <li>In production the Set is <b>Redis</b> (SETNX + TTL) or a DB with a unique constraint — the JVM Set doesn't survive restarts.</li>
+            <li>Combined with Kafka's <b>idempotent producer</b> (producerId + seq number for broker-side dedup) ⇒ end-to-end exactly-once.</li>
+            <li>Kafka's full EOS also adds <b>transactions</b> for atomic read-process-write across topics.</li>
+          </ul>
+        </div>
+      </div>
+    </div>
+    <div class="tabpanel" data-panel="cmp">
+      <table>
+        <thead><tr><th>Guarantee</th><th>Loss?</th><th>Duplicates?</th><th>Cost</th><th>Use for</th></tr></thead>
+        <tbody>
+          <tr><td><b>at-most-once</b> (commit before)</td><td>YES (crash during process)</td><td>NO</td><td>lowest — no retry</td><td>metrics, non-critical telemetry</td></tr>
+          <tr><td><b>at-least-once</b> (default — commit after)</td><td>NO</td><td>YES (on retry)</td><td>retries + idempotent handler</td><td>most workloads — orders, events</td></tr>
+          <tr><td><b>exactly-once</b></td><td>NO</td><td>NO</td><td>dedup store + optional transactions</td><td>payments, financial reconciliation</td></tr>
+        </tbody>
+      </table>
+    </div>
+    </div>
+  </section>
+
+  <!-- E · STORAGE STRATEGIES -->
+  <section>
+    <div class="sec-h"><span class="n">E</span><h2>Storage strategies — retention vs compaction</h2><span class="tag">StorageStrategy</span></div>
+    <div class="grid g2">
+      <div class="card">
+        <div class="kicker">TimeBasedRetentionStrategy (verbatim)</div>
+        <pre class="code"><span class="kw">public boolean</span> <span class="ty">shouldRetain</span>(Message msg, <span class="kw">long</span> retentionMs) {
+  <span class="kw">long</span> ageMs = Instant.now().toEpochMilli()
+             - msg.getTimestamp().toEpochMilli();
+  <span class="kw">return</span> ageMs &lt;= retentionMs;
+}</pre>
+        <p class="muted">Delete-based. Default <code>retentionMs = 604 800 000</code> (7 d). Prod deletes whole segment files, not individual messages.</p>
+      </div>
+      <div class="card">
+        <div class="kicker">LogCompactionStrategy (essence)</div>
+        <pre class="code"><span class="kw">public</span> List&lt;Message&gt; <span class="ty">compact</span>(List&lt;Message&gt; msgs) {
+  List&lt;Message&gt; nullKey    = <span class="kw">new</span> ArrayList&lt;&gt;();
+  Map&lt;String, Message&gt; latest = <span class="kw">new</span> LinkedHashMap&lt;&gt;();
+  <span class="kw">for</span> (Message m : msgs) {
+    <span class="kw">if</span> (m.getKey() == <span class="kw">null</span>) nullKey.add(m);
+    <span class="kw">else</span> {
+      Message existing = latest.get(m.getKey());
+      <span class="kw">if</span> (existing == <span class="kw">null</span> || m.getOffset() &gt; existing.getOffset())
+        latest.put(m.getKey(), m);
+    }
+  }
+  <span class="cm">// null-key messages ALWAYS survive</span>
+  <span class="kw">return</span> concat(nullKey, latest.values());
+}</pre>
+        <p class="muted">Latest-per-key. Offsets are <b>preserved</b>, not renumbered. Tombstone = message with <code>value=null</code> — marks a key for deletion during compaction (retained for <code>delete.retention.ms</code>).</p>
+      </div>
+    </div>
+    <div class="callout"><b>Which one?</b> Time-based for event streams, logs, metrics (bounded by window). Compaction for changelogs, CDC, materialized views, KTables, and <code>__consumer_offsets</code> itself (bounded by unique key count). Combine as <code>cleanup.policy=compact,delete</code> to compact THEN drop old segments.</div>
+  </section>
+
+  <!-- F · REQUEST SEQUENCES -->
+  <section>
+    <div class="sec-h"><span class="n">F</span><h2>Request sequences (call chains)</h2><span class="tag">produce · consume · commit · subscribe</span></div>
+    <div class="grid g2">
+      <div class="card">
+        <div class="kicker">produce (POST /topics/{t}/messages)</div>
+        <pre class="code">Controller.produce
+  → MessageQueueService.send
+    → ProducerService.send(record, ackMode)
+       1. topicRepository.findByName → partitionCount
+       2. resolvePartition(record)          <span class="cm">// explicit ▸ hash ▸ RR</span>
+       3. partitionManager.getPartition     <span class="cm">// CommitLog</span>
+       4. new Message.Builder(topic, val)
+             .key(k).partition(p).headers(h).build()
+       5. commitLog.append(msg)             <span class="cm">// synchronized · O(1)</span>
+                                            <span class="cm">// assigns monotonic offset</span>
+       6. replicationEngine.replicate(msg, partition, ackMode)
+       7. metricsService.recordProduce(topic, msg)
+       8. return offset</pre>
+      </div>
+      <div class="card">
+        <div class="kicker">consume (GET /topics/{t}/messages)</div>
+        <pre class="code">Controller.poll
+  → MessageQueueService.poll
+    → ConsumerService.poll(group, topic, part, max)
+       1. coordinator.getCommittedOffset(g, t, p) → committedOffset
+       2. partitionManager.getPartition(t, p)     → CommitLog
+       3. commitLog.read(committedOffset, max)   <span class="cm">// O(1) seek + O(k) copy</span>
+       4. map Message → ConsumerRecord           <span class="cm">// immutable snapshot</span>
+       5. metricsService.recordConsume(topic, ...)
+       6. return List&lt;ConsumerRecord&gt;            <span class="cm">// offset NOT advanced</span></pre>
+      </div>
+    </div>
+    <div class="grid g2" style="margin-top:14px">
+      <div class="card">
+        <div class="kicker">commit (POST /topics/{t}/commit)</div>
+        <pre class="code">Controller.commit
+  → MessageQueueService.commit
+    → ConsumerService.commit(g, t, p, offset)
+       → coordinator.commitOffset(g, t, p, offset)
+         <span class="cm">// committedOffsets["g-t-p"] = offset</span>
+         <span class="cm">// next poll starts here → at-least-once</span></pre>
+      </div>
+      <div class="card">
+        <div class="kicker">subscribe + rebalance</div>
+        <pre class="code">Controller.subscribe
+  → MessageQueueService.subscribe
+    → ConsumerService.subscribe(g, cId, topic, partitionCount)
+       1. if group absent → coordinator.createGroup(g)
+       2. group.subscribe(topic)
+       3. new ConsumerInstance(cId, g, "localhost")
+       4. coordinator.joinGroup(g, consumer)
+       5. coordinator.rebalance(g, partitionCount)   <span class="cm">// range assign</span>
+          <span class="cm">// sort consumerIds; perConsumer = N/M;</span>
+          <span class="cm">// first (N%M) consumers get one extra partition</span>
+          <span class="cm">// group.setAssignment(cId, List&lt;PartitionAssignment&gt;)</span></pre>
+      </div>
+    </div>
+  </section>
+
+  <!-- G · FILE MAP -->
+  <section>
+    <div class="sec-h"><span class="n">§</span><h2>Source file map</h2><span class="tag">where to look in the repo</span></div>
+    <div class="card">
+      <pre class="code">20-distributed-message-queue/src/main/java/com/systemdesign/messagequeue/
+├── DistributedMessageQueueApp.java           <span class="cm">// main + 12 demos</span>
+├── config/AppConfig.java                     <span class="cm">// composition root · lazy · strategy setters</span>
+├── controller/MessageQueueController.java    <span class="cm">// REST-like facade</span>
+├── display/MessageQueueStatsDisplay.java     <span class="cm">// console dashboard</span>
+├── engine/
+│   ├── CommitLog.java                        <span class="cm">// append-only · THE core</span>
+│   ├── PartitionManager.java                 <span class="cm">// CommitLog registry (ConcurrentHashMap)</span>
+│   ├── MessageRouter.java                    <span class="cm">// partition cascade</span>
+│   ├── ReplicationEngine.java                <span class="cm">// acks 0/1/all · ISR</span>
+│   └── ConsumerGroupCoordinator.java         <span class="cm">// join/leave/rebalance/offsets</span>
+├── service/
+│   ├── TopicService.java · ProducerService.java · ConsumerService.java
+│   ├── BrokerService.java (controller election) · RetentionService.java
+│   ├── MetricsService.java · MessageQueueService.java   <span class="cm">// FACADE</span>
+├── strategy/
+│   ├── partitioning/  Hash · RoundRobin  (impl PartitioningStrategy)
+│   ├── delivery/      AtLeastOnce · ExactlyOnce  (impl DeliveryStrategy)
+│   └── storage/       TimeBasedRetention · LogCompaction  (impl StorageStrategy)
+├── repository/  Topic · ConsumerGroup · Broker · Offset  (interfaces + InMemory impls)
+└── model/  Message(+Builder) · Topic · Partition · ConsumerGroup · Offset · BrokerNode
+         · ConsumerInstance · ConsumerRecord · ProducerRecord · MessageBatch
+         · PartitionAssignment · QueueMetrics · RetentionPolicy
+         · AckMode · DeliveryGuarantee  (enums)</pre>
+    </div>
+    <p class="muted">Design patterns actually present: <b>Strategy × 3</b> (partitioning, delivery, storage), <b>Builder</b> (Message), <b>Factory</b> + <b>Singleton</b> (AppConfig), <b>Repository × 4</b>, <b>Facade</b> (MessageQueueService), <b>Enum-Strategy</b> (AckMode routing inside ReplicationEngine).</p>
+  </section>
+
+  <footer>
+    <p>Use case 20 · Distributed Message Queue — Canvas 2 of 3 (LLD). Grounded in <code>20-distributed-message-queue/src/main/java/com/systemdesign/messagequeue/</code> — every class name, method signature, and constant above appears verbatim in the source.</p>
+    <p class="run"><a href="hld.html">Canvas 1 · HLD</a> · LLD · <a href="deepdive.html">Canvas 3 · Deep-dive &amp; Trade-offs</a> &nbsp;|&nbsp; <a href="../index.html">Hub</a></p>
+  </footer>
+
+</div>
+<script src="../assets/canvas.js"></script>
+</body>
+</html>

@@ -1,0 +1,332 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>12 · News Feed — HLD</title>
+<link rel="stylesheet" href="../assets/canvas.css">
+</head>
+<body>
+<div class="wrap">
+
+  <header class="hero">
+    <h1>News Feed — High-Level Design</h1>
+    <div class="sub">Use case 12 · Canvas 1 of 3. Facebook / LinkedIn / Twitter-scale personalized feed for 1 B users. The big picture: requirements, back-of-envelope numbers, and an <b>interactive architecture</b> — click a component to see its role, then step through the <b>publish</b> and <b>feed-read</b> flows. Star of the interview: <b>hybrid fan-out</b> (push for normals, pull for celebrities) + algorithmic ranking.</div>
+    <div class="badges">
+      <span class="badge lvl">Use case 12 · HLD</span>
+      <span class="badge">Canvas 1 of 3</span>
+      <span class="badge">interactive</span>
+      <span class="badge">AP · read-heavy ~100:1</span>
+      <span class="badge">hybrid fan-out</span>
+    </div>
+    <div class="legend">
+      <span><i class="dot" style="background:var(--eden)"></i> click a component</span>
+      <span><i class="dot" style="background:var(--survivor)"></i> write / publish path</span>
+      <span><i class="dot" style="background:var(--eden)"></i> current step</span>
+      <span><i class="dot" style="background:var(--old)"></i> data stores</span>
+      <span><i class="dot" style="background:var(--warn)"></i> async / off hot-path</span>
+    </div>
+  </header>
+
+  <!-- A · PROBLEM & REQUIREMENTS -->
+  <section>
+    <div class="sec-h"><span class="n">A</span><h2>Problem &amp; requirements</h2><span class="tag">clarify first</span></div>
+    <div class="grid g2">
+      <div class="card">
+        <div class="kicker">functional</div>
+        <ul class="tight">
+          <li><b>Publish a post</b> — text, image, video, link or poll (see <code>ContentType</code>); poster sees their own post immediately.</li>
+          <li><b>Generate feed</b> — personalized, ranked (not pure chronological) merge of posts from friends + celebrities.</li>
+          <li><b>Engagement</b> — like / comment / share; idempotent likes; live counter updates.</li>
+          <li><b>Follow / unfollow</b> — bidirectional social graph; auto-detect celebrities.</li>
+          <li><b>Real-time updates</b> — WebSocket "N new posts available" banner, live engagement counts.</li>
+          <li><b>Infinite scroll</b> — cursor-based pagination (20/page) with gap detection.</li>
+        </ul>
+      </div>
+      <div class="card">
+        <div class="kicker">non-functional</div>
+        <ul class="tight">
+          <li><b>Feed latency</b> p99 &lt; 200 ms — cache-first read path.</li>
+          <li><b>Publish latency</b> p99 &lt; 300 ms (sync); fan-out is async.</li>
+          <li><b>Real-time push</b> p99 &lt; 1 s; fan-out completion p99 &lt; 5 s for normal users.</li>
+          <li><b>Availability</b> 99.99% — a blank feed is worse than a stale one → <b>AP system</b>.</li>
+          <li><b>Consistency</b> — feed eventually consistent (5–10 s OK); social graph strongly consistent (drives fan-out correctness).</li>
+          <li><b>Read : Write ≈ 100 : 1</b> — optimise aggressively for the read path.</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <!-- B · ESTIMATION -->
+  <section>
+    <div class="sec-h"><span class="n">B</span><h2>Back-of-envelope estimation</h2><span class="tag">1 B users · 500 M DAU · avg 300 follows</span></div>
+    <div class="chips">
+      <div class="chip"><span class="k">Post QPS</span><span class="v">~6K/s</span></div>
+      <div class="chip"><span class="k">Post peak</span><span class="v">~17K/s</span></div>
+      <div class="chip"><span class="k">Feed QPS</span><span class="v">~60K/s</span></div>
+      <div class="chip"><span class="k">Feed peak</span><span class="v">~175K/s</span></div>
+      <div class="chip"><span class="k">Impressions</span><span class="v">~50B/day</span></div>
+      <div class="chip"><span class="k">Timeline / user</span><span class="v">~40 KB</span></div>
+      <div class="chip"><span class="k">Timeline cache</span><span class="v">~20 TB</span></div>
+      <div class="chip"><span class="k">Media / day</span><span class="v">~290 TB</span></div>
+      <div class="chip"><span class="k">Celebrity ≥</span><span class="v">1 M followers</span></div>
+      <div class="chip"><span class="k">Celeb count</span><span class="v">~100K users</span></div>
+    </div>
+    <div class="callout tip"><b>Derivation:</b> 500 M DAU × 5 posts/day × 20% active posters ≈ <b>500 M posts/day</b> → 6 K writes/s · reads ≈ 100× ≈ 60 K/s · <b>peak ×3</b>. Timeline cache: 500 entries × ~80 B (postId+score) ≈ 40 KB/user · 500 M DAU ≈ <b>20 TB</b> across ~40 Redis shards. <span class="run">→ full math on canvas 3 &amp; F3 · Estimation</span></div>
+    <div class="callout"><b>The celebrity math that kills pure push:</b> 50 M followers × ZADD @ 100 K/s per pipeline = <b>500 s ≈ 8 min</b> of fan-out per celebrity post. Times 500 K celebrity posts/day = <b>2.5 trillion writes/day</b> just for celebrities. Hybrid eliminates all of them.</div>
+  </section>
+
+  <!-- C · INTERACTIVE ARCHITECTURE -->
+  <section data-flowscope>
+    <div class="sec-h"><span class="n">C</span><h2>Architecture — click components, then step the flows</h2><span class="tag">the design, from the diagram</span></div>
+    <div>
+      <div class="arch">
+        <svg viewBox="0 0 900 480" width="100%" style="max-width:900px" role="img" aria-label="News feed architecture">
+          <defs>
+            <marker id="ah" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" fill="var(--muted)"></path></marker>
+          </defs>
+
+          <!-- arrows (drawn first, under boxes) -->
+          <!-- Client -> API GW -->
+          <line class="arrow" x1="100" y1="60" x2="140" y2="60" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"
+                data-flow="write read" data-write="1" data-read="1"
+                data-desc-write="Client sends POST /api/v1/posts (JWT auth)." data-desc-read="Client sends GET /api/v1/feed?cursor=X&amp;limit=20 (JWT)."></line>
+          <!-- API GW -> LB -->
+          <line class="arrow" x1="238" y1="60" x2="278" y2="60" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"
+                data-flow="write read" data-write="2" data-read="2"
+                data-desc-write="Gateway authenticates + rate-limits (300 posts/day/user)." data-desc-read="Gateway authenticates + rate-limits, routes to Feed Service."></line>
+          <!-- LB -> Post Service (write) -->
+          <line class="arrow" x1="368" y1="52" x2="410" y2="52" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"
+                data-flow="write" data-write="3"
+                data-desc-write="LB routes to any stateless Post Service instance."></line>
+          <!-- LB -> Feed Service (read) -->
+          <line class="arrow" x1="368" y1="88" x2="410" y2="130" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"
+                data-flow="read" data-read="3"
+                data-desc-read="LB routes to any stateless Feed Service instance."></line>
+          <!-- Post Service -> Cassandra -->
+          <line class="arrow" x1="490" y1="72" x2="618" y2="120" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"
+                data-flow="write" data-write="4"
+                data-desc-write="Post Service writes posts + posts_by_id (QUORUM) — durable before ack."></line>
+          <!-- Post Service -> Kafka -->
+          <line class="arrow" x1="490" y1="55" x2="618" y2="55" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"
+                data-flow="write" data-write="5"
+                data-desc-write="Post Service publishes post-event to Kafka topic (key=user_id)."></line>
+          <!-- Post -> Client 201 -->
+          <path class="arrow" d="M446,36 C 300,10 160,10 62,36" fill="none" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"
+                data-flow="write" data-write="6"
+                data-desc-write="201 Created returned to client — sync path done in ~60 ms. Fan-out is async."></path>
+          <!-- Kafka -> Fan-out Service -->
+          <line class="arrow" x1="660" y1="76" x2="660" y2="180" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"
+                data-flow="write" data-write="7"
+                data-desc-write="Fan-out Service (Kafka consumer group) receives the event."></line>
+          <!-- Fan-out -> Social Graph -->
+          <line class="arrow" x1="618" y1="220" x2="518" y2="220" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"
+                data-flow="write" data-write="8"
+                data-desc-write="Fan-out asks Social Graph: is author a celebrity? Get follower IDs."></line>
+          <!-- Fan-out -> Timeline Cache -->
+          <line class="arrow" x1="660" y1="252" x2="660" y2="330" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"
+                data-flow="write" data-write="9"
+                data-desc-write="If NORMAL user (Hybrid): ZADD post_id into every follower's timeline (Redis pipeline, batches of 1000). If CELEBRITY: SKIP fan-out — post stays in author's user timeline only."></line>
+          <!-- Kafka -> Real-time Push -->
+          <line class="arrow" x1="700" y1="60" x2="798" y2="60" stroke="var(--muted)" stroke-width="2" stroke-dasharray="4 3" marker-end="url(#ah)"
+                data-flow="write" data-write="10"
+                data-desc-write="Push Service consumes event, looks up ws_connections registry, pushes NEW_POSTS banner over WebSocket."></line>
+          <!-- Feed Service -> Timeline Cache (read step 4) -->
+          <line class="arrow" x1="490" y1="145" x2="618" y2="345" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"
+                data-flow="read" data-read="4"
+                data-desc-read="ZREVRANGEBYSCORE timeline:{user_id} → 500 pre-computed post IDs (fan-out-on-write for normal friends). ~1–2 ms."></line>
+          <!-- Feed -> Social Graph -->
+          <line class="arrow" x1="446" y1="160" x2="446" y2="210" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"
+                data-flow="read" data-read="5"
+                data-desc-read="Get celebrity_follows:{user_id} set (~5–20 celebs the viewer follows)."></line>
+          <!-- Feed -> Cassandra (celeb pull) -->
+          <line class="arrow" x1="490" y1="145" x2="618" y2="145" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"
+                data-flow="read" data-read="6"
+                data-desc-read="Pull latest 5 posts from each celebrity's user timeline (parallel). ~60 candidate posts."></line>
+          <!-- Feed -> Ranking -->
+          <line class="arrow" x1="446" y1="180" x2="446" y2="330" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"
+                data-flow="read" data-read="7"
+                data-desc-read="Send ~560 candidates to Ranking Service → score by affinity × recency × engagement × content_type, return top 50."></line>
+          <!-- Feed -> back to Client -->
+          <path class="arrow" d="M410,130 C 240,120 120,110 62,90" fill="none" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah)"
+                data-flow="read" data-read="8"
+                data-desc-read="Hydrate top 20 posts (Redis post cache → Cassandra fallback), apply diversity, return 200 OK with next_cursor + gap_detected."></path>
+
+          <!-- Engagement -> Kafka (side) -->
+          <line class="arrow" x1="238" y1="220" x2="618" y2="200" stroke="var(--muted)" stroke-width="2" stroke-dasharray="4 3" marker-end="url(#ah)"></line>
+          <text x="360" y="212" fill="var(--faint)" font-size="9">engagement events → Kafka → counter increments + affinity update</text>
+
+          <!-- Static labels -->
+          <text x="785" y="46" fill="var(--faint)" font-size="9">"3 new posts" banner</text>
+
+          <!-- ============ NODES ============ -->
+          <g data-node style="cursor:pointer" data-title="Clients (Web / Mobile / API)" data-detail="<b>Role:</b> browser, iOS/Android app, or 3rd-party API client. Publishes posts, requests feed, opens WebSocket for real-time updates. Renders new-posts banner and infinite-scroll pagination.<br><b>Payload:</b> ~50 KB per feed page (20 posts hydrated with author + top comments)."><rect x="12" y="36" width="88" height="48" rx="9" fill="var(--panel-2)" stroke="var(--eden)"></rect><text x="56" y="60" text-anchor="middle" fill="var(--eden)" font-size="12" font-weight="600">Clients</text><text x="56" y="75" text-anchor="middle" fill="var(--faint)" font-size="10">web · mobile</text></g>
+
+          <g data-node style="cursor:pointer" data-title="CDN" data-detail="<b>Role:</b> global edge cache for media (images 200 KB avg, video 5 MB avg, thumbnails). Keeps ~290 TB/day of media off the origin.<br><b>Tech:</b> CloudFront / Cloud CDN / Azure CDN. Signed URLs for private posts. Cache-Control immutable for content-addressed media."><rect x="12" y="120" width="88" height="42" rx="9" fill="var(--panel-2)" stroke="var(--old)"></rect><text x="56" y="145" text-anchor="middle" fill="var(--old)" font-size="12" font-weight="600">CDN</text></g>
+
+          <g data-node style="cursor:pointer" data-title="API Gateway" data-detail="<b>Role:</b> single ingress — JWT auth, per-user rate limiting (300 posts/day, 10 K feed reads/day), request validation, SSL termination.<br><b>Tech:</b> AWS API Gateway / Apigee / Azure APIM.<br><b>HA:</b> multi-AZ active-active."><rect x="140" y="36" width="98" height="48" rx="9" fill="var(--panel-2)" stroke="var(--border)"></rect><text x="189" y="60" text-anchor="middle" fill="var(--text)" font-size="12" font-weight="600">API Gateway</text><text x="189" y="75" text-anchor="middle" fill="var(--faint)" font-size="10">auth · rate-limit</text></g>
+
+          <g data-node style="cursor:pointer" data-title="Engagement Service" data-detail="<b>Role:</b> handles POST /posts/{id}/likes|comments|shares. Idempotent likes (Redis SET dedup), Redis INCR for display counters, Cassandra counter for durability, publishes engagement-events to Kafka.<br><b>Side-effect:</b> records interaction into affinity feature store — boosts author's future rank for this viewer."><rect x="140" y="200" width="98" height="42" rx="9" fill="var(--panel-2)" stroke="var(--border)"></rect><text x="189" y="220" text-anchor="middle" fill="var(--text)" font-size="12" font-weight="600">Engagement</text><text x="189" y="234" text-anchor="middle" fill="var(--faint)" font-size="10">likes · comments</text></g>
+
+          <g data-node style="cursor:pointer" data-title="Load Balancer" data-detail="<b>Role:</b> stateless request routing across Post / Feed / Engagement instances.<br><b>Tech:</b> ALB / Cloud LB / App Gateway. L7 for path routing; round-robin over healthy targets."><rect x="278" y="36" width="90" height="48" rx="9" fill="var(--panel-2)" stroke="var(--border)"></rect><text x="323" y="60" text-anchor="middle" fill="var(--text)" font-size="12" font-weight="600">Load</text><text x="323" y="75" text-anchor="middle" fill="var(--text)" font-size="12" font-weight="600">Balancer</text></g>
+
+          <g data-node style="cursor:pointer" data-title="Post Service (stateless)" data-detail="<b>Role:</b> write-path entry point. validate → assign Snowflake post_id → dual-write to Cassandra posts + posts_by_id (QUORUM) → cache post:{id} in Redis (24 h TTL) → publish post-event to Kafka → return 201 in ~60 ms.<br><b>Note:</b> fan-out is off the sync path; poster sees their own post immediately via client-side optimistic render."><rect x="410" y="32" width="80" height="46" rx="9" fill="var(--panel-2)" stroke="var(--border)"></rect><text x="450" y="52" text-anchor="middle" fill="var(--text)" font-size="12" font-weight="600">Post Svc</text><text x="450" y="67" text-anchor="middle" fill="var(--faint)" font-size="10">write path</text></g>
+
+          <g data-node style="cursor:pointer" data-title="Feed Service (stateless) — the FACADE" data-detail="<b>Role:</b> read-path orchestrator. 5 steps: (1) ZREVRANGEBYSCORE pre-computed timeline from Redis, (2) look up celebrity_follows, (3) parallel pull latest posts from each celebrity's user timeline (Cassandra), (4) merge + de-dup, (5) send ~560 candidates to Ranking, apply diversity, hydrate top 20, apply cursor pagination, return.<br><b>Latency budget:</b> ~57–119 ms end-to-end."><rect x="410" y="110" width="80" height="46" rx="9" fill="var(--panel-2)" stroke="var(--border)"></rect><text x="450" y="130" text-anchor="middle" fill="var(--text)" font-size="12" font-weight="600">Feed Svc</text><text x="450" y="145" text-anchor="middle" fill="var(--faint)" font-size="10">read path</text></g>
+
+          <g data-node style="cursor:pointer" data-title="Ranking Service" data-detail="<b>Role:</b> scores 560 candidates for the viewer in ~10–20 ms using pre-computed features.<br><b>Formula:</b> <code>score = affinity × recency_decay × engagement_boost × content_type_weight × neg_penalty</code>. Two-pass: candidate generation (cheap) → scoring (precise). Returns top 50.<br><b>Feature store:</b> Redis hashes — user_features, affinity:{viewer}:{author}, post_features."><rect x="410" y="330" width="80" height="46" rx="9" fill="var(--panel-2)" stroke="var(--border)"></rect><text x="450" y="350" text-anchor="middle" fill="var(--text)" font-size="12" font-weight="600">Ranking</text><text x="450" y="365" text-anchor="middle" fill="var(--faint)" font-size="10">affinity × rec</text></g>
+
+          <g data-node style="cursor:pointer" data-title="Social Graph Service" data-detail="<b>Role:</b> follow / unfollow, follower &amp; following lists, celebrity detection (&gt;1 M followers).<br><b>Storage:</b> PostgreSQL source of truth + Redis Sets (followers:{u}, following:{u}) for hot lookups. Per-user split into <code>celebrity_follows:{u}</code> and <code>normal_follows:{u}</code> so hybrid fan-out and read-time pull both O(1) lookups.<br><b>CP:</b> strongly consistent — a stale follow list breaks fan-out correctness."><rect x="410" y="200" width="108" height="42" rx="9" fill="var(--panel-2)" stroke="var(--survivor)"></rect><text x="464" y="220" text-anchor="middle" fill="var(--survivor)" font-size="12" font-weight="600">Social Graph</text><text x="464" y="234" text-anchor="middle" fill="var(--faint)" font-size="10">PG + Redis Sets</text></g>
+
+          <g data-node style="cursor:pointer" data-title="Kafka (event bus)" data-detail="<b>Role:</b> decouples writers from fan-out, push, analytics, counters.<br><b>Topics:</b> post-events (64 partitions, key=user_id), engagement-events.<br><b>Guarantees:</b> at-least-once, 72 h retention for replay, ordered per user_id partition.<br><b>Scale:</b> ~1 M msg/s ceiling; Kafka lag drives Fan-out worker auto-scaling."><rect x="618" y="36" width="82" height="42" rx="9" fill="var(--panel-2)" stroke="var(--warn)"></rect><text x="659" y="62" text-anchor="middle" fill="var(--warn)" font-size="12" font-weight="600">Kafka</text></g>
+
+          <g data-node style="cursor:pointer" data-title="Real-time Push Service" data-detail="<b>Role:</b> consumes post/engagement events from Kafka, looks up ws_connections registry (Redis Hash user_id → node_id), publishes to that node's Redis Pub/Sub channel; node sends NEW_POSTS / ENGAGEMENT_UPDATE over WebSocket.<br><b>Scale:</b> 100 M concurrent WebSocket connections across ~1 000 gateway nodes (100 K per node)."><rect x="798" y="36" width="92" height="42" rx="9" fill="var(--panel-2)" stroke="var(--warn)"></rect><text x="844" y="55" text-anchor="middle" fill="var(--warn)" font-size="12" font-weight="600">Push · WS</text><text x="844" y="70" text-anchor="middle" fill="var(--faint)" font-size="10">WebSocket</text></g>
+
+          <g data-node style="cursor:pointer" data-title="Fan-out Service (THE core)" data-detail="<b>Role:</b> Kafka consumer group (32 workers = 32 partitions). For each post-event: (1) check <code>isCelebrity()</code>. (2) NORMAL → get follower IDs from Social Graph, batch 1 000, Redis pipeline <code>ZADD timeline:{f} score post_id</code> + <code>ZREMRANGEBYRANK 0 -501</code> (cap 500). (3) CELEBRITY → SKIP (post lives in author timeline only, pulled at read time).<br><b>Auto-scale:</b> on Kafka consumer lag &gt; 100K → +8 workers."><rect x="618" y="180" width="82" height="70" rx="9" fill="var(--panel-2)" stroke="var(--warn)"></rect><text x="659" y="210" text-anchor="middle" fill="var(--warn)" font-size="12" font-weight="600">Fan-out</text><text x="659" y="226" text-anchor="middle" fill="var(--warn)" font-size="12" font-weight="600">Service</text><text x="659" y="240" text-anchor="middle" fill="var(--faint)" font-size="10">hybrid strategy</text></g>
+
+          <g data-node style="cursor:pointer" data-title="Timeline Cache — Redis Cluster" data-detail="<b>Data structure:</b> Sorted Set per user — <code>timeline:{user_id}</code>, member = post_id, score = ranking_score.<br><b>Ops:</b> ZADD (fan-out), ZREVRANGEBYSCORE (feed read), ZREMRANGEBYRANK (cap 500), TTL 7 days.<br><b>Size:</b> 500 × ~80 B ≈ 40 KB / user · 500 M DAU ≈ <b>20 TB</b> across ~40 shards (hash-slot sharding). Also holds post:{id} hash (24 h TTL) for hot hydration."><rect x="618" y="325" width="120" height="52" rx="9" fill="var(--panel-2)" stroke="var(--old)"></rect><text x="678" y="349" text-anchor="middle" fill="var(--old)" font-size="12" font-weight="600">Timeline Cache</text><text x="678" y="365" text-anchor="middle" fill="var(--faint)" font-size="10">Redis · sorted set</text></g>
+
+          <g data-node style="cursor:pointer" data-title="Post Store — Cassandra" data-detail="<b>Tables:</b> <code>posts (PK user_id, CK post_id DESC)</code> — user timeline co-located per partition; <code>posts_by_id (PK post_id)</code> — hydration lookup. Also likes, comments, followers, following.<br><b>Why Cassandra:</b> 500 M writes/day, linear horizontal scaling, native TTL, tunable QUORUM writes / ONE reads. Postgres can't shard cleanly at this scale."><rect x="618" y="110" width="120" height="52" rx="9" fill="var(--panel-2)" stroke="var(--old)"></rect><text x="678" y="134" text-anchor="middle" fill="var(--old)" font-size="12" font-weight="600">Post Store</text><text x="678" y="150" text-anchor="middle" fill="var(--faint)" font-size="10">Cassandra</text></g>
+
+          <g data-node style="cursor:pointer" data-title="User DB — PostgreSQL" data-detail="<b>Role:</b> source of truth for users (username unique, follower_count denorm, is_celebrity flag, is_verified) and durable follow graph.<br><b>Why Postgres:</b> ~1 B rows, relational lookups by username, ACID for follow/unfollow (strong consistency required).<br><b>Sharded:</b> by user_id range across nodes."><rect x="618" y="405" width="120" height="42" rx="9" fill="var(--panel-2)" stroke="var(--old)"></rect><text x="678" y="425" text-anchor="middle" fill="var(--old)" font-size="12" font-weight="600">User DB</text><text x="678" y="439" text-anchor="middle" fill="var(--faint)" font-size="10">PostgreSQL</text></g>
+
+          <g data-node style="cursor:pointer" data-title="Media / S3" data-detail="<b>Role:</b> object storage for images (200 KB avg) and video (5 MB avg). Pre-upload flow: client → media upload → S3 → returns media_id; post references media_ids. Video transcoding (480p/720p/1080p) async after upload.<br><b>Scale:</b> ~290 TB/day of new media. Fronted by CDN."><rect x="760" y="405" width="120" height="42" rx="9" fill="var(--panel-2)" stroke="var(--old)"></rect><text x="820" y="425" text-anchor="middle" fill="var(--old)" font-size="12" font-weight="600">Media · S3</text><text x="820" y="439" text-anchor="middle" fill="var(--faint)" font-size="10">object store</text></g>
+
+        </svg>
+      </div>
+      <div class="node-detail"><span class="nd-title">Click any component</span><div class="nd-body">Its role, tech choice, and scale note appear here. Then use the buttons below to step through the <b>write (publish)</b> and <b>read (feed)</b> flows one hop at a time.</div></div>
+
+      <div class="flowctl" data-flowctl>
+        <button class="btn" data-flow="write">Write path (publish)</button>
+        <button class="btn" data-flow="read">Read path (feed)</button>
+        <span style="flex:1"></span>
+        <button class="btn" data-flowstep="prev">◀ Prev</button>
+        <button class="btn" data-flowstep="next">Next ▶</button>
+      </div>
+      <div class="flowlabel" data-flowlabel>Pick <b>Write</b> or <b>Read</b>, then press "Next ▶" to walk the numbered request flow one hop at a time.</div>
+
+      <div class="cloudmap">
+        <div class="kicker" style="margin-top:4px">Managed-service mapping — the same components on each cloud</div>
+        <table class="cloudtable">
+          <thead><tr>
+            <th>Component</th>
+            <th><span class="hdrlogo"><span class="logochip"><img src="../assets/logos/aws.svg" alt="AWS"></span>AWS</span></th>
+            <th><span class="hdrlogo"><span class="logochip"><img src="../assets/logos/gcp.svg" alt="GCP"></span>GCP</span></th>
+            <th><span class="hdrlogo"><span class="logochip"><img src="../assets/logos/azure.svg" alt="Azure"></span>Azure</span></th>
+          </tr></thead>
+          <tbody>
+            <tr><td>API Gateway</td><td><img class="svcicon" src="../assets/logos/services/aws-apigw.svg" alt="">API Gateway</td><td><img class="svcicon" src="../assets/logos/services/gcp-apigw.svg" alt="">Apigee / Endpoints</td><td><img class="svcicon" src="../assets/logos/services/azure-apim.svg" alt="">API Management</td></tr>
+            <tr><td>Load Balancer</td><td><img class="svcicon" src="../assets/logos/services/aws-elb.svg" alt="">ALB / NLB</td><td><img class="svcicon" src="../assets/logos/services/gcp-elb.svg" alt="">Cloud Load Balancing</td><td><img class="svcicon" src="../assets/logos/services/azure-appgw.svg" alt="">Application Gateway</td></tr>
+            <tr><td>Compute (services)</td><td><img class="svcicon" src="../assets/logos/services/aws-ecs.svg" alt="">ECS Fargate / EKS</td><td><img class="svcicon" src="../assets/logos/services/gcp-run.svg" alt="">Cloud Run / GKE</td><td><img class="svcicon" src="../assets/logos/services/azure-aks.svg" alt="">AKS / Container Apps</td></tr>
+            <tr><td>Timeline cache</td><td><img class="svcicon" src="../assets/logos/services/aws-elasticache.svg" alt="">ElastiCache (Redis)</td><td><img class="svcicon" src="../assets/logos/services/gcp-memorystore.svg" alt="">Memorystore</td><td><img class="svcicon" src="../assets/logos/services/azure-redis.svg" alt="">Azure Cache for Redis</td></tr>
+            <tr><td>Post store</td><td><img class="svcicon" src="../assets/logos/services/aws-dynamodb.svg" alt="">Keyspaces (Cassandra) / DynamoDB</td><td><img class="svcicon" src="../assets/logos/services/gcp-bigtable.svg" alt="">Bigtable</td><td><img class="svcicon" src="../assets/logos/services/azure-cosmos.svg" alt="">Cosmos DB (Cassandra API)</td></tr>
+            <tr><td>User DB</td><td><img class="svcicon" src="../assets/logos/services/aws-rds.svg" alt="">RDS (PostgreSQL)</td><td><img class="svcicon" src="../assets/logos/services/gcp-cloudsql.svg" alt="">Cloud SQL</td><td><img class="svcicon" src="../assets/logos/services/azure-sql.svg" alt="">Azure DB for PostgreSQL</td></tr>
+            <tr><td>Event bus</td><td><img class="svcicon" src="../assets/logos/services/aws-msk.svg" alt="">MSK (Kafka) / Kinesis</td><td><img class="svcicon" src="../assets/logos/services/gcp-pubsub.svg" alt="">Pub/Sub</td><td><img class="svcicon" src="../assets/logos/services/azure-eventhubs.svg" alt="">Event Hubs (Kafka)</td></tr>
+            <tr><td>Media store</td><td><img class="svcicon" src="../assets/logos/services/aws-s3.svg" alt="">S3</td><td><img class="svcicon" src="../assets/logos/services/gcp-cloudstorage.svg" alt="">Cloud Storage</td><td><img class="svcicon" src="../assets/logos/services/azure-blob.svg" alt="">Blob Storage</td></tr>
+            <tr><td>CDN</td><td><img class="svcicon" src="../assets/logos/services/aws-cloudfront.svg" alt="">CloudFront</td><td><img class="svcicon" src="../assets/logos/services/gcp-cloudcdn.svg" alt="">Cloud CDN</td><td><img class="svcicon" src="../assets/logos/services/azure-cdn.svg" alt="">Azure CDN / Front Door</td></tr>
+            <tr><td>Video transcoding</td><td><img class="svcicon" src="../assets/logos/services/aws-media.svg" alt="">MediaConvert</td><td><img class="svcicon" src="../assets/logos/services/gcp-media.svg" alt="">Transcoder API</td><td><img class="svcicon" src="../assets/logos/services/azure-media.svg" alt="">Media Services</td></tr>
+            <tr><td>Push notifications</td><td><img class="svcicon" src="../assets/logos/services/aws-sns.svg" alt="">SNS + Pinpoint</td><td><img class="svcicon" src="../assets/logos/services/gcp-pubsub.svg" alt="">FCM</td><td><img class="svcicon" src="../assets/logos/services/azure-notifhub.svg" alt="">Notification Hubs</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+
+  <!-- D · API -->
+  <section>
+    <div class="sec-h"><span class="n">D</span><h2>API design</h2><span class="tag">REST + WebSocket</span></div>
+    <table>
+      <thead><tr><th>Endpoint</th><th>Purpose</th><th>Response</th></tr></thead>
+      <tbody>
+        <tr><td><code>POST /api/v1/posts</code></td><td>publish (body: content, content_type, media_ids, visibility, hashtags)</td><td>201 + hydrated post (Snowflake post_id)</td></tr>
+        <tr><td><code>GET /api/v1/feed?cursor=X&amp;limit=20</code></td><td>infinite-scroll feed (the hot path)</td><td>200 + 20 ranked posts, <code>next_cursor</code>, <code>gap_detected</code>, <code>new_posts_count</code></td></tr>
+        <tr><td><code>POST /api/v1/posts/{id}/likes</code></td><td>like (idempotent — SADD dedup)</td><td>200 + <code>like_count</code>, <code>is_liked</code></td></tr>
+        <tr><td><code>POST /api/v1/posts/{id}/comments</code></td><td>comment (threaded, 2 levels)</td><td>201 + comment</td></tr>
+        <tr><td><code>POST /api/v1/users/{id}/follow</code></td><td>follow — updates PG + Redis Sets atomically</td><td>200 + <code>follower_count</code>, <code>is_celebrity</code></td></tr>
+        <tr><td><code>WS /ws/feed</code></td><td>WebSocket: NEW_POSTS banner, ENGAGEMENT_UPDATE, POST_DELETED</td><td>server → client JSON events</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <!-- E · DATA MODEL -->
+  <section>
+    <div class="sec-h"><span class="n">E</span><h2>Data model</h2><span class="tag">read-optimised · denormalised</span></div>
+    <div class="grid g2">
+      <div class="card">
+        <div class="kicker">Cassandra — posts (user timeline)</div>
+        <pre class="code">CREATE TABLE posts (
+  post_id       BIGINT,   <span class="cm">// Snowflake — time-sortable</span>
+  user_id       BIGINT,
+  content       TEXT,
+  content_type  TEXT,     <span class="cm">// TEXT/IMAGE/VIDEO/LINK/POLL</span>
+  media_urls    LIST&lt;TEXT&gt;,
+  like_count    INT,      <span class="cm">// denormalised counter</span>
+  comment_count INT,
+  share_count   INT,
+  created_at    TIMESTAMP,
+  PRIMARY KEY (user_id, post_id)
+) WITH CLUSTERING ORDER BY (post_id DESC);
+<span class="cm">// posts_by_id (PK post_id) — hydration lookup</span></pre>
+        <p class="muted">Partition by <code>user_id</code> ⇒ author timeline co-located. Cluster by <code>post_id DESC</code> ⇒ latest first for free — no ORDER BY at read time.</p>
+      </div>
+      <div class="card">
+        <div class="kicker">Redis — timeline cache (per-user ZSET)</div>
+        <pre class="code"><span class="cm">// Write (fan-out worker):</span>
+ZADD timeline:{user}  score  post_id
+ZREMRANGEBYRANK timeline:{user} 0 -501  <span class="cm">// keep top 500</span>
+EXPIRE timeline:{user} 604800           <span class="cm">// 7 days</span>
+
+<span class="cm">// Read (feed):</span>
+ZREVRANGEBYSCORE timeline:{user}
+  +inf -inf LIMIT 0 20                  <span class="cm">// top page</span>
+ZREVRANGEBYSCORE timeline:{user}
+  (5.42 -inf LIMIT 0 20                 <span class="cm">// page 2, cursor</span></pre>
+        <p class="muted">Sorted Set. Member = post_id, score = ranking_score. ~40 KB/user; ~20 TB across the DAU. Post content lives in a separate <code>post:{id}</code> hash (24 h TTL) for hot hydration.</p>
+      </div>
+    </div>
+    <div class="callout tip"><b>Two tables in Cassandra, one purpose:</b> <code>posts</code> partitioned by <code>user_id</code> for the user timeline (celebrity pull), and <code>posts_by_id</code> partitioned by <code>post_id</code> for hydration during feed read. Same data, indexed twice — the price of a KV store is dual-writes.</div>
+  </section>
+
+  <!-- F · KEY CHOICES -->
+  <section>
+    <div class="sec-h"><span class="n">F</span><h2>Key design choices (deep-dived on canvas 3)</h2><span class="tag">defend these</span></div>
+    <div class="grid g3">
+      <div class="card"><div class="kicker">fan-out</div><h3>Hybrid (push + pull)</h3><p class="muted">Push for &lt; celebrity threshold, skip for celebrities (pulled at read). Eliminates 2.5 T writes/day. <span class="run">→ canvas 3 · Fan-out</span></p></div>
+      <div class="card"><div class="kicker">ranking</div><h3>Algorithmic scoring</h3><p class="muted"><code>affinity × recency_decay × engagement_boost × content_type_weight</code>. Best-friend's mundane post beats a stranger's viral post. <span class="run">→ canvas 2 · LLD</span></p></div>
+      <div class="card"><div class="kicker">pagination</div><h3>Cursor-based</h3><p class="muted"><code>cursor = {score}_{post_id}</code>. Stable under real-time inserts — no duplicates, no misses. Gap-detection banner instead of jumping. <span class="run">→ canvas 3</span></p></div>
+      <div class="card"><div class="kicker">consistency</div><h3>AP · eventually</h3><p class="muted">Feed 5–10 s stale is fine; blank feed at 175 K/s is not. Social graph is the CP exception (drives fan-out correctness).</p></div>
+      <div class="card"><div class="kicker">storage</div><h3>Cassandra + Redis + PG + S3</h3><p class="muted">Right store per access pattern: KV posts (Cassandra), ranked timelines (Redis ZSET), user + graph source-of-truth (Postgres), media (S3+CDN).</p></div>
+      <div class="card"><div class="kicker">real-time</div><h3>WebSocket + banner</h3><p class="muted">Push just a "N new posts" notification (~100 B), not the content. Banner lets the user control when to see it — no scroll jank.</p></div>
+    </div>
+  </section>
+
+  <!-- GLOSSARY -->
+  <section>
+    <div class="sec-h"><span class="n">§</span><h2>Glossary — one-liners</h2><span class="tag">terms used above</span></div>
+    <div class="grid g2">
+      <div class="card"><table><tbody>
+        <tr><td><b>Fan-out on write</b></td><td>push post_id into every follower's timeline at publish time</td></tr>
+        <tr><td><b>Fan-out on read</b></td><td>pull latest posts from each followed user at feed request time</td></tr>
+        <tr><td><b>Hybrid fan-out</b></td><td>push for normal users, pull for celebrities — the production answer</td></tr>
+        <tr><td><b>Celebrity</b></td><td>user above a follower threshold (10 K in code, ~1 M in production)</td></tr>
+        <tr><td><b>Timeline cache</b></td><td>per-user Redis Sorted Set of post_ids ranked by score</td></tr>
+      </tbody></table></div>
+      <div class="card"><table><tbody>
+        <tr><td><b>Affinity</b></td><td>weighted sum of viewer→author interactions (likes, comments, shares, DMs)</td></tr>
+        <tr><td><b>Recency decay</b></td><td>score multiplier that shrinks with post age (exp or harmonic)</td></tr>
+        <tr><td><b>Cursor pagination</b></td><td>"give me posts after this last-seen item" — stable under inserts</td></tr>
+        <tr><td><b>Gap detection</b></td><td>server tells client N new posts arrived above cursor → banner</td></tr>
+        <tr><td><b>Snowflake ID</b></td><td>64-bit time-sortable, coordination-free unique post_id</td></tr>
+      </tbody></table></div>
+    </div>
+  </section>
+
+  <footer>
+    <p>Use case 12 · News Feed — Canvas 1 of 3 (HLD). Grounded in <code>12-news-feed/docs/hld/HIGH_LEVEL_DESIGN.md</code> and the real Java under <code>12-news-feed/src/</code>.</p>
+    <p class="run">This use case: HLD · <a href="lld.html">Canvas 2 · LLD</a> · <a href="deepdive.html">Canvas 3 · Deep-dive &amp; Trade-offs</a> &nbsp;|&nbsp; Next → <a href="lld.html">12 · LLD</a> &nbsp;|&nbsp; <a href="../index.html">Hub</a></p>
+  </footer>
+
+</div>
+<script src="../assets/canvas.js"></script>
+</body>
+</html>
