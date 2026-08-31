@@ -5,8 +5,8 @@
    generic 6-colour categorical set — relabel the legend per topic.
    ============================================================ */
 :root{
-  --bg:#0d1117; --panel:#161b22; --panel-2:#1c2230; --border:#30363d;
-  --text:#e6edf3; --muted:#9aa4b2; --faint:#6b7280;
+  --bg:#0d1117; --panel:#161b22; --panel-2:#1c2230; --border:#4b5563;
+  --text:#e6edf3; --muted:#b8c1cc; --faint:#8b95a3;
   /* categorical palette (colorblind-aware) */
   --eden:#2dd4bf;      /* teal   - category 1 */
   --survivor:#fbbf24;  /* amber  - category 2 */
@@ -15,6 +15,7 @@
   --stack:#38bdf8;     /* sky    - category 5 */
   --gc:#4ade80;        /* green  - category 6 / process */
   --warn:#f87171;      /* red    - gotchas / errors */
+  --fig:#38bdf8;       /* alias for stack — used for "strategies" nodes */
 }
 *{box-sizing:border-box}
 html{scroll-behavior:smooth}
@@ -169,6 +170,16 @@ footer{margin-top:40px;padding-top:16px;border-top:1px solid var(--border);color
 .arrow.hl{stroke:var(--survivor)!important;stroke-width:3!important}
 .arrow.hl-step{stroke:var(--eden)!important;stroke-width:4.5!important}
 .arch [data-node].sel rect{stroke:var(--eden);stroke-width:3}
+/* edge/arrow labels — halo (bg-coloured stroke) keeps text readable over any node.
+   Applies to both the explicit `.edge-label` class (preferred going forward) and to any
+   small (font-size="9") text label in an .arch SVG (covers older canvases without edits). */
+.arch text.edge-label,
+.arch text[font-size="9"]{
+  fill:var(--muted); font-weight:500;
+  paint-order:stroke; stroke:var(--bg); stroke-width:3px; stroke-linejoin:round;
+  pointer-events:none;
+}
+.arch text.edge-label{ font-size:10px; }
 .flowctl{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin:12px 0 0}
 .flowlabel{margin-top:10px;font-size:13px;color:var(--text);min-height:20px;background:var(--panel-2);border:1px solid var(--border);border-radius:8px;padding:9px 12px}
 /* cloud-service annotation badges (provider-coloured, self-contained) */

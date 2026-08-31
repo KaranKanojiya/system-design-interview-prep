@@ -1,0 +1,613 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>17 · Distributed Task Scheduler — LLD</title>
+<link rel="stylesheet" href="../assets/canvas.css">
+</head>
+<body>
+
+<div class="wrap">
+
+  <header class="hero">
+    <h1>Distributed Task Scheduler — Low-Level Design</h1>
+    <div class="sub">Canvas 2 of 3. Real Java classes under <code>17-distributed-task-scheduler/src/main/java/com/systemdesign/scheduler/</code>. Composition root <code>AppConfig</code> → <code>SchedulerController</code> → <b>Facade <code>SchedulerService</code></b> → <b><code>SchedulerEngine</code></b> (tick = cron scan + dep resolve + queue drain) → 6 co-services (Task · Worker · Execution · LeaderElection · Failover · Monitoring) → 3 strategy families (Scheduling · Retry · Assignment) → 4 in-memory repositories. Click any class for its methods. Includes verbatim <code>tick()</code>, Kahn's topological sort, exponential-backoff with jitter, and the 9-state task lifecycle.</div>
+    <div class="badges">
+      <span class="badge lvl">Use case 17 · LLD</span>
+      <span class="badge">Canvas 2 of 3</span>
+      <span class="badge">grounded in 50 Java files</span>
+      <span class="badge">Strategy · Builder · Facade · Repository · State · Command · Observer · Factory</span>
+    </div>
+    <div class="legend">
+      <span><i class="dot" style="background:var(--eden)"></i> composition root / entry</span>
+      <span><i class="dot" style="background:var(--survivor)"></i> facade &amp; services</span>
+      <span><i class="dot" style="background:var(--warn)"></i> engine (star)</span>
+      <span><i class="dot" style="background:var(--fig)"></i> strategies (swappable)</span>
+      <span><i class="dot" style="background:var(--old)"></i> domain models &amp; repos</span>
+    </div>
+  </header>
+
+  <!-- A · CLASS MAP -->
+  <section>
+    <div class="sec-h"><span class="n">A</span><h2>Class map — click any class</h2><span class="tag">from <code>src/main/java/com/systemdesign/scheduler/</code></span></div>
+    <div>
+      <div class="arch">
+        <svg viewBox="0 0 900 520" width="100%" style="max-width:900px" role="img" aria-label="Distributed task scheduler class map">
+          <defs>
+            <marker id="ah17l" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" fill="var(--muted)"></path></marker>
+          </defs>
+          <!-- Grid: 3 cols (x=20 w=240, x=330 w=240, x=640 w=240), 6 rows (y=30,110,190,270,350,430, h=54).
+               Gutters at x=260-330 (70px) and x=570-640 (70px). Row-gaps ~26px. -->
+
+          <!-- ═══════ arrows ═══════ -->
+
+          <!-- Col 1 verticals (composition + facade + peer-services chain) -->
+          <line class="arrow" x1="140" y1="84" x2="140" y2="110" stroke="var(--muted)" stroke-width="1.5" stroke-dasharray="4 3" marker-end="url(#ah17l)"></line>
+          <line class="arrow" x1="140" y1="164" x2="140" y2="190" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah17l)"></line>
+          <line class="arrow" x1="140" y1="244" x2="140" y2="270" stroke="var(--muted)" stroke-width="1.5" stroke-dasharray="4 3" marker-end="url(#ah17l)"></line>
+          <line class="arrow" x1="140" y1="324" x2="140" y2="350" stroke="var(--muted)" stroke-width="1.5" stroke-dasharray="4 3" marker-end="url(#ah17l)"></line>
+          <line class="arrow" x1="140" y1="404" x2="140" y2="430" stroke="var(--muted)" stroke-width="1.5" stroke-dasharray="4 3" marker-end="url(#ah17l)"></line>
+
+          <!-- ★ SchedulerService → SchedulerEngine — THE STAR CALL — L-path through col1-2 gutter -->
+          <path class="arrow" d="M260,217 L295,217 L295,57 L330,57" fill="none" stroke="var(--warn)" stroke-width="2.5" marker-end="url(#ah17l)"></path>
+          <text class="edge-label" x="295" y="100" text-anchor="middle" fill="var(--warn)" font-weight="700">tick()</text>
+
+          <!-- SchedulerService → TaskService (L-path col1-2 gutter, dashed uses) -->
+          <path class="arrow" d="M260,210 L305,210 L305,377 L330,377" fill="none" stroke="var(--muted)" stroke-width="1.5" stroke-dasharray="4 3" marker-end="url(#ah17l)"></path>
+          <!-- SchedulerService → ExecutionService (L-path col1-2 gutter, dashed uses) -->
+          <path class="arrow" d="M260,225 L315,225 L315,457 L330,457" fill="none" stroke="var(--muted)" stroke-width="1.5" stroke-dasharray="4 3" marker-end="url(#ah17l)"></path>
+
+          <!-- SchedulerEngine → TaskQueue (short vertical, solid = owns) -->
+          <line class="arrow" x1="450" y1="84" x2="450" y2="110" stroke="var(--muted)" stroke-width="1.8" marker-end="url(#ah17l)"></line>
+
+          <!-- SchedulerEngine → DependencyResolver — routed via right gutter to skip TaskQueue -->
+          <path class="arrow" d="M570,50 L595,50 L595,210 L570,210" fill="none" stroke="var(--muted)" stroke-width="1.5" marker-end="url(#ah17l)"></path>
+          <!-- SchedulerEngine → CronParser — further out in right gutter -->
+          <path class="arrow" d="M570,60 L615,60 L615,290 L570,290" fill="none" stroke="var(--muted)" stroke-width="1.5" marker-end="url(#ah17l)"></path>
+
+          <!-- TaskService → ExecutionService (dashed peer, they cooperate on retry) -->
+          <line class="arrow" x1="450" y1="404" x2="450" y2="430" stroke="var(--muted)" stroke-width="1.5" stroke-dasharray="4 3" marker-end="url(#ah17l)"></line>
+
+          <!-- Col 2 → col 3 dashed "uses" arrows through col2-3 gutter -->
+          <!-- SchedulerEngine → Task+TaskExecution (horizontal dashed, both row 1) -->
+          <line class="arrow" x1="570" y1="57" x2="640" y2="57" stroke="var(--muted)" stroke-width="1.5" stroke-dasharray="4 3" marker-end="url(#ah17l)"></line>
+          <!-- ExecutionService → Repositories (horizontal dashed, both row 6) -->
+          <line class="arrow" x1="570" y1="457" x2="640" y2="457" stroke="var(--muted)" stroke-width="1.5" stroke-dasharray="4 3" marker-end="url(#ah17l)"></line>
+          <!-- ExecutionService → RetryStrategy — L-path via right gutter going up -->
+          <path class="arrow" d="M570,445 L605,445 L605,297 L640,297" fill="none" stroke="var(--muted)" stroke-width="1.5" stroke-dasharray="4 3" marker-end="url(#ah17l)"></path>
+
+          <!-- SchedulingStrategy → CronParser (dashed uses, diagonal short) -->
+          <line class="arrow" x1="640" y1="210" x2="570" y2="285" stroke="var(--muted)" stroke-width="1.2" stroke-dasharray="4 3" marker-end="url(#ah17l)"></line>
+
+          <!-- TaskAssignmentStrategy → Worker+SchedulerNode (vertical within col 3, dashed uses upward) -->
+          <line class="arrow" x1="760" y1="350" x2="760" y2="164" stroke="var(--muted)" stroke-width="1.5" stroke-dasharray="4 3" marker-end="url(#ah17l)"></line>
+
+          <!-- ═══════ NODES (18 total) ═══════ -->
+
+          <!-- Col 1 — composition + facade + peer services -->
+          <g data-node style="cursor:pointer" data-title="AppConfig (Factory · composition root)" data-detail="<b>Path:</b> <code>config/AppConfig.java</code>. The ONLY place where <code>new ConcreteClass()</code> appears.<br><b>Layers wired (in order):</b> Repositories (4 InMemory*) → Engine (CronParser + TaskQueue + DependencyResolver + SchedulerEngine) → Strategies (Scheduling + Retry + Assignment) → Services (Task, Worker, Execution, LeaderElection, Failover, Monitoring, Scheduler-Facade) → Controller → StatsDisplay.<br><b>Strategy defaults:</b> <code>ImmediateSchedulingStrategy</code>, <code>ExponentialBackoffRetryStrategy(1000, 30000, 2.0)</code>, <code>RoundRobinAssignmentStrategy</code>.<br><b>Setters:</b> <code>setSchedulingStrategy</code>, <code>setRetryStrategy</code>, <code>setAssignmentStrategy</code> — swap without touching services."><rect x="20" y="30" width="240" height="54" rx="9" fill="var(--panel-2)" stroke="var(--eden)"></rect><text x="140" y="55" text-anchor="middle" fill="var(--eden)" font-size="13" font-weight="600">AppConfig</text><text x="140" y="72" text-anchor="middle" fill="var(--faint)" font-size="11">composition root · lazy</text></g>
+
+          <g data-node style="cursor:pointer" data-title="SchedulerController (REST facade)" data-detail="<b>Path:</b> <code>controller/SchedulerController.java</code>. Simulated REST — maps HTTP-shaped calls to service methods.<br><b>Handlers:</b> <code>submitTask(Task)</code>, <code>submitTaskWithDependencies(Task, List&lt;String&gt;)</code>, <code>runSchedulingCycle()</code>, <code>cancelTask(String)</code>, <code>registerWorker(Worker)</code>, <code>getTask(String)</code>, <code>getDashboard()</code>.<br><b>Never contains business logic</b> — thin adapter over <code>SchedulerService</code> + <code>MonitoringService</code>."><rect x="20" y="110" width="240" height="54" rx="9" fill="var(--panel-2)" stroke="var(--border)"></rect><text x="140" y="135" text-anchor="middle" fill="var(--text)" font-size="13" font-weight="600">SchedulerController</text><text x="140" y="152" text-anchor="middle" fill="var(--faint)" font-size="11">REST facade · thin</text></g>
+
+          <g data-node style="cursor:pointer" data-title="SchedulerService (Facade · single entry)" data-detail="<b>Path:</b> <code>service/SchedulerService.java</code>. The ONE DOOR for task submission and scheduling.<br><b>Dependencies (6):</b> TaskService, WorkerService, ExecutionService, SchedulerEngine, TaskAssignmentStrategy, SchedulingStrategy.<br><b>Methods:</b><br>• <code>submitTask(Task)</code> — validates via TaskService, enqueues in engine.<br>• <code>submitTaskWithDependencies(Task, List&lt;String&gt;)</code> — registers DAG edges.<br>• <code>scheduleAndDispatch()</code> — the HOT PATH: engine.tick() → schedulingStrategy filter → getAvailableWorkers → assignmentStrategy.assignTask → executionService.executeTask.<br>• <code>cancelTask</code>, <code>getTask</code>, <code>getTaskStatus</code>, <code>notifyTaskCompletion(String)</code> — triggers dependency re-check (Observer)."><rect x="20" y="190" width="240" height="54" rx="9" fill="var(--panel-2)" stroke="var(--survivor)"></rect><text x="140" y="215" text-anchor="middle" fill="var(--survivor)" font-size="13" font-weight="600">SchedulerService</text><text x="140" y="232" text-anchor="middle" fill="var(--faint)" font-size="11">Facade · single entry</text></g>
+
+          <g data-node style="cursor:pointer" data-title="LeaderElectionService (Bully algorithm)" data-detail="<b>Path:</b> <code>service/LeaderElectionService.java</code>. Elects the coordinator among scheduler nodes.<br><b>Deps:</b> SchedulerNodeRepository.<br><b>Constants:</b> <code>ALIVE_TIMEOUT = Duration.ofSeconds(30)</code>.<br><b>Bully algorithm:</b><br>(1) Filter alive nodes (heartbeat &lt; 30s).<br>(2) Winner = node with no higher-priority challenger (highest priority + highest nodeId).<br>(3) Set winner.isLeader=true, others=false; cache <code>currentLeaderId</code>.<br><b>Methods:</b> <code>registerNode</code>, <code>electLeader</code>, <code>getCurrentLeader</code>, <code>handleNodeFailure(String)</code>, <code>isLeader(String)</code>, <code>simulateHeartbeats</code>.<br><b>Complexity:</b> O(N²) — each node challenges every higher-priority peer."><rect x="20" y="270" width="240" height="54" rx="9" fill="var(--panel-2)" stroke="var(--survivor)"></rect><text x="140" y="295" text-anchor="middle" fill="var(--survivor)" font-size="13" font-weight="600">LeaderElectionService</text><text x="140" y="312" text-anchor="middle" fill="var(--faint)" font-size="11">Bully algorithm · O(N²)</text></g>
+
+          <g data-node style="cursor:pointer" data-title="FailoverService (heartbeat + reassign)" data-detail="<b>Path:</b> <code>service/FailoverService.java</code>. Detects dead workers and reassigns their in-flight tasks.<br><b>Deps:</b> WorkerService, TaskService, ExecutionRepository, TaskAssignmentStrategy.<br><b>Methods:</b><br>• <code>detectDeadWorkers(Duration timeout)</code> — scan all workers; mark stale ones DEAD.<br>• <code>reassignTasks(List&lt;Worker&gt; dead)</code> — for each dead worker: find RUNNING executions → reset task to QUEUED → assignmentStrategy.assignTask → new worker → task=ASSIGNED.<br>• <code>performFailover(Duration timeout)</code> — combines both.<br><b>Key insight:</b> Tasks that can't be re-assigned stay QUEUED and will be picked up on the next dispatch cycle."><rect x="20" y="350" width="240" height="54" rx="9" fill="var(--panel-2)" stroke="var(--survivor)"></rect><text x="140" y="375" text-anchor="middle" fill="var(--survivor)" font-size="13" font-weight="600">FailoverService</text><text x="140" y="392" text-anchor="middle" fill="var(--faint)" font-size="11">heartbeat + reassign</text></g>
+
+          <g data-node style="cursor:pointer" data-title="MonitoringService (metrics · read-only)" data-detail="<b>Path:</b> <code>service/MonitoringService.java</code>. Read-only metrics computation. Never writes.<br><b>Deps:</b> TaskRepository, WorkerRepository, ExecutionRepository.<br><b>Methods:</b><br>• <code>getTaskCountByStatus() → Map&lt;TaskStatus, Long&gt;</code><br>• <code>getWorkerUtilization() → Map&lt;String, Double&gt;</code> (load/capacity)<br>• <code>getAverageExecutionTime() → Duration</code><br>• <code>getFailureRate() → double</code> (failed / total)<br>• <code>getRetryRate() → double</code> (attempts &gt; 1 / total)<br>• <code>getThroughput() → long</code> (COMPLETED count)<br>• <code>printDashboard()</code> — formatted console output."><rect x="20" y="430" width="240" height="54" rx="9" fill="var(--panel-2)" stroke="var(--survivor)"></rect><text x="140" y="455" text-anchor="middle" fill="var(--survivor)" font-size="13" font-weight="600">MonitoringService</text><text x="140" y="472" text-anchor="middle" fill="var(--faint)" font-size="11">metrics · dashboard</text></g>
+
+          <!-- Col 2 — engine core + services -->
+          <g data-node style="cursor:pointer" data-title="SchedulerEngine (engine · THE STAR)" data-detail="<b>Path:</b> <code>engine/SchedulerEngine.java</code>. Central coordinator — the brain of the scheduler.<br><b>Fields:</b> TaskQueue, DependencyResolver, CronParser, waitingOnDeps Map, cronTasks Map, cronLastFired Map.<br><b>Methods:</b><br>• <code>submitTask(Task)</code> — if CRON, register schedule; QUEUED + enqueue.<br>• <code>submitTaskWithDependencies</code> — register DAG edges + park in waitingOnDeps.<br>• <b><code>tick()</code></b> — hot path: (1) cron scan (fire time passed?), (2) resolve deps (move ready tasks to queue), (3) drain queue into dispatch batch.<br>• <code>getNextTasks(int maxBatch)</code>, <code>cancelTask(String)</code>, <code>getQueueSize()</code>.<br><b>Full code in Section B.</b>"><rect x="330" y="30" width="240" height="54" rx="9" fill="var(--panel-2)" stroke="var(--warn)" stroke-width="2"></rect><text x="450" y="55" text-anchor="middle" fill="var(--warn)" font-size="14" font-weight="700">SchedulerEngine ★</text><text x="450" y="72" text-anchor="middle" fill="var(--faint)" font-size="11">tick · queue · deps · cron</text></g>
+
+          <g data-node style="cursor:pointer" data-title="TaskQueue (PriorityQueue · 4 lanes)" data-detail="<b>Path:</b> <code>engine/TaskQueue.java</code>. Priority-ordered queue backed by <code>java.util.PriorityQueue&lt;Task&gt;</code>.<br><b>Comparator (two-level):</b><br>(1) <code>priority.getValue() DESCENDING</code> — CRITICAL=3 &gt; HIGH=2 &gt; MEDIUM=1 &gt; LOW=0.<br>(2) <code>createdAt ASCENDING</code> — FIFO within the same priority.<br><b>Complexity:</b> enqueue O(log n), dequeue O(log n), peek O(1), remove(taskId) O(n) linear scan.<br><b>Thread-safe:</b> NO — consumed only by the single-threaded scheduler loop (SchedulerEngine.tick).<br><b>Example order:</b> submit LOW·CRITICAL·MEDIUM·HIGH → dequeue CRITICAL → HIGH → MEDIUM → LOW."><rect x="330" y="110" width="240" height="54" rx="9" fill="var(--panel-2)" stroke="var(--old)"></rect><text x="450" y="135" text-anchor="middle" fill="var(--old)" font-size="13" font-weight="600">TaskQueue</text><text x="450" y="152" text-anchor="middle" fill="var(--faint)" font-size="11">PriorityQueue · 4 lanes</text></g>
+
+          <g data-node style="cursor:pointer" data-title="DependencyResolver (Kahn + DFS cycle)" data-detail="<b>Path:</b> <code>engine/DependencyResolver.java</code>. DAG tracker for task dependencies.<br><b>State:</b> <code>Map&lt;String, Set&lt;String&gt;&gt; dependencies</code> — taskId → set of taskIds it depends on.<br><b>Methods:</b><br>• <code>addDependency(taskId, dependsOn)</code>.<br>• <code>getReadyTasks(Set&lt;String&gt; completed)</code> — returns taskIds whose ALL deps are in completed.<br>• <code>hasCycle()</code> — DFS 3-coloring (WHITE / GRAY / BLACK). GRAY on revisit = back edge = cycle. O(V+E).<br>• <code>getTopologicalOrder()</code> — <b>Kahn's algorithm</b>: seed queue with in-degree=0 nodes, BFS peel; throws <code>DependencyCycleException</code> if hasCycle. O(V+E).<br><b>Full code in Section B.</b>"><rect x="330" y="190" width="240" height="54" rx="9" fill="var(--panel-2)" stroke="var(--old)"></rect><text x="450" y="215" text-anchor="middle" fill="var(--old)" font-size="13" font-weight="600">DependencyResolver</text><text x="450" y="232" text-anchor="middle" fill="var(--faint)" font-size="11">Kahn topo + DFS cycle</text></g>
+
+          <g data-node style="cursor:pointer" data-title="CronParser (5-field expression)" data-detail="<b>Path:</b> <code>engine/CronParser.java</code>. 5-field cron parser.<br><b>Format:</b> <code>minute hour dayOfMonth month dayOfWeek</code>.<br><b>Examples:</b><br>• <code>0 * * * *</code> — every hour at :00.<br>• <code>30 2 * * 1</code> — 2:30 AM every Monday.<br>• <code>0 0 1 * *</code> — midnight on the 1st of the month.<br><b>Supported tokens:</b> <code>*</code> (any), <code>5</code> (exact), <code>1,15,30</code> (comma list). No ranges or steps in demo.<br><b>Validation:</b> minute 0–59, hour 0–23, day 1–31, month 1–12, dow 0–7 (0/7 = Sunday).<br><b><code>getNextFireTime(schedule, after)</code>:</b> scans minute-by-minute from <code>after+1min</code> up to 24 h; returns <code>Optional&lt;Instant&gt;</code>. O(1440)."><rect x="330" y="270" width="240" height="54" rx="9" fill="var(--panel-2)" stroke="var(--old)"></rect><text x="450" y="295" text-anchor="middle" fill="var(--old)" font-size="13" font-weight="600">CronParser</text><text x="450" y="312" text-anchor="middle" fill="var(--faint)" font-size="11">5-field expression</text></g>
+
+          <g data-node style="cursor:pointer" data-title="TaskService (Task lifecycle · states)" data-detail="<b>Path:</b> <code>service/TaskService.java</code>. Task lifecycle management — validates business rules before state transitions.<br><b>Deps:</b> TaskRepository, ExecutionRepository.<br><b>Methods:</b><br>• <code>createTask(Task)</code> — validates name / taskType not null; saves.<br>• <code>getTask(String)</code>, <code>getAllTasks()</code>.<br>• <code>updateTaskStatus(String, TaskStatus)</code> — finds, transitions, saves.<br>• <code>cancelTask(String)</code> — blocks if already COMPLETED or FAILED.<br>• <code>getTasksByStatus</code>, <code>getTasksByGroup</code>.<br>• <code>getTaskExecutionHistory(String)</code> — all execution records for a task."><rect x="330" y="350" width="240" height="54" rx="9" fill="var(--panel-2)" stroke="var(--survivor)"></rect><text x="450" y="375" text-anchor="middle" fill="var(--survivor)" font-size="13" font-weight="600">TaskService</text><text x="450" y="392" text-anchor="middle" fill="var(--faint)" font-size="11">Task lifecycle · states</text></g>
+
+          <g data-node style="cursor:pointer" data-title="ExecutionService (execute · retry · load)" data-detail="<b>Path:</b> <code>service/ExecutionService.java</code>. Executes tasks on workers and records results.<br><b>Deps:</b> TaskRepository, ExecutionRepository, WorkerRepository, RetryStrategy.<br><b><code>executeTask(Task, Worker)</code> flow:</b><br>(1) Count prior executions → <code>attemptNumber</code>.<br>(2) Create TaskExecution, <code>markStarted()</code>, save.<br>(3) task.updateStatus(RUNNING), worker.incrementLoad().<br>(4) <code>simulateExecution(task)</code> → TaskResult.<br>(5) success → <code>markCompleted</code> → handleTaskCompletion (COMPLETED, decrementLoad).<br>(6) failure → <code>markFailed</code> → handleTaskFailure: retryStrategy.shouldRetry? YES → RETRYING · NO → FAILED."><rect x="330" y="430" width="240" height="54" rx="9" fill="var(--panel-2)" stroke="var(--survivor)"></rect><text x="450" y="455" text-anchor="middle" fill="var(--survivor)" font-size="13" font-weight="600">ExecutionService</text><text x="450" y="472" text-anchor="middle" fill="var(--faint)" font-size="11">execute · retry · load</text></g>
+
+          <!-- Col 3 — domain models + strategies + repos -->
+          <g data-node style="cursor:pointer" data-title="Task + TaskExecution (Builder + status)" data-detail="<b>Task</b> (<code>model/Task.java</code>): core entity, constructed only via fluent <code>Builder</code>. 14 fields — id (UUID), name (required), taskType, priority (default MEDIUM), status (default PENDING), payload (unmodifiable Map), cronExpression, delayMillis, maxRetries (default 3), timeoutMillis (60000), createdAt, updatedAt, scheduledAt, groupId. Only <code>status</code> and <code>updatedAt</code> are mutable — transitions via <code>updateStatus(TaskStatus)</code>.<br><b>TaskExecution</b> (<code>model/TaskExecution.java</code>): one record per attempt. Fields: id, taskId, workerId, attemptNumber, status, startTime, endTime, result, errorMessage. Explicit methods: <code>markStarted</code>, <code>markCompleted(TaskResult)</code>, <code>markFailed(String)</code>, <code>getDuration()</code>."><rect x="640" y="30" width="240" height="54" rx="9" fill="var(--panel-2)" stroke="var(--old)"></rect><text x="760" y="55" text-anchor="middle" fill="var(--old)" font-size="13" font-weight="600">Task + TaskExecution</text><text x="760" y="72" text-anchor="middle" fill="var(--faint)" font-size="11">Builder + status</text></g>
+
+          <g data-node style="cursor:pointer" data-title="Worker + SchedulerNode (pool + cluster)" data-detail="<b>Worker</b> (<code>model/Worker.java</code>): a task-executing node. Fields: id, hostname, port, capacity, currentLoad (mutable), status (WorkerStatus), lastHeartbeat, registeredAt, tags. Methods: <code>incrementLoad()</code> — auto-flip to BUSY at capacity; <code>decrementLoad()</code> — back to ACTIVE; <code>isAvailable()</code> — ACTIVE &amp;&amp; load &lt; capacity; <code>updateHeartbeat()</code>; <code>addTag(String)</code> / <code>hasTag(String)</code> — for affinity routing (e.g., GPU tasks → GPU workers).<br><br><b>SchedulerNode</b> (<code>model/SchedulerNode.java</code>): a cluster node participating in leader election. Fields: nodeId, hostname, isLeader (mutable), lastHeartbeat, startedAt, priority (higher wins). Methods: <code>updateHeartbeat()</code>, <code>isAlive(Duration timeout)</code>, <code>setLeader(boolean)</code>."><rect x="640" y="110" width="240" height="54" rx="9" fill="var(--panel-2)" stroke="var(--old)"></rect><text x="760" y="135" text-anchor="middle" fill="var(--old)" font-size="13" font-weight="600">Worker + SchedulerNode</text><text x="760" y="152" text-anchor="middle" fill="var(--faint)" font-size="11">pool + cluster</text></g>
+
+          <g data-node style="cursor:pointer" data-title="SchedulingStrategy (3 impls)" data-detail="<b>Path:</b> <code>strategy/scheduling/</code>.<br><b>Interface:</b> <code>boolean shouldScheduleNow(Task, Instant)</code> + <code>Optional&lt;Instant&gt; getNextScheduleTime(Task, Instant)</code>.<br><b>Impls:</b><br>• <b>ImmediateSchedulingStrategy</b> — fires as soon as status ∈ {PENDING, QUEUED}. Default for ONE_TIME tasks.<br>• <b>CronSchedulingStrategy</b> — delegates to <code>CronParser.getNextFireTime</code>. Injected via constructor.<br>• <b>DelayedSchedulingStrategy</b> — fires at <code>scheduledAt</code> if set, else <code>createdAt + delayMillis</code>.<br><b>Section D — tabs.</b>"><rect x="640" y="190" width="240" height="54" rx="9" fill="var(--panel-2)" stroke="var(--fig)"></rect><text x="760" y="215" text-anchor="middle" fill="var(--fig)" font-size="13" font-weight="600">SchedulingStrategy</text><text x="760" y="232" text-anchor="middle" fill="var(--faint)" font-size="11">Immediate/Cron/Delayed</text></g>
+
+          <g data-node style="cursor:pointer" data-title="RetryStrategy (ExpBackoff · Fixed)" data-detail="<b>Path:</b> <code>strategy/retry/</code>.<br><b>Interface:</b> <code>boolean shouldRetry(Task, int attempt, String error)</code> + <code>long getRetryDelayMillis(int attempt)</code>.<br><b>Impls:</b><br>• <b>ExponentialBackoffRetryStrategy(initialDelayMs, maxDelayMs, multiplier)</b> — delay = min(initial × mult^(attempt−1), max) × jitter(±10 %). Prevents thundering herd.<br>• <b>FixedIntervalRetryStrategy(fixedDelayMs)</b> — constant delay regardless of attempt.<br><b>Both:</b> <code>shouldRetry</code> = <code>attemptNumber &lt;= task.getMaxRetries()</code>.<br><b>Section C — tabs.</b>"><rect x="640" y="270" width="240" height="54" rx="9" fill="var(--panel-2)" stroke="var(--fig)"></rect><text x="760" y="295" text-anchor="middle" fill="var(--fig)" font-size="13" font-weight="600">RetryStrategy</text><text x="760" y="312" text-anchor="middle" fill="var(--faint)" font-size="11">ExpBackoff · Fixed</text></g>
+
+          <g data-node style="cursor:pointer" data-title="TaskAssignmentStrategy (RR · LeastLoaded)" data-detail="<b>Path:</b> <code>strategy/assignment/</code>.<br><b>Interface:</b> <code>Optional&lt;Worker&gt; assignTask(Task, List&lt;Worker&gt; available)</code>.<br><b>Impls:</b><br>• <b>RoundRobinAssignmentStrategy</b> — state: <code>AtomicInteger counter</code>. index = <code>|counter.getAndIncrement()| % readyWorkers.size()</code>. Lock-free CAS. Best for homogeneous clusters.<br>• <b>LeastLoadedAssignmentStrategy</b> — sort by <code>currentLoad</code> asc, then <code>registeredAt</code> asc (older worker wins tie). Best for heterogeneous.<br><b>Extensibility (see LLD §13.3):</b> AffinityAssignmentStrategy — filter by <code>hasTag(required_tag)</code>."><rect x="640" y="350" width="240" height="54" rx="9" fill="var(--panel-2)" stroke="var(--fig)"></rect><text x="760" y="375" text-anchor="middle" fill="var(--fig)" font-size="13" font-weight="600">TaskAssignmentStrategy</text><text x="760" y="392" text-anchor="middle" fill="var(--faint)" font-size="11">RR · LeastLoaded</text></g>
+
+          <g data-node style="cursor:pointer" data-title="Repositories (4 · in-memory)" data-detail="<b>Path:</b> <code>repository/</code>. Storage abstraction — swap for JDBC or DynamoDB without touching services.<br><b>Interfaces:</b> TaskRepository · WorkerRepository · ExecutionRepository · SchedulerNodeRepository.<br><b>Impls:</b> InMemory*Repository — all backed by <code>ConcurrentHashMap&lt;String, T&gt;</code>.<br><b>Query surface:</b><br>• <code>TaskRepository.findByStatus / findByGroupId</code><br>• <code>WorkerRepository.findAvailable()</code> — ACTIVE + spare capacity<br>• <code>ExecutionRepository.findLatestByTaskId</code> — most-recent by startTime<br>• <code>SchedulerNodeRepository.findLeader / findAlive(Duration)</code><br><b>Prod mapping:</b> Task+Worker on PostgreSQL / Aurora, Execution on Cassandra (time-series), SchedulerNode via ZooKeeper / etcd."><rect x="640" y="430" width="240" height="54" rx="9" fill="var(--panel-2)" stroke="var(--old)"></rect><text x="760" y="455" text-anchor="middle" fill="var(--old)" font-size="13" font-weight="600">Repositories (4)</text><text x="760" y="472" text-anchor="middle" fill="var(--faint)" font-size="11">Task/Worker/Exec/Node</text></g>
+
+        </svg>
+      </div>
+      <div class="node-detail"><span class="nd-title">Click any class</span><div class="nd-body">Its file path, method signatures, and how it plugs into the scheduler appear here.</div></div>
+    </div>
+  </section>
+
+  <!-- B · ENGINE CODE -->
+  <section>
+    <div class="sec-h"><span class="n">B</span><h2>The engine — <code>SchedulerEngine.tick</code> + <code>DependencyResolver.getTopologicalOrder</code></h2><span class="tag">verbatim · the hot path + Kahn's</span></div>
+
+    <div class="card">
+      <div class="kicker">from <code>engine/SchedulerEngine.java</code></div>
+      <pre class="code">public List&lt;Task&gt; tick() {
+  Instant now = Instant.now();
+  List&lt;Task&gt; readyToDispatch = new ArrayList&lt;&gt;();
+
+  <span class="cm">// Step 1: Check CRON tasks — if next fire time has passed, re-enqueue a clone</span>
+  for (Map.Entry&lt;String, CronSchedule&gt; entry : cronTasks.entrySet()) {
+    String taskId = entry.getKey();
+    CronSchedule schedule = entry.getValue();
+    Instant lastFired = cronLastFired.getOrDefault(taskId, Instant.EPOCH);
+
+    Optional&lt;Instant&gt; nextFire = cronParser.getNextFireTime(schedule, lastFired);
+    if (nextFire.isPresent() &amp;&amp; !nextFire.get().isAfter(now)) {
+      cronLastFired.put(taskId, now);
+      <span class="cm">// The actual task re-creation is handled by the service layer;</span>
+      <span class="cm">// we signal readiness by including the taskId in the result</span>
+    }
+  }
+
+  <span class="cm">// Step 2: Check dependency-waiting tasks — move any that are now ready</span>
+  Set&lt;String&gt; completedIds = new HashSet&lt;&gt;();  <span class="cm">// populated externally via markCompleted</span>
+  Set&lt;String&gt; nowReady = dependencyResolver.getReadyTasks(completedIds);
+  for (String readyId : nowReady) {
+    Task task = waitingOnDeps.remove(readyId);
+    if (task != null) {
+      task.updateStatus(TaskStatus.QUEUED);
+      taskQueue.enqueue(task);            <span class="cm">// O(log n) heap insertion</span>
+    }
+  }
+
+  <span class="cm">// Step 3: Drain the queue into the dispatch batch</span>
+  while (!taskQueue.isEmpty()) {
+    taskQueue.dequeue().ifPresent(readyToDispatch::add);
+  }
+
+  return readyToDispatch;
+}</pre>
+    </div>
+
+    <div class="callout tip"><b>Why <code>tick()</code> is single-threaded:</b> the TaskQueue (java.util.PriorityQueue) and the internal Maps (waitingOnDeps, cronTasks, cronLastFired) are <b>not thread-safe</b> by design. The scheduler runs <code>tick()</code> on one dedicated loop thread; concurrency lives in the repositories (ConcurrentHashMap) and the strategies (AtomicInteger for RoundRobin). This gives you deterministic ordering with zero locking overhead in the hot path.</div>
+
+    <div class="card" style="margin-top:14px">
+      <div class="kicker">from <code>engine/DependencyResolver.java</code> — Kahn's algorithm (verbatim)</div>
+      <pre class="code">public List&lt;String&gt; getTopologicalOrder() {
+  if (hasCycle()) {
+    throw new DependencyCycleException(
+        "Dependency graph contains a cycle — topological sort impossible");
+  }
+
+  <span class="cm">// 1. Build in-degree map and adjacency (dependsOn -&gt; dependents)</span>
+  Map&lt;String, Integer&gt; inDegree = new HashMap&lt;&gt;();
+  Map&lt;String, Set&lt;String&gt;&gt; dependents = new HashMap&lt;&gt;();
+
+  for (String node : dependencies.keySet()) {
+    inDegree.putIfAbsent(node, 0);
+    dependents.putIfAbsent(node, new HashSet&lt;&gt;());
+  }
+  for (Map.Entry&lt;String, Set&lt;String&gt;&gt; entry : dependencies.entrySet()) {
+    String taskId = entry.getKey();
+    for (String dep : entry.getValue()) {
+      <span class="cm">// dep -&gt; taskId (dep must run before taskId)</span>
+      dependents.computeIfAbsent(dep, k -&gt; new HashSet&lt;&gt;()).add(taskId);
+      inDegree.merge(taskId, 1, Integer::sum);
+    }
+  }
+
+  <span class="cm">// 2. Seed the queue with zero-in-degree nodes</span>
+  Queue&lt;String&gt; queue = new ArrayDeque&lt;&gt;();
+  for (Map.Entry&lt;String, Integer&gt; entry : inDegree.entrySet()) {
+    if (entry.getValue() == 0) queue.add(entry.getKey());
+  }
+
+  <span class="cm">// 3. BFS — peel off zero-in-degree nodes</span>
+  List&lt;String&gt; order = new ArrayList&lt;&gt;();
+  while (!queue.isEmpty()) {
+    String node = queue.poll();
+    order.add(node);
+    for (String dependent : dependents.getOrDefault(node, Collections.emptySet())) {
+      int newDegree = inDegree.merge(dependent, -1, Integer::sum);
+      if (newDegree == 0) queue.add(dependent);
+    }
+  }
+
+  return order;
+}</pre>
+    </div>
+
+    <div class="callout"><b>Why guard with <code>hasCycle()</code> first:</b> Kahn's algorithm will silently return a partial order if a cycle exists — the cycle nodes never reach zero in-degree and are dropped. Doing the DFS 3-coloring check (O(V+E)) upfront lets us <b>fail loudly</b> with a <code>DependencyCycleException</code> that names the involved tasks, instead of silently losing them. Two O(V+E) passes total; still cheap even for 100 K-task DAGs.</div>
+  </section>
+
+  <!-- C · RETRY STRATEGY TABS -->
+  <section>
+    <div class="sec-h"><span class="n">C</span><h2>Retry strategies — decide whether &amp; when to retry</h2><span class="tag">swap via <code>AppConfig.setRetryStrategy(...)</code></span></div>
+    <div data-tabscope>
+      <div class="tabs">
+        <div class="tab active" data-tab="retry-exp">ExponentialBackoff</div>
+        <div class="tab" data-tab="retry-fixed">FixedInterval</div>
+        <div class="tab" data-tab="retry-jitter">jitter table</div>
+        <div class="tab" data-tab="retry-cmp">comparison</div>
+      </div>
+
+      <div class="tabpanel active" data-panel="retry-exp">
+        <div class="kicker">from <code>strategy/retry/ExponentialBackoffRetryStrategy.java</code></div>
+        <pre class="code">public class ExponentialBackoffRetryStrategy implements RetryStrategy {
+
+  private final long initialDelayMs;
+  private final long maxDelayMs;
+  private final double multiplier;
+
+  public ExponentialBackoffRetryStrategy(long initialDelayMs, long maxDelayMs, double multiplier) {
+    if (initialDelayMs &lt;= 0)                 throw new IllegalArgumentException("initialDelayMs must be positive");
+    if (maxDelayMs &lt; initialDelayMs)         throw new IllegalArgumentException("maxDelayMs must be &gt;= initialDelayMs");
+    if (multiplier &lt;= 1.0)                   throw new IllegalArgumentException("multiplier must be &gt; 1.0");
+    this.initialDelayMs = initialDelayMs;
+    this.maxDelayMs = maxDelayMs;
+    this.multiplier = multiplier;
+  }
+
+  @Override
+  public boolean shouldRetry(Task task, int attemptNumber, String errorMessage) {
+    return attemptNumber &lt;= task.getMaxRetries();
+  }
+
+  @Override
+  public long getRetryDelayMillis(int attemptNumber) {
+    <span class="cm">// 1. Compute base delay: initialDelay * multiplier^(attempt-1)</span>
+    double baseDelay = initialDelayMs * Math.pow(multiplier, attemptNumber - 1);
+
+    <span class="cm">// 2. Cap at maxDelay</span>
+    long cappedDelay = (long) Math.min(baseDelay, maxDelayMs);
+
+    <span class="cm">// 3. Apply ±10% jitter to prevent thundering herd</span>
+    double jitterFactor = 0.9 + ThreadLocalRandom.current().nextDouble() * 0.2;
+    return (long) (cappedDelay * jitterFactor);
+  }
+
+  @Override
+  public String getStrategyName() { return "EXPONENTIAL_BACKOFF"; }
+}</pre>
+        <p class="muted"><b>Default wiring in AppConfig:</b> <code>new ExponentialBackoffRetryStrategy(1000, 30000, 2.0)</code> — starts at 1 s, doubles each attempt, caps at 30 s. <code>maxRetries</code> lives on the Task itself (default 3), so the strategy is <b>stateless</b> across tasks.</p>
+      </div>
+
+      <div class="tabpanel" data-panel="retry-fixed">
+        <div class="kicker">from <code>strategy/retry/FixedIntervalRetryStrategy.java</code></div>
+        <pre class="code">public class FixedIntervalRetryStrategy implements RetryStrategy {
+
+  private final long fixedDelayMs;
+
+  public FixedIntervalRetryStrategy(long fixedDelayMs) {
+    if (fixedDelayMs &lt;= 0) {
+      throw new IllegalArgumentException("fixedDelayMs must be positive");
+    }
+    this.fixedDelayMs = fixedDelayMs;
+  }
+
+  @Override
+  public boolean shouldRetry(Task task, int attemptNumber, String errorMessage) {
+    return attemptNumber &lt;= task.getMaxRetries();
+  }
+
+  @Override
+  public long getRetryDelayMillis(int attemptNumber) {
+    return fixedDelayMs;   <span class="cm">// constant, regardless of attempt</span>
+  }
+
+  @Override
+  public String getStrategyName() { return "FIXED_INTERVAL"; }
+}</pre>
+        <p class="muted"><b>When to prefer fixed:</b> transient errors with predictable recovery time (e.g., a database restart takes ~5 s regardless of how many retries you've done). Exponential can be excessive when the underlying fault clears at a known cadence.</p>
+      </div>
+
+      <div class="tabpanel" data-panel="retry-jitter">
+        <div class="kicker">defaults: <code>initial=1000ms, max=30000ms, multiplier=2.0</code></div>
+        <table>
+          <thead><tr><th>Attempt</th><th>Base delay</th><th>After cap</th><th>With ±10 % jitter</th></tr></thead>
+          <tbody>
+            <tr><td>1</td><td>1,000 ms</td><td>1,000 ms</td><td>900 – 1,100 ms</td></tr>
+            <tr><td>2</td><td>2,000 ms</td><td>2,000 ms</td><td>1,800 – 2,200 ms</td></tr>
+            <tr><td>3</td><td>4,000 ms</td><td>4,000 ms</td><td>3,600 – 4,400 ms</td></tr>
+            <tr><td>4</td><td>8,000 ms</td><td>8,000 ms</td><td>7,200 – 8,800 ms</td></tr>
+            <tr><td>5</td><td>16,000 ms</td><td>16,000 ms</td><td>14,400 – 17,600 ms</td></tr>
+            <tr><td>6</td><td>32,000 ms</td><td><b>30,000 ms (capped)</b></td><td>27,000 – 33,000 ms</td></tr>
+            <tr><td>7</td><td>64,000 ms</td><td><b>30,000 ms (capped)</b></td><td>27,000 – 33,000 ms</td></tr>
+          </tbody>
+        </table>
+        <p class="muted"><b>Why jitter matters:</b> 10 000 tasks all failing at t=0 with a deterministic backoff would retry <i>simultaneously</i> at t=1 s, t=2 s, t=4 s, ... — a thundering herd that would knock over the same downstream service that just failed. ±10 % spreads them across a 200 ms window at t=1 s, 400 ms at t=2 s, 800 ms at t=4 s. AWS SDK, gRPC, Kafka clients all use jittered exponential backoff for exactly this reason.</p>
+      </div>
+
+      <div class="tabpanel" data-panel="retry-cmp">
+        <table>
+          <thead><tr><th>Property</th><th>ExponentialBackoff</th><th>FixedInterval</th></tr></thead>
+          <tbody>
+            <tr><td><b>Delay growth</b></td><td>initial × mult^(attempt−1), capped at max</td><td>constant</td></tr>
+            <tr><td><b>Jitter</b></td><td>±10 % random</td><td>none</td></tr>
+            <tr><td><b>State</b></td><td>stateless (params only)</td><td>stateless (params only)</td></tr>
+            <tr><td><b>Best for</b></td><td>overloaded downstream, thundering-herd risk</td><td>known-recovery-time faults (DB restart, DNS TTL)</td></tr>
+            <tr><td><b>Worst for</b></td><td>SLA-sensitive tasks (delay grows fast)</td><td>overloaded downstream (all retries land together)</td></tr>
+            <tr><td><b>Extensibility</b></td><td colspan="2">Add <code>CircuitBreakerRetryStrategy</code> — trip after N consecutive failures, return <code>false</code> from <code>shouldRetry</code>. Zero changes to <code>ExecutionService</code>.</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+
+  <!-- D · ASSIGNMENT STRATEGY TABS -->
+  <section>
+    <div class="sec-h"><span class="n">D</span><h2>Assignment strategies — pick the worker</h2><span class="tag">swap via <code>AppConfig.setAssignmentStrategy(...)</code></span></div>
+    <div data-tabscope>
+      <div class="tabs">
+        <div class="tab active" data-tab="assign-rr">RoundRobin</div>
+        <div class="tab" data-tab="assign-ll">LeastLoaded</div>
+        <div class="tab" data-tab="assign-affinity">Affinity (extension)</div>
+        <div class="tab" data-tab="assign-cmp">comparison</div>
+      </div>
+
+      <div class="tabpanel active" data-panel="assign-rr">
+        <div class="kicker">from <code>strategy/assignment/RoundRobinAssignmentStrategy.java</code></div>
+        <pre class="code">public class RoundRobinAssignmentStrategy implements TaskAssignmentStrategy {
+
+  private final AtomicInteger counter = new AtomicInteger(0);   <span class="cm">// lock-free CAS</span>
+
+  @Override
+  public Optional&lt;Worker&gt; assignTask(Task task, List&lt;Worker&gt; availableWorkers) {
+    List&lt;Worker&gt; ready = availableWorkers.stream()
+        .filter(Worker::isAvailable)
+        .collect(Collectors.toList());
+
+    if (ready.isEmpty()) return Optional.empty();
+
+    int index = Math.abs(counter.getAndIncrement()) % ready.size();
+    return Optional.of(ready.get(index));
+  }
+
+  @Override
+  public String getStrategyName() { return "ROUND_ROBIN"; }
+}</pre>
+        <p class="muted"><b>Thread-safety:</b> <code>AtomicInteger.getAndIncrement()</code> is a single CAS operation — safe for concurrent dispatchers on multiple scheduler threads. <b>Limitation:</b> ignores current worker load — can overload a 2-slot worker just as easily as an 8-slot one. Best when the cluster is homogeneous (same capacity, same hardware).</p>
+      </div>
+
+      <div class="tabpanel" data-panel="assign-ll">
+        <div class="kicker">from <code>strategy/assignment/LeastLoadedAssignmentStrategy.java</code> (verbatim)</div>
+        <pre class="code">public class LeastLoadedAssignmentStrategy implements TaskAssignmentStrategy {
+
+  @Override
+  public Optional&lt;Worker&gt; assignTask(Task task, List&lt;Worker&gt; availableWorkers) {
+    return availableWorkers.stream()
+        .filter(Worker::isAvailable)
+        <span class="cm">// 1. Sort by currentLoad ascending</span>
+        <span class="cm">// 2. Break ties by registeredAt ascending (prefer older workers)</span>
+        .min(Comparator.comparingInt(Worker::getCurrentLoad)
+                .thenComparing(Worker::getRegisteredAt));
+  }
+
+  @Override
+  public String getStrategyName() { return "LEAST_LOADED"; }
+}</pre>
+        <p class="muted"><b>Tie-breaker on <code>registeredAt</code>:</b> when two workers have identical load, prefer the older one — it's already proven stable (survived heartbeats), while a freshly-registered worker might be about to fail its first tasks. <b>Complexity:</b> O(W log W) for the stream min; W is typically ≤ 100 in a scheduler tier so this is a rounding error even at 1 K TPS.</p>
+      </div>
+
+      <div class="tabpanel" data-panel="assign-affinity">
+        <div class="kicker">extension pattern — from LLD §13.3</div>
+        <pre class="code">public class AffinityAssignmentStrategy implements TaskAssignmentStrategy {
+
+  @Override
+  public Optional&lt;Worker&gt; assignTask(Task task, List&lt;Worker&gt; availableWorkers) {
+    String requiredTag = task.getPayload().get("required_tag");
+
+    return availableWorkers.stream()
+        .filter(Worker::isAvailable)
+        .filter(w -&gt; requiredTag == null || w.hasTag(requiredTag))
+        .min(Comparator.comparingInt(Worker::getCurrentLoad));
+  }
+
+  @Override
+  public String getStrategyName() { return "AFFINITY"; }
+}
+
+<span class="cm">// Wire in AppConfig — ZERO changes to SchedulerService or ExecutionService:</span>
+config.setAssignmentStrategy(new AffinityAssignmentStrategy());</pre>
+        <p class="muted"><b>Use case:</b> GPU tasks require <code>gpu</code>-tagged workers; high-memory ML jobs need <code>hi-mem</code> workers. Worker tags live on <code>Worker.tags</code> (Set&lt;String&gt;); the strategy filters + falls back to least-loaded within the affinity subset. This is a textbook <b>Open/Closed Principle</b> extension — a whole new class of behavior with zero touches to existing code.</p>
+      </div>
+
+      <div class="tabpanel" data-panel="assign-cmp">
+        <table>
+          <thead><tr><th>Strategy</th><th>Complexity</th><th>State</th><th>Best for</th><th>Weakness</th></tr></thead>
+          <tbody>
+            <tr><td><b>RoundRobin</b></td><td>O(W)</td><td>AtomicInteger counter</td><td>homogeneous cluster, uniform tasks</td><td>ignores load — can overload small workers</td></tr>
+            <tr><td><b>LeastLoaded</b></td><td>O(W log W)</td><td>stateless</td><td>heterogeneous workers, variable task duration</td><td>ignores affinity (GPU / hi-mem / region)</td></tr>
+            <tr><td><b>Affinity (ext)</b></td><td>O(W log W)</td><td>stateless</td><td>tagged workloads (GPU, hi-mem, region-pinned)</td><td>requires operator to tag both workers and tasks</td></tr>
+          </tbody>
+        </table>
+        <p class="muted"><b>Interview point:</b> production schedulers (Kubernetes scheduler, Nomad, YARN) combine all three via a <b>scoring function</b>: for each candidate worker, sum weighted scores from multiple predicates (fits? tagged? load percentile?). Our Strategy interface is deliberately narrow (<code>assignTask → Optional&lt;Worker&gt;</code>) so a <code>ScoringAssignmentStrategy</code> could compose the primitives without changing <code>SchedulerService</code>.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- E · TASK STATE MACHINE -->
+  <section>
+    <div class="sec-h"><span class="n">E</span><h2>Task state machine — 9 states, guarded transitions</h2><span class="tag">from <code>model/TaskStatus.java</code> + <code>model/Task.java</code></span></div>
+
+    <div class="grid g2">
+      <div class="card">
+        <div class="kicker">the 9 states</div>
+        <pre class="code">PENDING       <span class="cm">// initial — just created, not yet queued</span>
+QUEUED        <span class="cm">// in TaskQueue, waiting for dispatch</span>
+ASSIGNED      <span class="cm">// worker chosen, about to run</span>
+RUNNING       <span class="cm">// executing on a worker</span>
+COMPLETED     <span class="cm">// terminal — success</span>
+FAILED        <span class="cm">// terminal — retries exhausted</span>
+RETRYING      <span class="cm">// active — waiting for backoff, then re-dispatch</span>
+CANCELLED     <span class="cm">// terminal — user cancelled before completion</span>
+TIMED_OUT     <span class="cm">// terminal — exceeded timeoutMillis</span>
+
+<span class="cm">// helpers on TaskStatus enum:</span>
+isTerminal() = COMPLETED | FAILED | CANCELLED | TIMED_OUT
+isActive()   = RUNNING | ASSIGNED | RETRYING</pre>
+      </div>
+
+      <div class="card">
+        <div class="kicker">happy path</div>
+        <pre class="code">PENDING
+  ↓  submitTask()   <span class="cm">// engine.enqueue</span>
+QUEUED
+  ↓  scheduleAndDispatch()   <span class="cm">// assign worker</span>
+ASSIGNED
+  ↓  executionService.executeTask()  <span class="cm">// markStarted</span>
+RUNNING
+  ↓  simulate → TaskResult.success
+COMPLETED
+
+<span class="cm">// failure loop — see next card</span>
+RUNNING → FAILED (temp) → retry decision
+       ↑                      ↓
+       └────── RETRYING ←─────┘
+                (attemptNumber &lt;= maxRetries)</pre>
+      </div>
+    </div>
+
+    <div class="card" style="margin-top:14px">
+      <div class="kicker">the transition method — from <code>service/ExecutionService.java</code> (paraphrased)</div>
+      <pre class="code">public void handleTaskFailure(TaskExecution execution, String error) {
+  Worker worker = workerRepo.findById(execution.getWorkerId()).orElseThrow();
+  worker.decrementLoad();                          <span class="cm">// free the slot regardless</span>
+
+  Task task = taskRepo.findById(execution.getTaskId()).orElseThrow();
+  int attemptNumber = execution.getAttemptNumber();
+
+  if (retryStrategy.shouldRetry(task, attemptNumber, error)) {
+    task.updateStatus(TaskStatus.RETRYING);        <span class="cm">// will be re-picked next tick</span>
+    <span class="cm">// In prod: schedule re-enqueue with retryStrategy.getRetryDelayMillis(attempt)</span>
+  } else {
+    task.updateStatus(TaskStatus.FAILED);          <span class="cm">// terminal — retries exhausted</span>
+  }
+  taskRepo.save(task);
+}
+
+<span class="cm">// cancelTask() guard — from service/TaskService.java</span>
+public void cancelTask(String taskId) {
+  Task task = taskRepo.findById(taskId).orElseThrow(
+      () -&gt; new SchedulerException("Task not found: " + taskId));
+  TaskStatus current = task.getStatus();
+  if (current == TaskStatus.COMPLETED || current == TaskStatus.FAILED) {
+    throw new SchedulerException("Cannot cancel task in terminal state: " + current);
+  }
+  task.updateStatus(TaskStatus.CANCELLED);
+  taskRepo.save(task);
+}</pre>
+    </div>
+
+    <div class="callout tip"><b>Why put <code>isTerminal()</code> on the enum:</b> the check appears in <b>at least 4 places</b> — <code>cancelTask</code> (block cancel), <code>Failover.reassignTasks</code> (skip terminal tasks), <code>DependencyResolver.getReadyTasks</code> (COMPLETED unblocks), and <code>MonitoringService.getFailureRate</code> (denominator). Encoding it on the enum instead of scattering <code>if (s == COMPLETED || s == FAILED || ...)</code> across the codebase means adding a new terminal state (e.g., <code>PERMANENTLY_LOST</code>) is a one-line change.</div>
+  </section>
+
+  <!-- F · SEQUENCE DIAGRAM -->
+  <section>
+    <div class="sec-h"><span class="n">F</span><h2>Sequence — submit → dispatch → execute → retry</h2><span class="tag">who calls whom, in order</span></div>
+    <div class="card">
+      <pre class="code">Client          Controller           SchedulerService        Engine              DepResolver     TaskQueue        WorkerSvc         AssignStrategy    ExecutionSvc      Worker
+  │ POST /tasks     │                        │                        │                    │                │                │                │                │                │
+  │────────────────►│                        │                        │                    │                │                │                │                │                │
+  │                 │ submitTask(task)       │                        │                    │                │                │                │                │                │
+  │                 │───────────────────────►│                        │                    │                │                │                │                │                │
+  │                 │                        │ TaskService.createTask │                    │                │                │                │                │                │
+  │                 │                        │ (validate + save)      │                    │                │                │                │                │                │
+  │                 │                        │                        │                    │                │                │                │                │                │
+  │                 │                        │ engine.submitTask(task)│                    │                │                │                │                │                │
+  │                 │                        │───────────────────────►│                    │                │                │                │                │                │
+  │                 │                        │                        │ addDependency ×N   │                │                │                │                │                │
+  │                 │                        │                        │───────────────────►│                │                │                │                │                │
+  │                 │                        │                        │ enqueue(task)      │                │                │                │                │                │
+  │                 │                        │                        │───────────────────────────────────►│                │                │                │                │
+  │ 202 Accepted    │                        │                        │                    │                │                │                │                │                │
+  │◄────────────────│◄───────────────────────│                        │                    │                │                │                │                │                │
+  │                 │                        │                        │                    │                │                │                │                │                │
+  │ POST /run       │                        │                        │                    │                │                │                │                │                │
+  │────────────────►│                        │                        │                    │                │                │                │                │                │
+  │                 │ scheduleAndDispatch()  │                        │                    │                │                │                │                │                │
+  │                 │───────────────────────►│                        │                    │                │                │                │                │                │
+  │                 │                        │ engine.tick()          │                    │                │                │                │                │                │
+  │                 │                        │───────────────────────►│                    │                │                │                │                │                │
+  │                 │                        │                        │ cron scan          │                │                │                │                │                │
+  │                 │                        │                        │ getReadyTasks(done)│                │                │                │                │                │
+  │                 │                        │                        │───────────────────►│                │                │                │                │                │
+  │                 │                        │                        │ drain queue        │                │                │                │                │                │
+  │                 │                        │                        │───────────────────────────────────►│                │                │                │                │
+  │                 │                        │ ready: List&lt;Task&gt;      │                    │                │                │                │                │                │
+  │                 │                        │◄───────────────────────│                    │                │                │                │                │                │
+  │                 │                        │ getAvailableWorkers()  │                    │                │                │                │                │                │
+  │                 │                        │─────────────────────────────────────────────────────────────────────────────►│                │                │                │
+  │                 │                        │ assignTask(task, ws)   │                    │                │                │                │                │                │
+  │                 │                        │─────────────────────────────────────────────────────────────────────────────────────────────►│                │                │
+  │                 │                        │ task.status = ASSIGNED │                    │                │                │                │                │                │
+  │                 │                        │ executeTask(task, w)   │                    │                │                │                │                │                │
+  │                 │                        │─────────────────────────────────────────────────────────────────────────────────────────────────────────────►│                │
+  │                 │                        │                        │                    │                │                │                │                │ markStarted   │
+  │                 │                        │                        │                    │                │                │                │                │ incrementLoad │
+  │                 │                        │                        │                    │                │                │                │                │──────────────►│
+  │                 │                        │                        │                    │                │                │                │                │ simulate work │
+  │                 │                        │                        │                    │                │                │                │                │ TaskResult    │
+  │                 │                        │                        │                    │                │                │                │                │◄──────────────│
+  │                 │                        │                        │                    │                │                │                │                │ COMPLETED     │
+  │                 │                        │                        │                    │                │                │                │                │ decrementLoad │
+  │                 │                        │                        │                    │                │                │                │                │               │
+  │ 200 OK          │                        │                        │                    │                │                │                │                │               │
+  │◄────────────────│◄───────────────────────│                        │                    │                │                │                │                │               │</pre>
+    </div>
+
+    <div class="callout tip"><b>Latency budget (typical dispatch tick):</b> cron scan 0.1 ms (N ≤ 100) · getReadyTasks 1 ms (V+E ≤ 10 K) · queue drain 0.5 ms · getAvailableWorkers 0.5 ms (CHM read) · assignTask O(W log W) &lt; 1 ms · executeTask handoff 0.1 ms = <b>~3 ms per tick per task</b>. At 1 s tick cadence and 100-task batches, a single scheduler node dispatches ~30 K tasks/min. Work simulation (Step 5) is off the critical path — actual worker latency lives on the worker fleet, not the scheduler.</div>
+  </section>
+
+  <!-- FILE MAP + GLOSSARY -->
+  <section>
+    <div class="sec-h"><span class="n">§</span><h2>File map + Glossary</h2></div>
+    <div class="grid g2">
+      <div class="card"><div class="kicker">file map (50 files across 9 packages)</div><table><tbody>
+        <tr><td><code>config/AppConfig.java</code></td><td>Composition root — Factory + lazy singleton</td></tr>
+        <tr><td><code>controller/SchedulerController.java</code></td><td>REST facade — 7 handlers</td></tr>
+        <tr><td><code>display/SchedulerStatsDisplay.java</code></td><td>Console output helper (tables, DAG)</td></tr>
+        <tr><td><code>engine/SchedulerEngine.java</code></td><td><b>The engine</b> — tick() = cron + deps + queue</td></tr>
+        <tr><td><code>engine/{TaskQueue, DependencyResolver, CronParser}.java</code></td><td>Priority queue, Kahn's DAG, 5-field cron</td></tr>
+        <tr><td><code>service/SchedulerService.java</code></td><td><b>Facade</b> — submitTask, scheduleAndDispatch</td></tr>
+        <tr><td><code>service/{Task,Worker,Execution}Service.java</code></td><td>Core services — lifecycle, pool, retry</td></tr>
+        <tr><td><code>service/{LeaderElection,Failover,Monitoring}Service.java</code></td><td>Cluster + observability services</td></tr>
+        <tr><td><code>strategy/scheduling/*.java</code></td><td>Interface + 3 impls (Immediate, Cron, Delayed)</td></tr>
+        <tr><td><code>strategy/retry/*.java</code></td><td>Interface + 2 impls (ExpBackoff, FixedInterval)</td></tr>
+        <tr><td><code>strategy/assignment/*.java</code></td><td>Interface + 2 impls (RoundRobin, LeastLoaded)</td></tr>
+        <tr><td><code>repository/{Task,Worker,Execution,SchedulerNode}Repository.java</code></td><td>4 interfaces + 4 InMemory impls (CHM)</td></tr>
+        <tr><td><code>model/*.java</code></td><td>13 files — Task (Builder), TaskExecution, Worker, SchedulerNode, TaskDependency, TaskGroup, TaskResult, RetryPolicy, CronSchedule + 4 enums (TaskStatus, TaskPriority, TaskType, WorkerStatus)</td></tr>
+        <tr><td><code>exception/*.java</code></td><td>5 exceptions extending SchedulerException</td></tr>
+      </tbody></table></div>
+
+      <div class="card"><div class="kicker">glossary</div><table><tbody>
+        <tr><td><b>Tick</b></td><td>one iteration of the scheduler loop — cron scan + dep resolve + queue drain + dispatch</td></tr>
+        <tr><td><b>Kahn's algorithm</b></td><td>O(V+E) topological sort — seed queue with in-degree=0 nodes, BFS peel</td></tr>
+        <tr><td><b>DFS 3-coloring</b></td><td>cycle-detection: WHITE unvisited, GRAY in-stack, BLACK done; back edge to GRAY = cycle</td></tr>
+        <tr><td><b>Bully algorithm</b></td><td>leader election — highest-priority alive node wins; each node challenges higher-priority peers</td></tr>
+        <tr><td><b>Jitter</b></td><td>±10 % random offset on retry delay — prevents thundering herd when many tasks fail together</td></tr>
+        <tr><td><b>Thundering herd</b></td><td>failure mode where 10 K deterministic retries hit the same downstream at the same instant, re-triggering the outage</td></tr>
+        <tr><td><b>Priority + FIFO</b></td><td>TaskQueue comparator: priority DESC, then createdAt ASC — fairness within a priority lane</td></tr>
+        <tr><td><b>getReadyTasks(completed)</b></td><td>DependencyResolver query — returns taskIds whose ALL upstream deps are in completed set</td></tr>
+        <tr><td><b>Facade (SchedulerService)</b></td><td>single door — hides Task+Worker+Execution+Engine+Strategy wiring behind submitTask + scheduleAndDispatch</td></tr>
+        <tr><td><b>Composition root (AppConfig)</b></td><td>the ONE place that instantiates concrete classes — services depend on interfaces</td></tr>
+        <tr><td><b>Strategy pluggability</b></td><td>swap RetryStrategy / AssignmentStrategy at runtime via <code>AppConfig.setXxxStrategy(...)</code> — zero service changes</td></tr>
+        <tr><td><b>ConcurrentHashMap</b></td><td>lock-free reads, segment-level write locks — backing store for all InMemory*Repositories</td></tr>
+      </tbody></table></div>
+    </div>
+  </section>
+
+  <footer>
+    <p>Use case 17 · Distributed Task Scheduler — Canvas 2 of 3 (LLD). All 18 classes on the map verified against real Java under <code>17-distributed-task-scheduler/src/main/java/com/systemdesign/scheduler/</code>. No invented method signatures.</p>
+    <p class="run"><a href="hld.html">← Canvas 1 · HLD</a> · Canvas 2 · LLD · <a href="deepdive.html">Canvas 3 · Deep-dive &amp; Trade-offs →</a> &nbsp;|&nbsp; <a href="../index.html">Hub</a></p>
+  </footer>
+
+</div>
+<script src="../assets/canvas.js"></script>
+</body>
+</html>

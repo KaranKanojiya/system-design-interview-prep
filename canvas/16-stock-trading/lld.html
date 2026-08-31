@@ -1,0 +1,505 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>16 · Stock Trading — LLD</title>
+<link rel="stylesheet" href="../assets/canvas.css">
+</head>
+<body>
+
+<div class="wrap">
+
+  <header class="hero">
+    <h1>Stock Trading — Low-Level Design</h1>
+    <div class="sub">Canvas 2 of 3. Real Java classes under <code>16-stock-trading/src/main/java/com/systemdesign/trading/</code>. Composition root <code>AppConfig</code> → controller → <b>Facade <code>TradingService</code></b> → 5 collaborators (OrderService · RiskService · <code>MatchingService</code> → <b>MatchingEngine ★</b> · PortfolioService · AccountService) → 3 strategy families (order execution · risk · P&amp;L) → 6 in-memory repositories. The Matching Engine holds one <code>OrderBook</code> per symbol built from <b>TreeMap × 2 + FIFO PriceLevel queue</b>. Click any class for its methods. Includes verbatim <code>matchAgainstAsks</code> walk-through, order-type strategy tabs, and the <code>Order</code> state machine.</div>
+    <div class="badges">
+      <span class="badge lvl">Use case 16 · LLD</span>
+      <span class="badge">Canvas 2 of 3</span>
+      <span class="badge">grounded in code</span>
+      <span class="badge">Strategy × 3 · Facade · Chain-of-Responsibility · State · Builder · Repository</span>
+    </div>
+    <div class="legend">
+      <span><i class="dot" style="background:var(--eden)"></i> composition root / entry</span>
+      <span><i class="dot" style="background:var(--survivor)"></i> facade &amp; services</span>
+      <span><i class="dot" style="background:var(--warn)"></i> matching engine (star)</span>
+      <span><i class="dot" style="background:var(--fig)"></i> strategies (swappable)</span>
+      <span><i class="dot" style="background:var(--old)"></i> domain models &amp; repos</span>
+    </div>
+  </header>
+
+  <!-- A · CLASS MAP -->
+  <section>
+    <div class="sec-h"><span class="n">A</span><h2>Class map — click any class</h2><span class="tag">from <code>src/main/java/com/systemdesign/trading/</code></span></div>
+    <div>
+      <div class="arch">
+        <svg viewBox="0 0 900 520" width="100%" style="max-width:900px" role="img" aria-label="Stock trading class map">
+          <defs>
+            <marker id="ah16l" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" fill="var(--muted)"></path></marker>
+          </defs>
+          <!-- Grid: 3 cols (x=20 w=240, x=330 w=240, x=640 w=240), 6 rows (y=30,110,190,270,350,430, h=54).
+               Gutters at x=260-330 (70px) and x=570-640 (70px). Row-gaps 26px (84-110, 164-190, 244-270, 324-350, 404-430).
+               Mid-y per row: 57, 137, 217, 297, 377, 457. -->
+
+          <!-- ═══════ arrows ═══════ -->
+
+          <!-- Col 1 verticals (composition chain) -->
+          <line class="arrow" x1="140" y1="84" x2="140" y2="110" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah16l)"></line>
+          <line class="arrow" x1="140" y1="164" x2="140" y2="190" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah16l)"></line>
+          <line class="arrow" x1="140" y1="244" x2="140" y2="270" stroke="var(--muted)" stroke-width="1.5" stroke-dasharray="4 3" marker-end="url(#ah16l)"></line>
+          <line class="arrow" x1="140" y1="324" x2="140" y2="350" stroke="var(--muted)" stroke-width="1.5" stroke-dasharray="4 3" marker-end="url(#ah16l)"></line>
+
+          <!-- ★ TradingService → MatchingEngine — THE STAR CALL — L-path through col1-2 gutter -->
+          <path class="arrow" d="M260,217 L295,217 L295,217 L330,217" fill="none" stroke="var(--warn)" stroke-width="2.5" marker-end="url(#ah16l)"></path>
+          <text class="edge-label" x="295" y="210" text-anchor="middle" fill="var(--warn)" font-weight="700">submitOrder</text>
+
+          <!-- TradingService → RiskService (dashed uses, L-path down to R5) -->
+          <path class="arrow" d="M180,244 L200,244 L200,377 L200,377" fill="none" stroke="var(--muted)" stroke-width="1.2" stroke-dasharray="4 3" marker-end="url(#ah16l)"></path>
+
+          <!-- MatchingEngine → OrderBook (col 2 vertical R3→R4) -->
+          <line class="arrow" x1="450" y1="244" x2="450" y2="270" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah16l)"></line>
+
+          <!-- OrderBook → PriceLevel (col 2 vertical R4→R5) -->
+          <line class="arrow" x1="450" y1="324" x2="450" y2="350" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah16l)"></line>
+
+          <!-- MatchingEngine → OrderExecutionStrategy (row 3 horizontal via gutter 2, dashed = uses) -->
+          <line class="arrow" x1="570" y1="217" x2="640" y2="217" stroke="var(--muted)" stroke-width="1.5" stroke-dasharray="4 3" marker-end="url(#ah16l)"></line>
+
+          <!-- OrderBook peekFirst/removeFirst back-and-forth with strategy — routed via right gutter -->
+          <path class="arrow" d="M570,285 L605,285 L605,207 L640,207" fill="none" stroke="var(--muted)" stroke-width="1.2" stroke-dasharray="2 3" marker-end="url(#ah16l)"></path>
+
+          <!-- RiskService → RiskCheckStrategy (row 5 horizontal via gutter 2, dashed) -->
+          <line class="arrow" x1="570" y1="297" x2="640" y2="297" stroke="var(--muted)" stroke-width="1.5" stroke-dasharray="4 3" marker-end="url(#ah16l)"></line>
+
+          <!-- RiskService (col1 R5) → RiskCheckStrategy (col3 R4) — L-path via row-gap 324-350 to avoid OrderBook interior -->
+          <path class="arrow" d="M260,377 L295,377 L295,337 L605,337 L605,297 L640,297" fill="none" stroke="var(--muted)" stroke-width="1.5" marker-end="url(#ah16l)"></path>
+
+          <!-- PortfolioService → PnLStrategy (row 1 → row 5 col 3, long L-path via right gutter) -->
+          <path class="arrow" d="M570,60 L625,60 L625,377 L640,377" fill="none" stroke="var(--muted)" stroke-width="1.2" stroke-dasharray="4 3" marker-end="url(#ah16l)"></path>
+
+          <!-- OrderService → Order model (diagonal top-right dashed) -->
+          <line class="arrow" x1="260" y1="290" x2="640" y2="60" stroke="var(--muted)" stroke-width="1.2" stroke-dasharray="4 3" marker-end="url(#ah16l)"></line>
+
+          <!-- MatchingService → MatchingEngine (row 2 col2 vertical, from R2 down to R3) -->
+          <line class="arrow" x1="450" y1="164" x2="450" y2="190" stroke="var(--muted)" stroke-width="1.8" marker-end="url(#ah16l)"></line>
+
+          <!-- TradingService → PortfolioService (diagonal up dashed uses) -->
+          <line class="arrow" x1="260" y1="200" x2="330" y2="70" stroke="var(--muted)" stroke-width="1.2" stroke-dasharray="4 3" marker-end="url(#ah16l)"></line>
+
+          <!-- Services → Repositories (row 6 horizontal via gutter 2, dashed) -->
+          <line class="arrow" x1="570" y1="457" x2="640" y2="457" stroke="var(--muted)" stroke-width="1.2" stroke-dasharray="2 3" marker-end="url(#ah16l)"></line>
+
+          <!-- RiskService → Exceptions (col 1 vertical R5→R6, dashed = throws) -->
+          <line class="arrow" x1="140" y1="404" x2="140" y2="430" stroke="var(--muted)" stroke-width="1.2" stroke-dasharray="4 3" marker-end="url(#ah16l)"></line>
+
+          <!-- OrderExecutionStrategy → Trade + Position (col 3 R3 → R2, dashed = creates) -->
+          <line class="arrow" x1="760" y1="190" x2="760" y2="164" stroke="var(--muted)" stroke-width="1.2" stroke-dasharray="4 3" marker-end="url(#ah16l)"></line>
+
+          <!-- ═══════ NODES (18 total) ═══════ -->
+
+          <!-- Col 1 — composition + facade + orders + risk -->
+          <g data-node style="cursor:pointer" data-title="AppConfig (Factory · composition root)" data-detail="<b>Path:</b> <code>config/AppConfig.java</code>. The ONLY place where <code>new ConcreteClass()</code> appears.<br><b>Wires (in order):</b> Repositories → MatchingEngine + registerStrategy(MARKET, LIMIT) → Services → risk-check chain (Circuit → Margin → Position) → TradingService (Facade) → TradingController.<br><b>Seed helpers:</b> <code>seedStocks()</code>, <code>seedUsers()</code>, <code>seedAccounts()</code>, <code>seedMarketData()</code>.<br><b>PnL strategy default:</b> <code>AvgCostPnLStrategy</code> (swappable to <code>FIFOPnLStrategy</code> for tax reports)."><rect x="20" y="30" width="240" height="54" rx="9" fill="var(--panel-2)" stroke="var(--eden)"></rect><text x="140" y="55" text-anchor="middle" fill="var(--eden)" font-size="13" font-weight="600">AppConfig</text><text x="140" y="72" text-anchor="middle" fill="var(--faint)" font-size="11">composition root · lazy init</text></g>
+
+          <g data-node style="cursor:pointer" data-title="TradingController (REST adapter)" data-detail="<b>Path:</b> <code>controller/TradingController.java</code>. Simulated REST — maps HTTP-shaped calls to <code>TradingService</code>.<br><b>Handlers:</b> <code>handlePlaceOrder(userId, symbol, side, type, price, qty)</code>, <code>handleCancelOrder(orderId, symbol)</code>, <code>handleGetPortfolio(userId)</code>, <code>handleGetOrders(userId)</code>, <code>handleGetOrderBook(symbol)</code>, <code>handleGetMarketData(symbol)</code>.<br><b>Never contains business logic</b> — thin adapter over TradingService."><rect x="20" y="110" width="240" height="54" rx="9" fill="var(--panel-2)" stroke="var(--border)"></rect><text x="140" y="135" text-anchor="middle" fill="var(--text)" font-size="13" font-weight="600">TradingController</text><text x="140" y="152" text-anchor="middle" fill="var(--faint)" font-size="11">REST adapter · thin</text></g>
+
+          <g data-node style="cursor:pointer" data-title="TradingService (Facade)" data-detail="<b>Path:</b> <code>service/TradingService.java</code>. THE ONE DOOR for order writes.<br><b>Method:</b> <code>Order placeOrder(userId, symbol, side, type, price, qty)</code>:<br>(1) <code>OrderService.validateAndSave(order)</code>.<br>(2) <code>RiskService.runChecks(order, account, marketData)</code>.<br>(3) if pass → <code>AccountService.blockMargin(userId, amount)</code>.<br>(4) <code>order.markOpen()</code> → PENDING_RISK → OPEN.<br>(5) <b>★ <code>MatchingService.submitOrder(order)</code></b> → List&lt;Trade&gt;.<br>(6) for each trade → <code>PortfolioService.updatePositionOnTrade</code> + <code>MarketDataService.updateOnTrade</code>.<br>(7) release excess margin · notify · save."><rect x="20" y="190" width="240" height="54" rx="9" fill="var(--panel-2)" stroke="var(--survivor)"></rect><text x="140" y="215" text-anchor="middle" fill="var(--survivor)" font-size="13" font-weight="600">TradingService</text><text x="140" y="232" text-anchor="middle" fill="var(--faint)" font-size="11">Facade · placeOrder</text></g>
+
+          <g data-node style="cursor:pointer" data-title="OrderService" data-detail="<b>Path:</b> <code>service/OrderService.java</code>.<br><b>Wraps:</b> OrderRepository.<br><b>Methods:</b> <code>validateAndSave(Order)</code> — field validation + repo save (status=PENDING_RISK); <code>updateOrder(Order)</code> — persist state transitions; <code>Order getOrder(orderId)</code>; <code>List&lt;Order&gt; getOrdersByUserId(userId)</code>; <code>getActiveOrders(symbol)</code>.<br><b>Never</b> matches orders — that's the engine's job. Just CRUD + validation."><rect x="20" y="270" width="240" height="54" rx="9" fill="var(--panel-2)" stroke="var(--survivor)"></rect><text x="140" y="295" text-anchor="middle" fill="var(--survivor)" font-size="13" font-weight="600">OrderService</text><text x="140" y="312" text-anchor="middle" fill="var(--faint)" font-size="11">validate · CRUD · repo</text></g>
+
+          <g data-node style="cursor:pointer" data-title="RiskService (Chain of Responsibility)" data-detail="<b>Path:</b> <code>service/RiskService.java</code>. Chains risk checks — <b>fail-fast</b> on first rejection.<br><b>Method:</b> <code>RiskResult runChecks(Order, Account, MarketData)</code>:<br><pre>for (RiskCheckStrategy check : riskChecks) {\n  RiskResult r = check.check(order, account, marketData);\n  if (!r.isPassed()) return r; // fail fast\n}\nreturn RiskResult.pass();</pre><b>Order matters:</b> cheap checks first (CircuitBreaker O(1) → Margin O(read) → PositionLimit O(aggregate)). New rule = new strategy, zero edits here."><rect x="20" y="350" width="240" height="54" rx="9" fill="var(--panel-2)" stroke="var(--survivor)"></rect><text x="140" y="375" text-anchor="middle" fill="var(--survivor)" font-size="13" font-weight="600">RiskService</text><text x="140" y="392" text-anchor="middle" fill="var(--faint)" font-size="11">chain · fail-fast</text></g>
+
+          <g data-node style="cursor:pointer" data-title="Exception hierarchy (5)" data-detail="<b>Path:</b> <code>exception/</code>.<br><b>Base:</b> <code>TradingException extends RuntimeException</code>.<br><b>Types:</b><br>• <code>OrderRejectedException(reason)</code> → thrown by RiskService.<br>• <code>InsufficientMarginException(available, required)</code> → MarginCheckStrategy.<br>• <code>InvalidOrderException(field, value)</code> → OrderService validation.<br>• <code>CircuitBreakerException(price, upper, lower)</code> → CircuitBreakerStrategy.<br><b>Guides HTTP mapping:</b> 400/402/409/503 in the controller layer."><rect x="20" y="430" width="240" height="54" rx="9" fill="var(--panel-2)" stroke="var(--warn)"></rect><text x="140" y="455" text-anchor="middle" fill="var(--warn)" font-size="13" font-weight="600">Exceptions (5)</text><text x="140" y="472" text-anchor="middle" fill="var(--faint)" font-size="11">extend TradingException</text></g>
+
+          <!-- Col 2 — matching engine core -->
+          <g data-node style="cursor:pointer" data-title="PortfolioService + AccountService" data-detail="<b>PortfolioService</b> (<code>service/PortfolioService.java</code>): <code>updatePositionOnTrade(Trade)</code> — updates buyer/seller Position (qty + avg_cost) via injected <code>PnLStrategy</code>. <code>calculateUnrealizedPnL(userId)</code> — reads LTP from MarketDataService, marks position to market. <code>getPositions(userId)</code>.<br><br><b>AccountService</b> (<code>service/AccountService.java</code>): <code>blockMargin(userId, amount)</code> — CAS on version. <code>releaseMargin(userId, amount)</code>. <code>settleTradePayment(trade)</code> — T+1 debit/credit. Invariant: <code>balance + blocked + used = total</code>."><rect x="330" y="30" width="240" height="54" rx="9" fill="var(--panel-2)" stroke="var(--survivor)"></rect><text x="450" y="55" text-anchor="middle" fill="var(--survivor)" font-size="13" font-weight="600">Portfolio + Account Svc</text><text x="450" y="72" text-anchor="middle" fill="var(--faint)" font-size="11">positions · P&amp;L · margin</text></g>
+
+          <g data-node style="cursor:pointer" data-title="MatchingService (thin wrapper)" data-detail="<b>Path:</b> <code>service/MatchingService.java</code>. Infrastructure adapter around the pure algorithmic <code>MatchingEngine</code>.<br><b>Methods:</b><br>• <code>submitOrder(Order) → List&lt;Trade&gt;</code> — delegates to engine, then persists each trade via <code>TradeRepository.save</code>.<br>• <code>cancelOrder(orderId, symbol)</code> — delegates to engine's <code>OrderBook.removeOrder</code>.<br>• <code>getOrderBook(symbol)</code> — read-only access for display.<br><b>Why the wrapper:</b> keeps <code>MatchingEngine</code> free of repository dependencies — the engine is pure logic, testable in isolation."><rect x="330" y="110" width="240" height="54" rx="9" fill="var(--panel-2)" stroke="var(--survivor)"></rect><text x="450" y="135" text-anchor="middle" fill="var(--survivor)" font-size="13" font-weight="600">MatchingService</text><text x="450" y="152" text-anchor="middle" fill="var(--faint)" font-size="11">engine + trade repo</text></g>
+
+          <g data-node style="cursor:pointer" data-title="MatchingEngine (engine · THE STAR)" data-detail="<b>Path:</b> <code>engine/MatchingEngine.java</code>. Pure algorithmic core — no DB, no network.<br><b>State:</b> <code>Map&lt;String, OrderBook&gt; orderBooks</code> (one book per symbol, lazy-created) + <code>Map&lt;OrderType, OrderExecutionStrategy&gt; strategies</code>.<br><b>Method:</b> <code>List&lt;Trade&gt; submitOrder(Order order)</code>:<br><pre>OrderBook book = getOrCreateOrderBook(symbol);\nOrderExecutionStrategy s = strategies.get(order.getType());\nreturn s.execute(order, book);  // pure delegation</pre><b>Concurrency:</b> in prod, one thread per symbol; here single-thread for the JVM demo.<br><b>Full code walk-through in Section B.</b>"><rect x="330" y="190" width="240" height="54" rx="9" fill="var(--panel-2)" stroke="var(--warn)" stroke-width="2"></rect><text x="450" y="215" text-anchor="middle" fill="var(--warn)" font-size="14" font-weight="700">MatchingEngine ★</text><text x="450" y="232" text-anchor="middle" fill="var(--faint)" font-size="11">strategy dispatcher</text></g>
+
+          <g data-node style="cursor:pointer" data-title="OrderBook (TreeMap × 2 · the data structure)" data-detail="<b>Path:</b> <code>engine/OrderBook.java</code>. The key data structure.<br><b>Fields:</b><br>• <code>bids: TreeMap&lt;Double, PriceLevel&gt;</code> — <code>Comparator.reverseOrder()</code> → highest price first.<br>• <code>asks: TreeMap&lt;Double, PriceLevel&gt;</code> — natural order → lowest first.<br>• <code>orderIndex: Map&lt;String, OrderLocationIndex&gt;</code> — O(log N) cancellation.<br><b>Ops:</b> <code>addOrder(Order)</code>, <code>removeOrder(orderId)</code>, <code>getBestBid()</code>, <code>getBestAsk()</code> — all O(log N) or better.<br><b>Depth:</b> <code>getBidDepth(N)</code>, <code>getAskDepth(N)</code> — top N levels for display.<br><b>Spread:</b> <code>getSpread()</code> = bestAsk − bestBid."><rect x="330" y="270" width="240" height="54" rx="9" fill="var(--panel-2)" stroke="var(--old)"></rect><text x="450" y="295" text-anchor="middle" fill="var(--old)" font-size="13" font-weight="600">OrderBook</text><text x="450" y="312" text-anchor="middle" fill="var(--faint)" font-size="11">TreeMap × 2 + index</text></g>
+
+          <g data-node style="cursor:pointer" data-title="PriceLevel (FIFO queue at one price)" data-detail="<b>Path:</b> <code>engine/PriceLevel.java</code>. One instance per non-empty price on either side of the book.<br><b>Fields:</b> <code>double price</code>, <code>LinkedList&lt;Order&gt; orders</code> (FIFO — head = earliest), <code>int totalQuantity</code> (O(1) depth).<br><b>Ops:</b> <code>addOrder(Order)</code> — O(1) addLast; <code>removeFirst()</code> — O(1); <code>peekFirst()</code> — O(1); <code>removeOrder(orderId)</code> — O(K) scan; <code>updateQuantityAfterFill(int)</code>.<br><b>Why LinkedList</b> not ArrayList: O(1) removeFirst; ArrayList removeFirst is O(N).<br><b>Time priority:</b> head fills first — universal exchange rule."><rect x="330" y="350" width="240" height="54" rx="9" fill="var(--panel-2)" stroke="var(--old)"></rect><text x="450" y="375" text-anchor="middle" fill="var(--old)" font-size="13" font-weight="600">PriceLevel</text><text x="450" y="392" text-anchor="middle" fill="var(--faint)" font-size="11">LinkedList · FIFO queue</text></g>
+
+          <g data-node style="cursor:pointer" data-title="MarketData + Settlement services" data-detail="<b>MarketDataService</b> (<code>service/MarketDataService.java</code>): <code>updateOnTrade(symbol, price, qty)</code> → LTP, high, low, volume, change%. <code>updateBidAsk(symbol, book)</code> → reads best bid/ask from OrderBook. Subscribed-symbol tracking for WebSocket push.<br><br><b>SettlementService</b> (<code>service/SettlementService.java</code>): <code>int settleTradesForDay()</code> → T+1 batch. For each unsettled trade: <code>accountService.settleTradePayment(trade)</code>, mark SETTLED, notify. Real world: end-of-day netting job."><rect x="330" y="430" width="240" height="54" rx="9" fill="var(--panel-2)" stroke="var(--survivor)"></rect><text x="450" y="455" text-anchor="middle" fill="var(--survivor)" font-size="13" font-weight="600">MarketData + Settlement</text><text x="450" y="472" text-anchor="middle" fill="var(--faint)" font-size="11">LTP · T+1 netting</text></g>
+
+          <!-- Col 3 — models + strategies + repos -->
+          <g data-node style="cursor:pointer" data-title="Order (aggregate · state machine)" data-detail="<b>Path:</b> <code>model/Order.java</code>. Aggregate root with GUARDED transitions.<br><b>Fields:</b> orderId, userId, symbol, side, type, price, quantity, filledQuantity, status, triggerPrice, createdAt, updatedAt, <code>List&lt;Trade&gt; trades</code>.<br><b>States (OrderStatus enum):</b> PENDING_RISK · OPEN · PARTIALLY_FILLED · FILLED · CANCELLED · REJECTED.<br><b>Transitions:</b> <code>markOpen()</code>, <code>fill(qty, trade)</code>, <code>cancel()</code>, <code>reject()</code> — each asserts current state is allowed, else throws <code>IllegalStateException</code>.<br><b>Computed:</b> <code>getRemainingQuantity() = quantity − filledQuantity</code> (never stored → no stale state).<br><b>Builder</b> — <code>new Order.Builder(userId, symbol, side, type).price(p).quantity(q).build()</code>."><rect x="640" y="30" width="240" height="54" rx="9" fill="var(--panel-2)" stroke="var(--old)"></rect><text x="760" y="55" text-anchor="middle" fill="var(--old)" font-size="13" font-weight="600">Order (aggregate)</text><text x="760" y="72" text-anchor="middle" fill="var(--faint)" font-size="11">state machine · Builder</text></g>
+
+          <g data-node style="cursor:pointer" data-title="Trade + Position + MarketData models" data-detail="<b>Trade</b> (<code>model/Trade.java</code>): tradeId, buyOrderId, sellOrderId, buyerId, sellerId, symbol, price, quantity, timestamp, settlementStatus. Immutable.<br><br><b>Position</b> (<code>model/Position.java</code>): userId + symbol composite key; qty, avgCost, realizedPnl, updatedAt. Mutable via <code>PortfolioService</code>.<br><br><b>MarketData</b> (<code>model/MarketData.java</code>): symbol, ltp, open, high, low, volume, bestBid, bestAsk, upperCircuit, lowerCircuit.<br><br><b>Account · Stock · RiskResult · User · Watchlist</b> — the rest of the 13 model classes."><rect x="640" y="110" width="240" height="54" rx="9" fill="var(--panel-2)" stroke="var(--old)"></rect><text x="760" y="135" text-anchor="middle" fill="var(--old)" font-size="13" font-weight="600">Trade + Position models</text><text x="760" y="152" text-anchor="middle" fill="var(--faint)" font-size="11">13 model classes total</text></g>
+
+          <g data-node style="cursor:pointer" data-title="OrderExecutionStrategy (2 impls)" data-detail="<b>Path:</b> <code>strategy/order/</code>.<br><b>Interface:</b> <code>List&lt;Trade&gt; execute(Order order, OrderBook book)</code>.<br><b>Impls:</b><br>• <code>MarketOrderStrategy</code> — match at any price, sweep the book until filled. No price check. Never rests.<br>• <code>LimitOrderStrategy</code> — match only within price limit (buy at ≤ limit; sell at ≥ limit). Unfilled remainder → <code>book.addOrder(order)</code> for later matching.<br><b>STOP_LOSS / STOP_LIMIT:</b> when triggered, promote to MARKET or LIMIT strategy respectively.<br><b>Section C — tabs walk-through.</b>"><rect x="640" y="190" width="240" height="54" rx="9" fill="var(--panel-2)" stroke="var(--fig)"></rect><text x="760" y="215" text-anchor="middle" fill="var(--fig)" font-size="13" font-weight="600">OrderExecutionStrategy</text><text x="760" y="232" text-anchor="middle" fill="var(--faint)" font-size="11">Market · Limit · Stop</text></g>
+
+          <g data-node style="cursor:pointer" data-title="RiskCheckStrategy (3 impls)" data-detail="<b>Path:</b> <code>strategy/risk/</code>.<br><b>Interface:</b> <code>RiskResult check(Order, Account, MarketData)</code>.<br><b>Impls:</b><br>• <code>CircuitBreakerStrategy</code> — is trading halted? is price within [lower, upper] band?<br>• <code>MarginCheckStrategy</code> — <code>availableMargin ≥ price × qty × marginPercent</code> (1.0 CNC · 0.20 MIS).<br>• <code>PositionLimitStrategy</code> — <code>currentQty + orderQty ≤ maxLimit</code>.<br><b>Pluggability:</b> new rule (wash-sale, KYC-tier) = new class in this folder + register in <code>AppConfig</code>."><rect x="640" y="270" width="240" height="54" rx="9" fill="var(--panel-2)" stroke="var(--fig)"></rect><text x="760" y="295" text-anchor="middle" fill="var(--fig)" font-size="13" font-weight="600">RiskCheckStrategy</text><text x="760" y="312" text-anchor="middle" fill="var(--faint)" font-size="11">Circuit · Margin · Limit</text></g>
+
+          <g data-node style="cursor:pointer" data-title="PnLStrategy (2 impls)" data-detail="<b>Path:</b> <code>strategy/pricing/</code>.<br><b>Interface:</b> <code>double calculateRealizedPnL(Position position, Trade closingTrade)</code>.<br><b>Impls:</b><br>• <code>AvgCostPnLStrategy</code> — <code>realized = (sellPrice − avgCost) × qty</code>. Simple, used by most Indian brokers (Zerodha).<br>• <code>FIFOPnLStrategy</code> — oldest buy lots closed first. Required for US &amp; India tax reporting (LTCG vs STCG).<br><b>Swap at runtime:</b> AppConfig injects the default; PortfolioService could accept override for tax-report mode."><rect x="640" y="350" width="240" height="54" rx="9" fill="var(--panel-2)" stroke="var(--fig)"></rect><text x="760" y="375" text-anchor="middle" fill="var(--fig)" font-size="13" font-weight="600">PnLStrategy</text><text x="760" y="392" text-anchor="middle" fill="var(--faint)" font-size="11">AvgCost · FIFO</text></g>
+
+          <g data-node style="cursor:pointer" data-title="Repositories (6 · in-memory)" data-detail="<b>Path:</b> <code>repository/</code>.<br><b>Interfaces + InMemory impls:</b><br>• <code>OrderRepository</code> / <code>InMemoryOrderRepository</code> — indexed by orderId + userId.<br>• <code>TradeRepository</code> — findUnsettled for T+1.<br>• <code>PositionRepository</code> — (userId, symbol) key.<br>• <code>AccountRepository</code>.<br>• <code>StockRepository</code> — symbol master + circuit limits.<br>• <code>MarketDataRepository</code>.<br><b>Prod mapping:</b> Order/Trade → Aurora PG · Position/Account → DynamoDB · Stock → Redis + PG · MarketData → Redis (hot) + Timestream (cold)."><rect x="640" y="430" width="240" height="54" rx="9" fill="var(--panel-2)" stroke="var(--old)"></rect><text x="760" y="455" text-anchor="middle" fill="var(--old)" font-size="13" font-weight="600">Repositories (6)</text><text x="760" y="472" text-anchor="middle" fill="var(--faint)" font-size="11">interfaces + InMemory</text></g>
+
+        </svg>
+      </div>
+      <div class="node-detail"><span class="nd-title">Click any class</span><div class="nd-body">Its file path, key method signatures, and how it plugs into the matching engine appear here.</div></div>
+    </div>
+  </section>
+
+  <!-- B · MATCHING CODE -->
+  <section>
+    <div class="sec-h"><span class="n">B</span><h2>The match — <code>LimitOrderStrategy.matchAgainstAsks</code></h2><span class="tag">verbatim · price-time priority · partial fills</span></div>
+    <div class="card">
+      <div class="kicker">from <code>strategy/order/LimitOrderStrategy.java</code></div>
+      <pre class="code"><span class="cm">// WALK-THROUGH (Buy Limit $105 for 200 shares):
+//   Ask side: $103×80 · $104.50×100 · $106×50
+//   Step 1: Match 80 @ $103 → Trade. Remaining = 120.
+//   Step 2: Match 100 @ $104.50 → Trade. Remaining = 20.
+//   Step 3: $106 &gt; $105 limit → STOP. Remaining 20 rests as bid at $105.</span>
+
+private void matchAgainstAsks(Order buyOrder, OrderBook book, List&lt;Trade&gt; trades) {
+  double priceLimit = buyOrder.getPrice();      <span class="cm">// buyer's maximum acceptable price</span>
+
+  while (buyOrder.getRemainingQuantity() &gt; 0 &amp;&amp; book.hasAsks()) {
+    PriceLevel bestAsk = book.getBestAsk();     <span class="cm">// O(log N) — TreeMap firstEntry()</span>
+    if (bestAsk == null || bestAsk.isEmpty()) break;
+
+    <span class="cm">// PRICE CHECK: only match if ask price is at or below buyer's limit</span>
+    if (bestAsk.getPrice() &gt; priceLimit) {
+      break;                                    <span class="cm">// no more matchable asks — remainder rests</span>
+    }
+
+    Order sellOrder = bestAsk.peekFirst();      <span class="cm">// FIFO — earliest seller at this price</span>
+    if (sellOrder == null) break;
+
+    int    fillQty   = Math.min(buyOrder.getRemainingQuantity(),
+                                sellOrder.getRemainingQuantity());
+    double fillPrice = sellOrder.getPrice();    <span class="cm">// execute at PASSIVE (maker) order's price</span>
+
+    Trade trade = new Trade(
+        buyOrder.getOrderId(),  sellOrder.getOrderId(),
+        buyOrder.getUserId(),   sellOrder.getUserId(),
+        buyOrder.getSymbol(),   fillPrice, fillQty
+    );
+    trades.add(trade);
+
+    buyOrder.fill(fillQty, trade);              <span class="cm">// updates status → PARTIALLY_FILLED or FILLED</span>
+    sellOrder.fill(fillQty, trade);
+    bestAsk.updateQuantityAfterFill(fillQty);
+
+    if (sellOrder.isFilled()) {
+      bestAsk.removeFirst();                    <span class="cm">// FIFO pop — next order at this level moves up</span>
+    }
+    if (bestAsk.isEmpty()) {
+      book.removeBestAsk();                     <span class="cm">// TreeMap.pollFirstEntry — level gone</span>
+    }
+  }
+}
+
+<span class="cm">// After matching:
+//   if (buyOrder.getRemainingQuantity() &gt; 0 &amp;&amp; buyOrder.isActive()) {
+//     book.addOrder(buyOrder);   ← unfilled remainder rests in bids at $105
+//   }</span></pre>
+    </div>
+    <div class="callout tip"><b>Why <b>fillPrice = sellOrder.getPrice()</b> (the passive order's price):</b> the resting sell order was there first — the buyer is the "aggressor" who crossed the spread. Exchange convention: <b>maker gets their price</b>, taker pays it. This also incentivises makers (rebate) and disincentivises takers (fee) — the "maker-taker" fee model. Selling at $103 (the resting price) instead of $105 (buyer's limit) is a $2 discount to the buyer — that's price improvement, and Reg NMS requires it if the venue can do better than NBBO.</div>
+  </section>
+
+  <!-- C · ORDER TYPE STRATEGY TABS -->
+  <section>
+    <div class="sec-h"><span class="n">C</span><h2>Order type strategies</h2><span class="tag">swap via <code>OrderType</code> → <code>OrderExecutionStrategy</code></span></div>
+    <div data-tabscope>
+      <div class="tabs">
+        <div class="tab active" data-tab="limit">Limit</div>
+        <div class="tab" data-tab="market">Market</div>
+        <div class="tab" data-tab="stoploss">Stop-loss</div>
+        <div class="tab" data-tab="iceberg">Iceberg</div>
+        <div class="tab" data-tab="cmp">comparison</div>
+      </div>
+      <div class="tabpanel active" data-panel="limit">
+        <div class="kicker"><code>strategy/order/LimitOrderStrategy.java</code></div>
+        <pre class="code">public List&lt;Trade&gt; execute(Order order, OrderBook book) {
+  List&lt;Trade&gt; trades = new ArrayList&lt;&gt;();
+  if (order.getSide() == OrderSide.BUY) {
+    matchAgainstAsks(order, book, trades);        <span class="cm">// match at ask ≤ limit</span>
+    if (order.getRemainingQuantity() &gt; 0 &amp;&amp; order.isActive()) {
+      book.addOrder(order);                       <span class="cm">// unfilled → rest as bid</span>
+    }
+  } else {
+    matchAgainstBids(order, book, trades);        <span class="cm">// match at bid ≥ limit</span>
+    if (order.getRemainingQuantity() &gt; 0 &amp;&amp; order.isActive()) {
+      book.addOrder(order);                       <span class="cm">// unfilled → rest as ask</span>
+    }
+  }
+  return trades;
+}</pre>
+        <p class="muted"><b>Rules:</b> Buy Limit $105 only matches asks ≤ $105 · Sell Limit $95 only matches bids ≥ $95. Unfilled quantity <b>rests in the book</b> (provides liquidity) until matched, cancelled, or day's end. Most retail orders are limit.</p>
+      </div>
+      <div class="tabpanel" data-panel="market">
+        <div class="kicker"><code>strategy/order/MarketOrderStrategy.java</code></div>
+        <pre class="code">public List&lt;Trade&gt; execute(Order order, OrderBook book) {
+  List&lt;Trade&gt; trades = new ArrayList&lt;&gt;();
+  if (order.getSide() == OrderSide.BUY) {
+    <span class="cm">// priceLimit = Double.MAX_VALUE → no price check, sweep asks</span>
+    matchAgainstAsks(order, book, trades, Double.MAX_VALUE);
+  } else {
+    matchAgainstBids(order, book, trades, 0.0);   <span class="cm">// sweep bids down to 0</span>
+  }
+  return trades;    <span class="cm">// never rests — unfilled market orders cancel</span>
+}</pre>
+        <p class="muted"><b>Slippage risk:</b> a market buy for 1000 shares in a thin book fills 100 @ $100, then 200 @ $105, then 300 @ $110, then 400 @ $120 — avg $114. That's <b>walking the book</b>. Smart clients check depth first; naive clients pay the spread. Never rests in the book.</p>
+      </div>
+      <div class="tabpanel" data-panel="stoploss">
+        <div class="kicker">stop-loss + stop-limit — triggered promotion</div>
+        <pre class="code"><span class="cm">// From MatchingEngine.submitOrder — triggered stops promote to MARKET/LIMIT:
+if (order.getType() == OrderType.STOP_LOSS) {
+  strategy = strategies.get(OrderType.MARKET);   ← becomes market once triggered
+} else if (order.getType() == OrderType.STOP_LIMIT) {
+  strategy = strategies.get(OrderType.LIMIT);    ← becomes limit once triggered
+}</span>
+
+<span class="cm">// LIFECYCLE:
+// 1. User places STOP_LOSS at trigger=$95 (currently trading at $100).
+// 2. Order does NOT enter the book yet — held in a "pending trigger" store.
+// 3. Trigger monitor watches trades.SYMBOL. On any trade at price ≤ $95:
+//      trigger monitor emits new MARKET order → engine matches it.
+// 4. Result: stop-loss "kicks in" and sells at whatever the market offers.
+
+// STOP_LIMIT (better protection): trigger=$95, limit=$94. If price hits $95,
+//   place LIMIT sell at $94 → won't fill below $94 (protects from flash crash).</span></pre>
+        <p class="muted"><b>Why stops don't sit in the book:</b> a resting sell at $95 would show as an ask level and be matched by any buy that crosses it. But a stop-loss says "only <b>after</b> the price falls to $95" — it's a <b>conditional</b> order. So it lives in a separate trigger store; the engine sees it only after promotion.</p>
+      </div>
+      <div class="tabpanel" data-panel="iceberg">
+        <div class="kicker">iceberg / hidden orders — not in demo, common in prod</div>
+        <pre class="code"><span class="cm">// Concept: place 100 000 buy limit at $2500, but only show 500 at a time.
+// After each 500-share fill, refresh from the hidden reserve.
+// Prevents front-running by HFT bots that see a big resting order.
+
+Order icebergOrder = new Order.Builder(userId, symbol, BUY, LIMIT)
+    .price(2500)
+    .quantity(100000)
+    .disclosedQuantity(500)     ← visible slice
+    .build();
+
+// In OrderBook.getBidDepth() — report only disclosedQuantity in the level count.
+// After each fill, refresh disclosed slice from remaining hidden reserve.</span></pre>
+        <p class="muted"><b>Regulator note:</b> iceberg is allowed on most venues but some (dark pools) go further: FULLY hidden orders. NBBO must still be respected — an iceberg can't be at a price that improves NBBO without being disclosed to the SIP.</p>
+      </div>
+      <div class="tabpanel" data-panel="cmp">
+        <table>
+          <thead><tr><th>Type</th><th>Price check</th><th>Rests in book?</th><th>Slippage risk</th><th>Use case</th></tr></thead>
+          <tbody>
+            <tr><td><b>MARKET</b></td><td>none</td><td>never</td><td><b>high</b> (walks the book)</td><td>get out NOW at any price</td></tr>
+            <tr><td><b>LIMIT</b></td><td>price ≤ limit (buy) / ≥ (sell)</td><td>yes, if unfilled</td><td>none (may not fill)</td><td>price control · retail default</td></tr>
+            <tr><td><b>STOP_LOSS</b></td><td>none (once triggered)</td><td>trigger store, then never</td><td>high (becomes market)</td><td>cut losses on falling price</td></tr>
+            <tr><td><b>STOP_LIMIT</b></td><td>trigger AND limit</td><td>trigger store, then yes</td><td>none (may not fill)</td><td>guard against flash-crash</td></tr>
+            <tr><td><b>ICEBERG</b></td><td>as underlying LIMIT</td><td>yes, small visible slice</td><td>none</td><td>hide institutional size</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+
+  <!-- D · MATCHING STRATEGY TABS -->
+  <section>
+    <div class="sec-h"><span class="n">D</span><h2>Matching algorithm — price-time vs pro-rata</h2><span class="tag">how ties at same price are broken</span></div>
+    <div data-tabscope>
+      <div class="tabs">
+        <div class="tab active" data-tab="pt">Price-time priority (default)</div>
+        <div class="tab" data-tab="prorata">Pro-rata (options / futures)</div>
+        <div class="tab" data-tab="mixed">mixed / weighted</div>
+      </div>
+      <div class="tabpanel active" data-panel="pt">
+        <div class="kicker">rule: best price wins; at same price, earliest order fills first</div>
+        <pre class="code"><span class="cm">// This is what our LinkedList inside PriceLevel implements — insertion order:
+LinkedList&lt;Order&gt; orders;
+orders.addLast(order);        ← new order goes to the back
+Order first = orders.peekFirst(); ← oldest fills first</span>
+
+<span class="cm">// SCENARIO — three resting bids at $100:
+//   A: 100 shares @ 09:15:01
+//   B:  50 shares @ 09:15:02
+//   C: 200 shares @ 09:15:03
+// Incoming sell market for 200 shares:
+//   fill 100 from A (A fully filled, removed from queue)
+//   fill  50 from B (B fully filled)
+//   fill  50 from C (C partially filled — remaining 150 stays at head)</span></pre>
+        <p class="muted">Universal at NYSE, NASDAQ, LSE, NSE (India). <b>Rewards liquidity providers</b> for showing up early — the first bid at $100 gets priority forever until it's filled or cancelled. Modifying an order (change qty or price) <b>loses time priority</b> — that's why platforms let you cancel + re-place separately.</p>
+      </div>
+      <div class="tabpanel" data-panel="prorata">
+        <div class="kicker">rule: incoming volume divided proportionally across all orders at best price</div>
+        <pre class="code"><span class="cm">// SCENARIO — three resting bids at $100:
+//   A: 100 shares (25 % of level)
+//   B: 200 shares (50 % of level)
+//   C: 100 shares (25 % of level)
+// Total at level = 400. Incoming sell market for 100 shares.
+//
+// Pro-rata: each gets its % share:
+//   A: 100 × 25% = 25 shares filled  (75 remaining)
+//   B: 100 × 50% = 50 shares filled  (150 remaining)
+//   C: 100 × 25% = 25 shares filled  (75 remaining)</span></pre>
+        <p class="muted"><b>Used by:</b> CME futures (crude, gold), some interest-rate products, part of Eurex. <b>Why:</b> for large institutional books, time priority creates a "race to be first" that rewards latency arms-race spending. Pro-rata neutralises that — it's about size, not speed. <b>Downside:</b> gaming — traders inflate their order size to grab more of the fill.</p>
+      </div>
+      <div class="tabpanel" data-panel="mixed">
+        <div class="kicker">rule: first M % time-priority, rest pro-rata</div>
+        <p>Some exchanges combine both: the <b>first-in order at each price gets top-of-book priority</b> (typical: 40 %) but the rest of the level is distributed pro-rata. This preserves the incentive to show up early while diluting the latency-race intensity.</p>
+        <p class="muted"><b>NYSE Options</b> uses a hybrid: <code>customer > public customer > firm proprietary</code> priority classes, then time within class. <b>NSE India</b> uses strict price-time. <b>Bitcoin exchanges</b> (Binance, Coinbase) use strict price-time.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- E · ORDER STATE MACHINE -->
+  <section>
+    <div class="sec-h"><span class="n">E</span><h2>Order state machine — guarded transitions</h2><span class="tag">from <code>model/Order.java</code></span></div>
+    <div class="card">
+      <div class="kicker">the transitions (verbatim)</div>
+      <pre class="code">public void markOpen() {
+  if (status != OrderStatus.PENDING_RISK) {
+    throw new IllegalStateException(
+        "Cannot open order in state " + status + ". Order: " + orderId);
+  }
+  this.status = OrderStatus.OPEN;
+  this.updatedAt = Instant.now();
+}
+
+public void fill(int qty, Trade trade) {
+  <span class="cm">// Guard: only OPEN or PARTIALLY_FILLED orders can be filled</span>
+  if (status != OrderStatus.OPEN &amp;&amp; status != OrderStatus.PARTIALLY_FILLED) {
+    throw new IllegalStateException(
+        "Cannot fill order in state " + status + ". Order: " + orderId);
+  }
+  if (qty &lt;= 0 || qty &gt; getRemainingQuantity()) {
+    throw new IllegalArgumentException(
+        "Invalid fill qty " + qty + " for remaining " + getRemainingQuantity());
+  }
+  this.filledQuantity += qty;
+  this.trades.add(trade);
+  this.updatedAt = Instant.now();
+
+  <span class="cm">// Transition based on whether fully filled</span>
+  if (filledQuantity &gt;= quantity) {
+    this.status = OrderStatus.FILLED;
+  } else {
+    this.status = OrderStatus.PARTIALLY_FILLED;
+  }
+}
+
+public void cancel() {
+  <span class="cm">// Can cancel from OPEN or PARTIALLY_FILLED (cancels REMAINDER only)</span>
+  if (status != OrderStatus.OPEN &amp;&amp; status != OrderStatus.PARTIALLY_FILLED) {
+    throw new IllegalStateException(
+        "Cannot cancel order in state " + status + ". Order: " + orderId);
+  }
+  this.status = OrderStatus.CANCELLED;
+  this.updatedAt = Instant.now();
+}
+
+public void reject() {
+  if (status != OrderStatus.PENDING_RISK) {
+    throw new IllegalStateException(
+        "Cannot reject order in state " + status + ". Order: " + orderId);
+  }
+  this.status = OrderStatus.REJECTED;
+  this.updatedAt = Instant.now();
+}</pre>
+    </div>
+    <div class="callout tip"><b>Why encode transitions in the model, not the service:</b> the service can (and will) be called concurrently by the matching engine, cancel API, admin console, and reconciliation jobs. If guards live in the service, a rogue caller can just <code>order.setStatus(FILLED)</code>. In the model there is <b>no setter</b> — only guarded transitions. An <code>IllegalStateException</code> is your last line of defence against a bug that would corrupt an order's audit trail.</div>
+    <div class="grid g2" style="margin-top:14px">
+      <div class="card"><div class="kicker">success path</div><pre class="code">PENDING_RISK
+  ↓ markOpen()           <span class="cm">// risk passed</span>
+OPEN
+  ↓ fill(qty, trade)     <span class="cm">// first match</span>
+PARTIALLY_FILLED         <span class="cm">// rests in book</span>
+  ↓ fill(qty, trade)     <span class="cm">// last match</span>
+FILLED                   <span class="cm">// terminal — settlement next</span></pre></div>
+      <div class="card"><div class="kicker">failure / cancel paths</div><pre class="code">PENDING_RISK
+  ↓ reject()             <span class="cm">// margin fail / halt</span>
+REJECTED                 <span class="cm">// terminal</span>
+
+OPEN / PARTIALLY_FILLED
+  ↓ cancel()             <span class="cm">// user cancels remainder</span>
+CANCELLED                <span class="cm">// terminal</span>
+
+<span class="cm">// IllegalStateException on any other transition</span></pre></div>
+    </div>
+  </section>
+
+  <!-- F · SEQUENCE DIAGRAM -->
+  <section>
+    <div class="sec-h"><span class="n">F</span><h2>Sequence — happy path place-order</h2><span class="tag">who calls whom, in order</span></div>
+    <div class="card">
+      <pre class="code">Client                Controller            TradingService      RiskService     AccountService    MatchingService     MatchingEngine    OrderBook       PortfolioSvc
+  │  POST /orders           │                     │                    │                │                    │                    │                │                │
+  │────────────────────────►│                     │                    │                │                    │                    │                │                │
+  │                         │  placeOrder(...)    │                    │                │                    │                    │                │                │
+  │                         │────────────────────►│                    │                │                    │                    │                │                │
+  │                         │                     │ validateAndSave()  │                │                    │                    │                │                │
+  │                         │                     │────────────────────►                │                    │                    │                │                │
+  │                         │                     │ runChecks(order)   │                │                    │                    │                │                │
+  │                         │                     │─────────────────────────────────────►│                    │                    │                │                │
+  │                         │                     │  RiskResult(pass)  │                │                    │                    │                │                │
+  │                         │                     │◄─────────────────────────────────────                    │                    │                │                │
+  │                         │                     │ blockMargin(userId, amount)         │                    │                    │                │                │
+  │                         │                     │─────────────────────────────────────────────────────────►│                    │                │                │
+  │                         │                     │ order.markOpen()   │                │                    │                    │                │                │
+  │                         │                     │─── (in-model)     │                │                    │                    │                │                │
+  │                         │                     │ ★ submitOrder(order)                │                    │                    │                │                │
+  │                         │                     │───────────────────────────────────────────────────────────────────────────────►                │                │
+  │                         │                     │                    │                │                    │  submitOrder(order)│                │                │
+  │                         │                     │                    │                │                    │───────────────────►│                │                │
+  │                         │                     │                    │                │                    │                    │ getOrCreateBook(sym)              │
+  │                         │                     │                    │                │                    │                    │───────────────►│                │
+  │                         │                     │                    │                │                    │                    │ strategy.execute(order, book)     │
+  │                         │                     │                    │                │                    │                    │────────── (LimitOrderStrategy) ──►│
+  │                         │                     │                    │                │                    │                    │           matchAgainstAsks(...)   │
+  │                         │                     │                    │                │                    │                    │           ← List&lt;Trade&gt;           │
+  │                         │                     │                    │                │                    │  List&lt;Trade&gt;       │                │                │
+  │                         │                     │                    │                │                    │◄───────────────────                │                │
+  │                         │                     │  List&lt;Trade&gt;       │                │                    │                    │                │                │
+  │                         │                     │◄───────────────────────────────────────────────────────────                    │                │                │
+  │                         │                     │ for each trade → updatePositionOnTrade(trade)             │                    │                │                │
+  │                         │                     │───────────────────────────────────────────────────────────────────────────────────────────────────────────────►│
+  │  200 + Order (FILLED)   │                     │                    │                │                    │                    │                │                │
+  │◄────────────────────────│◄────────────────────                    │                │                    │                    │                │                │</pre>
+    </div>
+    <div class="callout tip"><b>Latency budget (typical happy path):</b> Validate + persist (Aurora sync insert) 3 ms · Risk checks (3 × Redis reads) 2 ms · Block margin (DDB CAS) 3 ms · Kafka publish (acks=all) 2 ms · Engine dequeue + match (in-memory) &lt; 1 ms · Trade Kafka publish 1 ms · Position update (DDB CAS) async — off critical path.  <b>ACK to client: ~11 ms end-to-end</b>. Matching engine itself: &lt; 1 ms (in-memory, no network). Everything above ~5 ms is I/O — the algorithm is a rounding error.</div>
+  </section>
+
+  <!-- FILE MAP + GLOSSARY -->
+  <section>
+    <div class="sec-h"><span class="n">§</span><h2>File map + Glossary</h2></div>
+    <div class="grid g2">
+      <div class="card"><div class="kicker">file map</div><table><tbody>
+        <tr><td><code>config/AppConfig.java</code></td><td>Composition root — factory + lazy init</td></tr>
+        <tr><td><code>controller/TradingController.java</code></td><td>REST adapter — 6 handlers</td></tr>
+        <tr><td><code>service/TradingService.java</code></td><td>Facade — <code>placeOrder</code>, <code>cancelOrder</code></td></tr>
+        <tr><td><code>service/{Order,Risk,Matching,Portfolio,Account,MarketData,Settlement,Notification}Service.java</code></td><td>8 collaborators</td></tr>
+        <tr><td><code>engine/MatchingEngine.java</code></td><td><b>The star</b> — strategy dispatcher</td></tr>
+        <tr><td><code>engine/OrderBook.java</code></td><td>TreeMap × 2 + orderIndex</td></tr>
+        <tr><td><code>engine/PriceLevel.java</code></td><td>LinkedList FIFO queue at one price</td></tr>
+        <tr><td><code>strategy/order/{Market,Limit}OrderStrategy.java</code></td><td>2 execution strategies</td></tr>
+        <tr><td><code>strategy/risk/{Margin,PositionLimit,CircuitBreaker}Strategy.java</code></td><td>3 pre-trade checks</td></tr>
+        <tr><td><code>strategy/pricing/{FIFO,AvgCost}PnLStrategy.java</code></td><td>2 P&amp;L strategies</td></tr>
+        <tr><td><code>model/*.java</code></td><td>13 files — Order, Trade, Position, Account, MarketData, Stock, User, Watchlist, RiskResult, OrderBookEntry, enums</td></tr>
+        <tr><td><code>repository/{Order,Trade,Position,Account,Stock,MarketData}Repository.java + InMemory*.java</code></td><td>6 interfaces + 6 impls</td></tr>
+        <tr><td><code>exception/*.java</code></td><td>5 exceptions, extend <code>TradingException</code></td></tr>
+      </tbody></table></div>
+      <div class="card"><div class="kicker">glossary</div><table><tbody>
+        <tr><td><b>Price-time priority</b></td><td>match best price first; at same price, earliest order fills first (universal)</td></tr>
+        <tr><td><b>Passive vs aggressive order</b></td><td>passive rests in book (maker) · aggressive crosses spread (taker) — maker-taker fees</td></tr>
+        <tr><td><b>Order book</b></td><td>TreeMap of PriceLevels — bids desc, asks asc</td></tr>
+        <tr><td><b>PriceLevel</b></td><td>FIFO queue of resting orders at one price (LinkedList)</td></tr>
+        <tr><td><b>Spread</b></td><td><code>bestAsk − bestBid</code> — narrow = liquid, wide = illiquid</td></tr>
+        <tr><td><b>Walking the book</b></td><td>market order that sweeps multiple price levels — slippage risk</td></tr>
+        <tr><td><b>Partial fill</b></td><td>only some qty matched; remainder rests (limit) or cancels (market)</td></tr>
+        <tr><td><b>State-machine guard</b></td><td>guardTransition throws on illegal state; encoded in the aggregate, not the service</td></tr>
+        <tr><td><b>Strategy pluggability</b></td><td>swap Order-execution / Risk / P&amp;L strategies at call site — no engine changes</td></tr>
+        <tr><td><b>Chain of responsibility</b></td><td>RiskService iterates List&lt;RiskCheckStrategy&gt;, fail-fast on first reject</td></tr>
+      </tbody></table></div>
+    </div>
+  </section>
+
+  <footer>
+    <p>Use case 16 · Stock Trading — Canvas 2 of 3 (LLD). All classes verified against real Java under <code>16-stock-trading/src/</code>. No invented method signatures.</p>
+    <p class="run"><a href="hld.html">← Canvas 1 · HLD</a> · Canvas 2 · LLD · <a href="deepdive.html">Canvas 3 · Deep-dive &amp; Trade-offs →</a> &nbsp;|&nbsp; <a href="../index.html">Hub</a></p>
+  </footer>
+
+</div>
+<script src="../assets/canvas.js"></script>
+</body>
+</html>

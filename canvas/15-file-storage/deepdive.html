@@ -1,0 +1,397 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>15 · File Storage — Deep-dive &amp; Trade-offs</title>
+<link rel="stylesheet" href="../assets/canvas.css">
+</head>
+<body>
+<div class="wrap">
+
+  <header class="hero">
+    <h1>File Storage — Deep-dive &amp; Trade-offs</h1>
+    <div class="sub">Canvas 3 of 3. Where interviews are won or lost. <b>Dedup math</b> that saves $24 M/month, the <b>split CAP</b> answer (CP for metadata &amp; refCounts, AP for sync &amp; quota), <b>delta sync</b> mechanics, the <b>ref-count</b> catastrophe (undercount = permanent data loss), <b>8 bottlenecks</b> with fixes, the <b>cloud mapping</b>, an <b>11-decision trade-off table</b>, and an <b>8-phase interview walkthrough</b> with green &amp; red flags.</div>
+    <div class="badges">
+      <span class="badge lvl">Use case 15 · Deep-dive</span>
+      <span class="badge">Canvas 3 of 3</span>
+      <span class="badge">interview-ready</span>
+      <span class="badge">CP metadata · AP sync</span>
+      <span class="badge">$24 M/mo saved</span>
+    </div>
+  </header>
+
+  <!-- A · SCALING -->
+  <section>
+    <div class="sec-h"><span class="n">A</span><h2>Scaling strategy — how each layer grows</h2><span class="tag">Dropbox-scale · 500 M users · 2.5 EB</span></div>
+    <div data-tabscope>
+      <div class="tabs">
+        <div class="tab active" data-tab="scale-math">Dropbox-scale math</div>
+        <div class="tab" data-tab="scale-triggers">Scaling triggers</div>
+        <div class="tab" data-tab="scale-shard">Sharding scheme</div>
+      </div>
+      <div class="tabpanel active" data-panel="scale-math">
+        <div class="kicker">the numbers you'll write on the whiteboard</div>
+        <pre class="code"><span class="cm">// Users</span>
+Registered users:           500 M
+Daily active users (DAU):   100 M
+Devices / DAU:              1.5     → 150 M concurrent sync connections
+
+<span class="cm">// Storage</span>
+Avg storage / user:         5 GB
+Raw storage:                500 M × 5 GB = 2 500 000 000 GB = <b>2.5 EB</b>
+After dedup (40 %):         2.5 EB × 0.6 = <b>1.5 EB</b>
+S3 cost (0.023 $/GB/mo):    1.5 EB × 0.023 $/GB × 10⁹ ≈ <b>$36 M/month</b>
+$ saved by dedup:           1.0 EB × 0.023 $/GB × 10⁹ ≈ <b>$24 M/month</b>
+
+<span class="cm">// Traffic</span>
+Uploads / day:              100 M    → ~1 160/s avg, ~3 500/s peak (3×)
+Downloads / day:            300 M    → ~3 470/s avg, ~10 400/s peak
+Upload volume / day:        100 TB   → ~1.16 GB/s ingress
+Download volume / day:      600 TB   → ~7 GB/s egress
+
+<span class="cm">// Metadata</span>
+Files:                      250 B rows @ 500 B  = <b>125 TB</b>
+Unique chunks:              ~300 B (after dedup, from ~500 B raw)
+Metadata shards:            ~100 (Postgres, sharded by userId)
+
+<span class="cm">// Sync</span>
+Sync events / sec:          ~50 K (file changes)
+Notification fan-out:       ×1.5 devices → ~75 K notifications/sec</pre>
+      </div>
+      <div class="tabpanel" data-panel="scale-triggers">
+        <table>
+          <thead><tr><th>Metric</th><th>Trigger</th><th>Action</th></tr></thead>
+          <tbody>
+            <tr><td>Metadata QPS &gt; 60 % of shard capacity</td><td>hot user or hot folder</td><td>add read-replicas; split shard if user growth outpaces capacity</td></tr>
+            <tr><td>Postgres shard &gt; 2 TB</td><td>metadata size</td><td>rebalance — introduce new shard, migrate userId ranges via double-write + backfill</td></tr>
+            <tr><td>S3 partition throttled (503)</td><td>hash-prefix hot spot</td><td>widen hash-prefix sharding (2 hex chars → 3 hex chars in the key), pre-warm partitions</td></tr>
+            <tr><td>Sync notification p99 &gt; 10 s</td><td>consumer lag</td><td>add Sync Service partitions; scale WebSocket fleet; enable partition-affinity routing</td></tr>
+            <tr><td>Redis dedup-cache hit &lt; 90 %</td><td>working set outgrew memory</td><td>increase Redis Cluster size; tier Bloom filter for negative fast-path</td></tr>
+            <tr><td>Upload p95 &gt; 5 s (10 MB file)</td><td>chunk parallelism cap</td><td>raise client parallel from 4 → 8; regionalize presigned URLs to nearest S3 region</td></tr>
+            <tr><td>CDN cache hit &lt; 80 % for hot files</td><td>content is diverse</td><td>lengthen TTL for immutable content-addressed URLs; enable origin shield</td></tr>
+            <tr><td>Storage cost / user &gt; $0.05/mo</td><td>dedup ratio dropped</td><td>investigate encrypted uploads (kill dedup); introduce client-side encryption with convergent keys</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="tabpanel" data-panel="scale-shard">
+        <div class="kicker">sharding by data type</div>
+        <table>
+          <thead><tr><th>Data</th><th>Shard key</th><th>Why</th><th>Cross-shard reads?</th></tr></thead>
+          <tbody>
+            <tr><td>File, Folder</td><td><b>userId</b></td><td>a user's whole tree lives on one shard → fast folder listings</td><td>only sharing (cross-user reads) — fan out via user index</td></tr>
+            <tr><td>FileVersion, FileChunk</td><td><b>fileId</b></td><td>a file's version history is co-located → single-shard download</td><td>rare</td></tr>
+            <tr><td>BlockStore (S3)</td><td><b>hash prefix</b> (first 2 hex chars of SHA-256)</td><td>uniform hash distribution ⇒ uniform S3 partition load, avoids hot key</td><td>never — content-addressed, key alone identifies</td></tr>
+            <tr><td>Dedup index (Postgres)</td><td>hash prefix</td><td>~300 B unique-hash rows spread across shards evenly</td><td>never — lookup is single hash</td></tr>
+            <tr><td>SyncCursor</td><td>userId</td><td>cursor read on every device sync; user-local</td><td>never</td></tr>
+            <tr><td>ShareLink</td><td>linkUrl (hash)</td><td>anonymous public-link lookup by URL</td><td>only one</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+
+  <!-- B · DEDUPLICATION -->
+  <section>
+    <div class="sec-h"><span class="n">B</span><h2>Deduplication — the star of the interview</h2><span class="tag">saves $24 M/month at Dropbox scale</span></div>
+    <div class="grid g2">
+      <div class="card">
+        <div class="kicker">how dedup wins so hard</div>
+        <p>Content-addressable storage → key = SHA-256(content). Two identical files (same node_modules, same OS installer, same viral meme) upload from N users → stored <b>once</b>. Reference count tracks 'who is using this block' — the block is freed only when the last file referencing it is permanently deleted.</p>
+        <p><b>Where the savings live:</b></p>
+        <ul class="tight">
+          <li><b>Cross-user dedup</b> — same installer / video / meme uploaded by many. ~20–30 % savings.</li>
+          <li><b>Cross-version dedup (CoW)</b> — a 100 MB file with 10 % edited on save reuses 90 % of blocks. ~15 % savings on active users.</li>
+          <li><b>Cross-folder dedup</b> — same photo saved in "vacation" and "family" folders → one block.</li>
+          <li><b>Total measured</b> (Dropbox blog): ~<b>40 %</b> average, up to 75 % for corporate accounts (shared file sets).</li>
+        </ul>
+      </div>
+      <div class="card">
+        <div class="kicker">worked example — 10 users, one common file</div>
+        <pre class="code"><span class="cm">// 10 users each upload the SAME 100 MB video (25 chunks of 4 MB)</span>
+
+Naive:            10 × 25 × 4 MB = <b>1000 MB</b>
+Content-dedup:    1  × 25 × 4 MB = <b>100 MB</b>  (refCount = 10 on each chunk)
+Savings:          <b>90 %</b>
+
+<span class="cm">// Then user 3 deletes their copy:</span>
+softDelete(user3.file)      → hides from tree, isDeleted=true
+                             → no blocks touched (soft)
+
+<span class="cm">// 30 days later, cron runs permanentDelete:</span>
+for each chunk in user3.file.chunks:
+  blockStore.deleteBlock(hash)
+    refCount 10 → 9   <span class="cm">// bytes still there, 9 users need it</span>
+
+<span class="cm">// User 3's tree is gone. All 10 chunks still live. No data loss for the other 9.</span></pre>
+      </div>
+    </div>
+    <div class="callout warn"><b>The ref-count catastrophe</b> — undercounting is <b>permanent data loss</b>. If two DCs both decrement refCount 2→1 during a partition (each thinking the other hasn't run), the reconciled value becomes 0 and the block is GC'd — but Charlie's file still references it. On next download: <code>NULL bytes</code>. This is why refCount operations MUST be serialized (CP path — single-leader). Overcount is only a storage leak, harmless.</div>
+    <div class="callout tip"><b>The killer to dedup:</b> client-side encryption. Different keys ⇒ different ciphertexts ⇒ different hashes ⇒ no dedup. Mitigation: <b>convergent encryption</b> — key = SHA-256(plaintext) — same plaintext still produces the same ciphertext hash. But this leaks 'you have this file' to the server (Dropbox chose this trade-off; Boxcryptor and Cryptomator did not).</div>
+  </section>
+
+  <!-- C · CHUNKED UPLOAD -->
+  <section>
+    <div class="sec-h"><span class="n">C</span><h2>Chunked resumable upload — the flow that survives flaky networks</h2><span class="tag">10 GB uploads over hotel WiFi</span></div>
+    <div class="grid g2">
+      <div class="card">
+        <div class="kicker">the full protocol</div>
+        <pre class="code">1) Client hashes: SHA-256 whole file + SHA-256 per 4 MB chunk
+2) POST /upload/chunked/init { fileName, totalChunks, chunkHashes[] }
+3) Server checks each hash against BlockStore index:
+   → { existingChunks: [0,1,4,5,6,8,11],   // ~40 % dedup hit
+       missingChunks:  [2,3,7,9,10,12],
+       presignedUrls:  { 2: "...", 3: "...", ... } }
+4) Client PUTs missing chunks in parallel (up to 4 concurrent)
+   → each PUT goes DIRECT to S3 (bypasses our servers)
+   → S3 verifies signature + Content-Length + optional MD5
+5) If a PUT fails (network hiccup): client retries THAT chunk only
+   → no need to redo the 5 that succeeded
+6) POST /upload/chunked/{uploadId}/complete
+7) Server verifies all chunks present, creates FileMetadata + Version #1
+8) Server publishes file_created to Kafka → sync fan-out</pre>
+      </div>
+      <div class="card">
+        <div class="kicker">why the client does the hashing</div>
+        <ul class="tight">
+          <li><b>Bandwidth savings</b> — client sends 32-byte hashes first; server tells it what to skip. A user re-uploading a slightly changed file might send &lt; 5 % of bytes.</li>
+          <li><b>Server CPU savings</b> — no re-hashing after upload; server just verifies S3's returned hash matches what the client claimed.</li>
+          <li><b>Presigned URLs bypass app servers</b> — the actual bytes never touch our compute. At 1.16 GB/s ingress, this saves several thousand cores worth of network I/O.</li>
+          <li><b>Resume works across sessions</b> — server tracks state in Redis (TTL 24 h); client restarts, sends init again with hashes → server responds with the same 'missing' list minus what's now uploaded.</li>
+        </ul>
+      </div>
+    </div>
+    <div class="callout"><b>The 10 GB upload success story:</b> a 10 GB file = 2 560 chunks. Even at 1 % chunk-level failure rate → ~26 chunks need retry, not the whole file. Without chunked resumable, one dropped connection at byte 9.9 GB = start over. Chunked = ship the last ~100 MB and move on.</div>
+  </section>
+
+  <!-- D · DELTA SYNC -->
+  <section>
+    <div class="sec-h"><span class="n">D</span><h2>Delta sync — edit locally, propagate globally</h2><span class="tag">&lt; 10 s cross-device target</span></div>
+    <div data-tabscope>
+      <div class="tabs">
+        <div class="tab active" data-tab="sync-flow">The 14-step sync flow</div>
+        <div class="tab" data-tab="sync-cursor">Cursor protocol</div>
+        <div class="tab" data-tab="sync-conflict">Conflict resolution</div>
+        <div class="tab" data-tab="sync-transport">WebSocket vs long-poll</div>
+      </div>
+      <div class="tabpanel active" data-panel="sync-flow">
+        <pre class="code">1) Desktop client detects file change via inotify/FSEvents/RDCW
+2) Client re-chunks the file with rolling hash → knows which chunks changed
+3) Only changed chunks travel (20 MB edit ⇒ ~8 MB uploaded, not 20 MB)
+4) Client uploads changed chunks via chunked-init/PUT flow
+5) Client POSTs new-version metadata (chunkHashes list — mostly OLD hashes)
+6) MetadataService creates FileVersion #N+1 (old version preserved via CoW)
+7) UploadService publishes file_modified event to Kafka
+8) Sync Service consumes event (partitioned by userId)
+9) Sync Service holds WebSocket connections for user's other devices
+10) For each connected device, push { fileId, changedChunks: [2, 4] }
+11) Phone / tablet receives push, requests GET /sync/changes?cursor=X
+12) Sync Service returns the event list + new cursor
+13) Client downloads ONLY the 2 changed chunks (8 MB, not 20 MB)
+14) Client reconstructs new file locally: 3 cached chunks + 2 new chunks</pre>
+      </div>
+      <div class="tabpanel" data-panel="sync-cursor">
+        <div class="kicker">the sync cursor is just an opaque server timestamp</div>
+        <pre class="code">Client stores { deviceId, cursor="2026-04-26T10:34:59.123Z" }
+
+<span class="cm">// Every N seconds (or on WebSocket push):</span>
+GET /sync/changes?cursor=2026-04-26T10:34:59.123Z
+
+<span class="cm">// SyncService (Java, from real code):</span>
+public SyncResult getChangesSince(String userId, Instant lastCursor) {
+  List&lt;SyncEvent&gt; userEvents = eventsByUser.getOrDefault(userId, ...);
+  List&lt;SyncEvent&gt; newEvents = userEvents.stream()
+      .filter(e -&gt; e.getTimestamp().isAfter(lastCursor))
+      .collect(toList());
+  Instant newCursor = newEvents.isEmpty() ? lastCursor
+                              : newEvents.get(newEvents.size() - 1).getTimestamp();
+  return new SyncResult(newEvents, newCursor);
+}
+
+<span class="cm">// Cursor is idempotent — sending the same cursor returns the same events.</span>
+<span class="cm">// Client stores the RETURNED cursor as its next 'last seen'.</span></pre>
+        <p class="muted"><b>Why opaque</b>: the server can change the internal cursor format (timestamp → LSN → vector clock) without breaking clients. Clients treat it as a black box.</p>
+      </div>
+      <div class="tabpanel" data-panel="sync-conflict">
+        <table>
+          <thead><tr><th>Strategy</th><th>Behaviour</th><th>Result on 'edited both devices offline'</th></tr></thead>
+          <tbody>
+            <tr><td><b>LastWriterWins</b> (Google Drive)</td><td>compare <code>updatedAt</code>; latest wins</td><td>the earlier edit is silently discarded → data loss</td></tr>
+            <tr><td><b>KeepBoth</b> (Dropbox)</td><td>create <code>doc (alice's conflicted copy 2026-04-26).pdf</code></td><td>never data loss, but manual merge required</td></tr>
+            <tr><td><b>Vector-clock CRDT</b> (advanced)</td><td>merge non-conflicting edits automatically (e.g., text at different line numbers)</td><td>ideal for real-time collaborative editing (covered in use case 14)</td></tr>
+          </tbody>
+        </table>
+        <p class="muted">In this codebase, both <code>LastWriterWinsStrategy</code> and <code>KeepBothStrategy</code> implement the same <code>ConflictStrategy</code> interface — swap in <code>AppConfig</code>.</p>
+      </div>
+      <div class="tabpanel" data-panel="sync-transport">
+        <table>
+          <thead><tr><th>Transport</th><th>Latency</th><th>Server cost</th><th>Works behind corp proxy</th></tr></thead>
+          <tbody>
+            <tr><td><b>WebSocket</b></td><td>&lt; 100 ms push</td><td>1 open TCP conn / device — 150 M cons</td><td>often blocked; need fallback</td></tr>
+            <tr><td><b>Long-poll</b></td><td>~1 s (poll interval)</td><td>similar # of connections; timeout &amp; restart</td><td>yes (looks like HTTP)</td></tr>
+            <tr><td><b>Server-Sent Events (SSE)</b></td><td>&lt; 100 ms</td><td>similar to WS but unidirectional server → client</td><td>yes</td></tr>
+            <tr><td><b>Short-poll every 30 s</b></td><td>up to 30 s stale</td><td>3 M req/s total (fine for infra)</td><td>always</td></tr>
+          </tbody>
+        </table>
+        <p class="muted">Dropbox uses <b>WebSocket with long-poll fallback</b>. Sync Service maintains a per-user 'connected devices' registry (Redis) and picks the transport per device. WebSocket first; auto-fallback if handshake fails.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- E · CAP SPLIT -->
+  <section>
+    <div class="sec-h"><span class="n">E</span><h2>CAP theorem — the split answer</h2><span class="tag">CP for metadata &amp; refCounts · AP for sync &amp; quota</span></div>
+    <div class="callout tip"><b>The interview-winning insight:</b> file storage isn't 'pick CP or AP globally'. Metadata (file tree) and dedup ref-counts MUST be CP — inconsistency = data loss or orphan files. Sync notifications and quota SHOULD be AP — being 8 s stale is better than users staring at a spinner.</div>
+    <table>
+      <thead><tr><th>Data / operation</th><th>Consistency</th><th>Availability</th><th>Partition Tolerance</th><th>Justification</th></tr></thead>
+      <tbody>
+        <tr><td><b>File metadata (path, folder tree)</b></td><td><b>Strong (CP)</b></td><td>blocks writes during partition</td><td>required</td><td>orphan files if inconsistent → corruption</td></tr>
+        <tr><td><b>Dedup reference counts</b></td><td><b>Strong (CP)</b></td><td>ref-count-op blocks during partition</td><td>required</td><td>undercount → block GC'd → permanent data loss</td></tr>
+        <tr><td><b>Folder hierarchy / permissions</b></td><td><b>Strong (CP)</b></td><td>write path blocked</td><td>required</td><td>security → 'shared' vs 'private' mismatch</td></tr>
+        <tr><td>Block storage (S3)</td><td>Read-after-write (S3 guarantees)</td><td>very high (11 nines)</td><td>required</td><td>immutable content-addressed → dedup is safe</td></tr>
+        <tr><td><b>Sync notifications</b></td><td>Eventual (AP)</td><td>always available</td><td>required</td><td>5–10 s stale is fine; frozen sync is not</td></tr>
+        <tr><td><b>Storage quota</b></td><td>Eventual (AP)</td><td>never blocks upload</td><td>required</td><td>brief 100 MB over-quota is OK; blocking a paying user is not</td></tr>
+        <tr><td>Share-link validation</td><td>Eventual (TTL)</td><td>always available</td><td>required</td><td>1-minute stale cache is safe</td></tr>
+        <tr><td>File version history</td><td>Eventual (AP)</td><td>read-heavy, cache-friendly</td><td>required</td><td>seeing 'version 4' briefly after 'version 5' created is OK</td></tr>
+        <tr><td>Search index</td><td>Eventual (AP)</td><td>always available</td><td>required</td><td>1-min delay for search visibility is acceptable</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <!-- F · BOTTLENECKS -->
+  <section>
+    <div class="sec-h"><span class="n">F</span><h2>Bottlenecks &amp; mitigations</h2><span class="tag">8 failure modes · defence against each</span></div>
+    <div class="grid g2">
+      <div class="card collapsible"><div class="c-head">S3 partition hot-spotting <span class="muted">(hash-prefix)</span></div><div class="c-body"><p><b>Symptom:</b> 503 SlowDown from S3 on a specific prefix under sustained &gt; 5 500 PUT/s or 3 500 GET/s per partition. Manifests as elevated tail latency and retry storms.</p><p><b>Mitigations:</b> use SHA-256 as the S3 object key (uniform random distribution). Widen prefix if you have hot 2-char prefixes (e.g., every hash starting <code>00</code>). Enable <b>Transfer Acceleration</b> for cross-region uploads. Pre-warm partitions with S3 support ticket for known bursts.</p></div></div>
+      <div class="card collapsible"><div class="c-head">Metadata shard hot-spotting <span class="muted">(power user)</span></div><div class="c-body"><p><b>Symptom:</b> one Postgres shard at 90 %+ CPU while others idle — usually a corporate account with millions of files.</p><p><b>Mitigations:</b> (1) <b>Read replicas</b> per shard for read-heavy load (folder listing, search). (2) <b>Split the shard</b> — introduce a new shard, migrate half the userId range via double-write + backfill + cutover. (3) For a single mega-user, sub-shard by <code>(userId, folderPrefix)</code>.</p></div></div>
+      <div class="card collapsible"><div class="c-head">Ref-count race → permanent data loss</div><div class="c-body"><p><b>Symptom:</b> file downloads return corrupt bytes or 404s for chunks that 'should' exist.</p><p><b>Root cause:</b> two concurrent deletes both saw refCount=2 → both decremented to 1 → net refCount=0 without atomicity → block GC'd.</p><p><b>Mitigations:</b> ref-count ops MUST use atomic INCR/DECR in a single-leader store (Postgres row-lock, Redis <code>DECR</code>, DynamoDB conditional update). Never eventual consistency for refCount. Add <b>staged deletion</b>: mark block <code>pendingDelete</code> for 24 h before actually removing bytes — one last chance to catch races.</p></div></div>
+      <div class="card collapsible"><div class="c-head">Sync notification lag &gt; 10 s</div><div class="c-body"><p><b>Symptom:</b> user edits on laptop, opens phone, still sees old version 30 s later.</p><p><b>Mitigations:</b> (1) Add Kafka partitions for the <code>file.events</code> topic (partitioned by userId — same user always same partition ⇒ ordering). (2) Scale Sync Service consumers horizontally. (3) Enable partition-affinity routing — a user's WebSocket connection lands on the same Sync Service instance consuming their event partition (removes internal hop).</p></div></div>
+      <div class="card collapsible"><div class="c-head">Upload storm on Monday 9 AM</div><div class="c-body"><p><b>Symptom:</b> upload traffic 5× spike as everyone starts their workday.</p><p><b>Mitigations:</b> (1) <b>Presigned URLs</b> mean the app server is not in the byte path — spike hits S3, which auto-scales. (2) Upload-init endpoint scales horizontally on stateless nodes. (3) Client SDK exponential-backoff for 429s. (4) Regional presigned URLs to the user's nearest S3 region.</p></div></div>
+      <div class="card collapsible"><div class="c-head">Dedup cache miss cliff</div><div class="c-body"><p><b>Symptom:</b> Redis dedup-cache hit rate falls from 95 % → 60 % overnight; every upload now hits Postgres index → latency spikes.</p><p><b>Mitigations:</b> (1) <b>Bloom filter</b> in front — sized for ~1 % false-positive rate on 300 B hashes ≈ 2 GB. False positives just fall through to Postgres; false negatives impossible ⇒ correct. (2) Warm cache with hot hash set on Redis restart. (3) Auto-scale Redis Cluster based on eviction rate.</p></div></div>
+      <div class="card collapsible"><div class="c-head">Quota reconciliation drift</div><div class="c-body"><p><b>Symptom:</b> a user's shown 'used storage' differs from the sum of their file sizes by &gt; 100 MB.</p><p><b>Mitigations:</b> quota is intentionally AP — a background job every hour re-computes <code>SUM(size) WHERE userId = X AND isDeleted = false</code> and reconciles the cached counter. For heavy uploads/deletes, accept short drift. Bill on the reconciled value at month-end.</p></div></div>
+      <div class="card collapsible"><div class="c-head">Fat file → CDN cache thrash</div><div class="c-body"><p><b>Symptom:</b> 500 MB training-data file gets viral traffic; CDN cache-fill dominates edge bandwidth.</p><p><b>Mitigations:</b> (1) <b>Origin shield</b> (Cloudfront) — one regional cache absorbs origin fetches. (2) <b>Longer TTL</b> — since content is content-addressed (hash in URL), it's provably immutable — set TTL to 30 days. (3) For truly viral files, pre-warm popular POPs.</p></div></div>
+    </div>
+  </section>
+
+  <!-- G · CLOUD -->
+  <section>
+    <div class="sec-h"><span class="n">G</span><h2>Cloud mapping — the design on each provider</h2><span class="tag">reference — quote the managed service</span></div>
+    <div class="cloudmap">
+      <table class="cloudtable">
+        <thead><tr>
+          <th>Concern</th>
+          <th><span class="hdrlogo"><span class="logochip"><img src="../assets/logos/aws.svg" alt="AWS"></span>AWS</span></th>
+          <th><span class="hdrlogo"><span class="logochip"><img src="../assets/logos/gcp.svg" alt="GCP"></span>GCP</span></th>
+          <th><span class="hdrlogo"><span class="logochip"><img src="../assets/logos/azure.svg" alt="Azure"></span>Azure</span></th>
+        </tr></thead>
+        <tbody>
+          <tr><td><b>Block store (11 nines)</b></td><td><img class="svcicon" src="../assets/logos/services/aws-s3.svg" alt="">S3 (Standard / IA / Glacier tiers)</td><td><img class="svcicon" src="../assets/logos/services/gcp-cloudstorage.svg" alt="">Cloud Storage (Standard / Nearline / Coldline)</td><td><img class="svcicon" src="../assets/logos/services/azure-blob.svg" alt="">Blob Storage (Hot / Cool / Archive)</td></tr>
+          <tr><td>Metadata DB (sharded)</td><td><img class="svcicon" src="../assets/logos/services/aws-rds.svg" alt="">Aurora Postgres · sharded via Vitess</td><td><img class="svcicon" src="../assets/logos/services/gcp-cloudsql.svg" alt="">Cloud SQL / <b>Spanner</b> (global consistency)</td><td><img class="svcicon" src="../assets/logos/services/azure-sql.svg" alt="">Azure SQL / Cosmos DB (SQL API)</td></tr>
+          <tr><td>Cache (upload state · dedup)</td><td><img class="svcicon" src="../assets/logos/services/aws-elasticache.svg" alt="">ElastiCache Redis Cluster</td><td><img class="svcicon" src="../assets/logos/services/gcp-memorystore.svg" alt="">Memorystore Redis</td><td><img class="svcicon" src="../assets/logos/services/azure-redis.svg" alt="">Azure Cache for Redis</td></tr>
+          <tr><td>Event bus (Kafka-like)</td><td><img class="svcicon" src="../assets/logos/services/aws-msk.svg" alt="">MSK (managed Kafka)</td><td><img class="svcicon" src="../assets/logos/services/gcp-pubsub.svg" alt="">Pub/Sub</td><td><img class="svcicon" src="../assets/logos/services/azure-eventhubs.svg" alt="">Event Hubs (Kafka-compat)</td></tr>
+          <tr><td>CDN</td><td><img class="svcicon" src="../assets/logos/services/aws-cloudfront.svg" alt="">CloudFront (+ Origin Shield)</td><td><img class="svcicon" src="../assets/logos/services/gcp-cloudcdn.svg" alt="">Cloud CDN</td><td><img class="svcicon" src="../assets/logos/services/azure-cdn.svg" alt="">Azure CDN / Front Door</td></tr>
+          <tr><td>Search (file names)</td><td><img class="svcicon" src="../assets/logos/services/aws-opensearch.svg" alt="">OpenSearch</td><td><img class="svcicon" src="../assets/logos/services/gcp-bigquery.svg" alt="">Cloud Search / BigQuery</td><td><img class="svcicon" src="../assets/logos/services/azure-search.svg" alt="">Cognitive Search</td></tr>
+          <tr><td>Compute (services)</td><td><img class="svcicon" src="../assets/logos/services/aws-ecs.svg" alt="">ECS / EKS / Lambda</td><td><img class="svcicon" src="../assets/logos/services/gcp-run.svg" alt="">Cloud Run / GKE</td><td><img class="svcicon" src="../assets/logos/services/azure-aks.svg" alt="">AKS / Container Apps</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <!-- H · TRADE-OFFS -->
+  <section>
+    <div class="sec-h"><span class="n">H</span><h2>Trade-offs summary — 11 decisions</h2><span class="tag">every choice has an opportunity cost</span></div>
+    <table>
+      <thead><tr><th>Decision</th><th>Chosen</th><th>Alternative</th><th>Why chosen</th></tr></thead>
+      <tbody>
+        <tr><td>Metadata vs blob storage</td><td><b>Split</b>: Postgres + S3</td><td>Single system (e.g., MongoDB with GridFS)</td><td>Different scaling curves; 125 TB indexed rows vs 1.5 EB immutable bytes</td></tr>
+        <tr><td>Chunking</td><td><b>Fixed 4 MB</b> (production default)</td><td>Content-defined (Rabin/Gear)</td><td>Simple, predictable; ContentDefined offered as strategy for edit-heavy workloads</td></tr>
+        <tr><td>Deduplication</td><td><b>Content-addressable</b> (SHA-256)</td><td>No dedup</td><td>~40 % storage saved ≈ $24 M/mo; trivially correct (hash = content)</td></tr>
+        <tr><td>Upload transport</td><td><b>Presigned URLs → S3 direct</b></td><td>Multipart through app servers</td><td>Zero bandwidth cost on app tier; S3 handles the byte volume</td></tr>
+        <tr><td>Metadata DB</td><td><b>Postgres</b> (sharded)</td><td>DynamoDB, MongoDB</td><td>Transactions for tree integrity; joins for permissions; mature indexes</td></tr>
+        <tr><td>Metadata consistency</td><td><b>Strong (CP)</b></td><td>Eventual</td><td>Orphan files &amp; permission mismatches = data corruption / security bugs</td></tr>
+        <tr><td>Sync consistency</td><td><b>Eventual (AP)</b></td><td>Strong</td><td>10 s stale is fine; frozen sync during partition is unacceptable</td></tr>
+        <tr><td>Ref-count consistency</td><td><b>Strong (CP)</b> · serialized</td><td>Eventual counters (CRDT)</td><td>Undercount = permanent data loss; overcount is only storage leak</td></tr>
+        <tr><td>Conflict resolution</td><td><b>LastWriterWins</b> default</td><td>KeepBoth (Dropbox)</td><td>Cleaner folder; offer KeepBoth on a per-workspace flag</td></tr>
+        <tr><td>Versioning</td><td><b>Copy-on-write via chunk sharing</b></td><td>Full-file snapshots</td><td>Save cost ≈ delta; rollback is one int swap</td></tr>
+        <tr><td>Trash / GC</td><td><b>30-day soft delete + background GC</b></td><td>Immediate hard delete</td><td>User error recovery; batches ref-count decrements for efficiency</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <!-- I · INTERVIEW WALKTHROUGH -->
+  <section>
+    <div class="sec-h"><span class="n">I</span><h2>Interview walkthrough — 8 phases</h2><span class="tag">45-min structure · green &amp; red flags</span></div>
+    <div class="grid g2">
+      <div class="card">
+        <div class="kicker">phase 1 — clarify (2 min)</div>
+        <p>Ask: max file size? free vs paid? sync latency SLA? global or regional? end-to-end encryption?</p>
+        <div class="muted">Green: "50 GB max, 15 GB free / 2 TB paid, sync &lt; 10 s, global, plaintext dedup". Red: skipping straight to architecture without pinning scale.</div>
+      </div>
+      <div class="card">
+        <div class="kicker">phase 2 — estimation (3 min)</div>
+        <p>500 M users × 5 GB = 2.5 EB raw → 1.5 EB after 40 % dedup. 100 M uploads/day = 1 160/s avg; 300 M downloads. 125 TB metadata across ~100 Postgres shards.</p>
+        <div class="muted">Green: quote dedup savings ($24 M/mo). Red: 5 000 GB when you mean 5 TB.</div>
+      </div>
+      <div class="card">
+        <div class="kicker">phase 3 — API sketch (3 min)</div>
+        <p>POST /upload/chunked/init → PUT presigned URLs → POST /complete. GET /download (Range). GET /sync/changes?cursor. POST /files/{id}/share.</p>
+        <div class="muted">Green: explain why chunk-init returns 'existing' vs 'missing'. Red: single POST /upload with 10 GB body.</div>
+      </div>
+      <div class="card">
+        <div class="kicker">phase 4 — data model (5 min)</div>
+        <p>File ← FileVersion ← FileChunk → BlockStore. Materialized path on Folder. SharePermission per (resource, principal, role).</p>
+        <div class="muted">Green: draw the join, explain ref-count on BlockStore. Red: storing chunks inline in the File row.</div>
+      </div>
+      <div class="card">
+        <div class="kicker">phase 5 — architecture (10 min)</div>
+        <p>Client (chunk+hash) → API GW → Upload Service → Dedup → BlockStore (S3). Metadata → Postgres. Sync via Kafka → WebSocket. CDN for hot files.</p>
+        <div class="muted">Green: metadata/blob split, presigned URLs bypass app tier. Red: routing all bytes through the app server.</div>
+      </div>
+      <div class="card">
+        <div class="kicker">phase 6 — deep dives (15 min)</div>
+        <p>Pick 2–3: <b>dedup</b> (content-addressable + refCount), <b>delta sync</b> (rolling hash + changed-chunks push), <b>versioning</b> (CoW). Draw the code path.</p>
+        <div class="muted">Green: verbatim <code>storeChunk</code> pseudocode with refCount++. Red: hand-wavy "we deduplicate".</div>
+      </div>
+      <div class="card">
+        <div class="kicker">phase 7 — CAP &amp; failures (5 min)</div>
+        <p>CP for metadata + refCounts (undercount = data loss). AP for sync + quota (stale is fine, frozen is not). 8 bottlenecks with fixes.</p>
+        <div class="muted">Green: "we split — CP where correctness matters, AP where availability matters". Red: "we chose CP" (globally, without split).</div>
+      </div>
+      <div class="card">
+        <div class="kicker">phase 8 — extensions (2 min)</div>
+        <p>Client-side encryption (kills dedup unless convergent). Global data residency (per-tenant region pinning). Real-time collab editing (use case 14). ML content indexing.</p>
+        <div class="muted">Green: name the trade-off (encryption vs dedup). Red: "we can add anything easily".</div>
+      </div>
+    </div>
+  </section>
+
+  <!-- GLOSSARY -->
+  <section>
+    <div class="sec-h"><span class="n">§</span><h2>Glossary — deep-dive terms</h2></div>
+    <div class="grid g2">
+      <div class="card"><table><tbody>
+        <tr><td><b>Convergent encryption</b></td><td>encryption key derived from plaintext hash → same plaintext always encrypts to same ciphertext → preserves dedup at the cost of confirming-a-guess attacks</td></tr>
+        <tr><td><b>Rolling hash</b></td><td>a hash that can be updated in O(1) as a sliding window advances by 1 byte (Rabin fingerprint, Gear hash)</td></tr>
+        <tr><td><b>Content-defined chunking</b></td><td>chunk boundaries determined by hash of a rolling window matching a magic pattern, not by fixed offset — resilient to insertions</td></tr>
+        <tr><td><b>Presigned URL</b></td><td>a time-limited signed URL letting a client PUT / GET S3 objects without app-server bandwidth or credentials</td></tr>
+        <tr><td><b>Origin shield</b></td><td>a regional CDN cache that absorbs origin fetches so edge PoPs don't all hit S3 directly during a cache-fill</td></tr>
+      </tbody></table></div>
+      <div class="card"><table><tbody>
+        <tr><td><b>Copy-on-write (CoW)</b></td><td>a new version reuses unchanged blocks; only writes new blocks for the changed regions</td></tr>
+        <tr><td><b>Delta sync</b></td><td>upload/download only the chunks that changed since the client's last sync cursor</td></tr>
+        <tr><td><b>Reference count</b></td><td>the number of files pointing at a given block; block is GC'd only when count hits 0</td></tr>
+        <tr><td><b>Materialized path</b></td><td>full folder path stored as a string on each Folder row for O(1) ancestor walks (vs recursive JOINs)</td></tr>
+        <tr><td><b>Sync cursor</b></td><td>opaque token (server timestamp) telling the server 'I have seen changes up to X' — enables catch-up-on-connect</td></tr>
+      </tbody></table></div>
+    </div>
+  </section>
+
+  <footer>
+    <p>Use case 15 · File Storage — Canvas 3 of 3 (Deep-dive &amp; Trade-offs). Grounded in <code>15-file-storage/docs/tradeoffs/CAP_THEOREM.md</code>, <code>docs/hld/HIGH_LEVEL_DESIGN.md</code>, and the real Java source.</p>
+    <p class="run"><a href="hld.html">← Canvas 1 · HLD</a> · <a href="lld.html">Canvas 2 · LLD</a> · Canvas 3 · Deep-dive &nbsp;|&nbsp; <a href="../index.html">Hub</a></p>
+  </footer>
+
+</div>
+<script src="../assets/canvas.js"></script>
+</body>
+</html>

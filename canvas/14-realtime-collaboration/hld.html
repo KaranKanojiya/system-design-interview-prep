@@ -1,0 +1,441 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>14 · Real-time Collaboration — HLD</title>
+<link rel="stylesheet" href="../assets/canvas.css">
+</head>
+<body>
+
+<div class="wrap">
+
+  <header class="hero">
+    <h1>Real-time Collaboration (Google Docs · Figma · Notion) — High-Level Design</h1>
+    <div class="sub">Use case 14 · Canvas 1 of 3. Two planes, one design: the <b>edit plane</b> (CP — <code>OT</code> engine + document-level lock, no divergence allowed) and the <b>presence plane</b> (AP — Redis cursors + heartbeat, stale is OK). WebSocket keeps 5 M sockets warm with sticky sessions by <code>documentId</code>; the OT engine transforms a late-arriving <code>INSERT(pos=6)</code> against the ops that already applied. Snapshot every 100 ops + operation log = O(1) document load. Click a component, then step both flows.</div>
+    <div class="badges">
+      <span class="badge lvl">Use case 14 · HLD</span>
+      <span class="badge">Canvas 1 of 3</span>
+      <span class="badge">interactive</span>
+      <span class="badge">OT · CRDT · WebSocket · Snapshot</span>
+      <span class="badge">100 K edits/sec · &lt; 100 ms p99</span>
+    </div>
+    <div class="legend">
+      <span><i class="dot" style="background:var(--eden)"></i> client / entry</span>
+      <span><i class="dot" style="background:var(--survivor)"></i> services &amp; facade</span>
+      <span><i class="dot" style="background:var(--warn)"></i> OT engine · async fan-out</span>
+      <span><i class="dot" style="background:var(--old)"></i> data stores</span>
+      <span><i class="dot" style="background:var(--meta)"></i> external / notify</span>
+    </div>
+  </header>
+
+  <!-- A · PROBLEM & REQUIREMENTS -->
+  <section>
+    <div class="sec-h"><span class="n">A</span><h2>Problem &amp; requirements</h2><span class="tag">edit CP · presence AP</span></div>
+    <div class="grid g2">
+      <div class="card">
+        <div class="kicker">functional</div>
+        <ul class="tight">
+          <li><b>Real-time co-editing</b> — 3–50 users on one doc; every keystroke propagates in &lt; 100 ms.</li>
+          <li><b>Convergence</b> — every client applies the same total order of ops → identical final content.</li>
+          <li><b>Cursor + selection sync</b> — coloured caret + highlight per user, throttled to ~50 ms.</li>
+          <li><b>Presence</b> — join / idle / left states; user avatars in the doc header.</li>
+          <li><b>Version history</b> — snapshot every 100 ops (or 5 min); browse + restore any prior revision.</li>
+          <li><b>Undo / redo</b> — per-user, correctly handling concurrent edits from others.</li>
+          <li><b>Comments</b> — anchored to text ranges (start/end + anchor_revision); resolve / reply.</li>
+          <li><b>Permissions</b> — OWNER / EDITOR / COMMENTER / VIEWER; link sharing with role + expiry.</li>
+          <li><b>Offline editing</b> — buffer ops locally; sync + transform on reconnect.</li>
+        </ul>
+      </div>
+      <div class="card">
+        <div class="kicker">non-functional</div>
+        <ul class="tight">
+          <li><b>Sync latency</b> p99 &lt; 100 ms edit propagation · &lt; 150 ms cursor.</li>
+          <li><b>Doc load</b> p99 &lt; 500 ms (snapshot + replay ≤ 100 ops).</li>
+          <li><b>Convergence</b> — <b>zero divergence tolerance</b>. Every client must end at the same content.</li>
+          <li><b>Durability</b> — zero edit loss after server ACK (Kafka append-before-PG-commit).</li>
+          <li><b>Availability</b> 99.99 % overall · 99.9 % on edit plane (CP — refuse if unsure).</li>
+          <li><b>Scale</b> 5 M concurrent WebSocket connections · 100 M ops/sec platform-wide.</li>
+          <li><b>Consistency split</b> — causal for edits (server total order), eventual for presence.</li>
+          <li><b>Correctness</b> — OT transforms must satisfy TP1 (<code>apply(A, B') = apply(B, A')</code>).</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <!-- B · ESTIMATION -->
+  <section>
+    <div class="sec-h"><span class="n">B</span><h2>Capacity estimation</h2><span class="tag">10 M DAU · 100 M docs</span></div>
+    <div class="chips">
+      <div class="chip"><span class="k">Total documents</span><span class="v">100 M</span></div>
+      <div class="chip"><span class="k">Daily active users</span><span class="v">10 M</span></div>
+      <div class="chip"><span class="k">Concurrent WS connections</span><span class="v">5 M (50 % DAU)</span></div>
+      <div class="chip"><span class="k">Active docs (peak)</span><span class="v">2 M (20 % DAU)</span></div>
+      <div class="chip"><span class="k">Editors / doc (avg → max)</span><span class="v">3 → 50</span></div>
+      <div class="chip"><span class="k">Ops / active doc</span><span class="v">~50 ops/sec</span></div>
+      <div class="chip"><span class="k">Platform ops/sec</span><span class="v">~100 M ops/sec</span></div>
+      <div class="chip"><span class="k">Avg op size</span><span class="v">100 bytes</span></div>
+      <div class="chip"><span class="k">Op log / day</span><span class="v">~500 GB (5 B ops)</span></div>
+      <div class="chip"><span class="k">Doc corpus</span><span class="v">~5 TB (100 M × 50 KB)</span></div>
+      <div class="chip"><span class="k">30-day op log</span><span class="v">~15 TB</span></div>
+      <div class="chip"><span class="k">WS bandwidth</span><span class="v">~10 GB/s peak</span></div>
+    </div>
+    <div class="callout tip"><b>Why 100 M ops/sec sounds worse than it is:</b> ops partition perfectly by <code>documentId</code>. 100 M ops/sec ÷ 50 ops/sec per active doc = <b>2 M independent shards</b>. A single Collab Service node handles ~1 000 docs (~50 K ops/sec); 50 nodes cover the fleet. The scary number is <b>per-doc concurrency</b> — 50 editors on one doc = 50 ops/sec on one shard, and the document-level lock (~1 ms hold) tops out at ~1 000 ops/sec. That's 20× headroom, but a "town hall" doc with 500 editors hits the limit → mitigations kick in (op batching · broadcast throttling · cursor sampling).</div>
+    <div class="callout warn"><b>The convergence non-negotiable:</b> if two clients end up with different content, the doc is <b>corrupted silently</b> — no error, no rollback, just Alice sees "Hello Earth" and Bob sees "Hello World". This is why <b>CP for edits</b> and why the server is the total-order authority. A 200 ms delay is annoying; a divergence is the end of the product.</div>
+  </section>
+
+  <!-- C · INTERACTIVE ARCHITECTURE -->
+  <section data-flowscope>
+    <div class="sec-h"><span class="n">C</span><h2>Architecture — click components, then step both flows</h2><span class="tag">edit plane (CP) + join / load plane</span></div>
+    <div>
+      <div class="arch">
+        <svg viewBox="0 0 900 560" width="100%" style="max-width:900px" role="img" aria-label="Real-time collaboration architecture — edit + join">
+          <defs>
+            <marker id="ah14" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" fill="var(--muted)"></path></marker>
+            <marker id="ah14w" markerWidth="10" markerHeight="10" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" fill="var(--warn)"></path></marker>
+          </defs>
+          <!-- Grid: 3 cols (x=20, x=330, x=640 · w=240 each), 7 rows (y=30, 105, 180, 255, 330, 405, 480 · h=54).
+               Gutters at x=260-330 (70 px) and x=570-640 (70 px). Row-gaps 21 px.
+               Mid-y per row: 57, 132, 207, 282, 357, 432, 507. -->
+
+          <!-- ═══════ edit flow (10 steps) ═══════ -->
+          <!-- E1 — Client → LB (col 1 vertical) -->
+          <line class="arrow" x1="140" y1="84" x2="140" y2="105" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah14)"
+                data-flow="edit join" data-edit="1" data-join="1"
+                data-desc-edit="Client emits OPERATION frame on the open WebSocket: {type:INSERT, pos:6, content:'Beautiful ', baseVersion:5}. Frame is ~100 bytes, encrypted TLS."
+                data-desc-join="HTTPS GET /documents/{docId} + Bearer JWT. Simple request-response — no WebSocket yet. Client waits for the DOCUMENT_STATE payload before it can open a WS."></line>
+
+          <!-- E2 — LB → WS Gateway (col 1 vertical) -->
+          <line class="arrow" x1="140" y1="159" x2="140" y2="180" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah14)"
+                data-flow="edit" data-edit="2"
+                data-desc-edit="L7 LB routes to a WS Gateway node using consistent hash on documentId + userId. Sticky: all editors of one doc land on the same gateway for zero-hop broadcast."></line>
+
+          <!-- J2 — LB → API Gateway (col 1 vertical, join uses REST) -->
+          <line class="arrow" x1="140" y1="234" x2="140" y2="255" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah14)"
+                data-flow="join" data-join="2"
+                data-desc-join="LB routes the HTTP call to any API Gateway node (stateless). JWT is validated at the edge; rate-limit bucket = 300 req/user/min for doc reads."></line>
+
+          <!-- E3 — WS Gateway → Collaboration Service (col1→col2, diagonal through gutter1, row3→row2) -->
+          <line class="arrow" x1="260" y1="207" x2="330" y2="132" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah14)"
+                data-flow="edit" data-edit="3"
+                data-desc-edit="Gateway validates permission (Redis cache 60 s), extracts documentId, forwards to the Collaboration Service pod that owns this doc's shard (hash-routed)."></line>
+
+          <!-- E4 — ★ Collaboration Service → OT/CRDT Engine (col 2 vertical, STAR call) -->
+          <line class="arrow" x1="450" y1="159" x2="450" y2="180" stroke="var(--warn)" stroke-width="2.5" marker-end="url(#ah14w)"
+                data-flow="edit" data-edit="4"
+                data-desc-edit="Facade invokes syncStrategy.applyOperation(doc, op, pendingOps). Enters the OT/CRDT engine — the core of the design. Doc-level Redis lock acquired (SETNX + 5 s TTL)."></line>
+          <text class="edge-label" x="500" y="172" text-anchor="start" fill="var(--warn)" font-weight="700" font-size="10">transform</text>
+
+          <!-- E5 — OT Engine → Operation Service (col 2 vertical) -->
+          <line class="arrow" x1="450" y1="234" x2="450" y2="255" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah14)"
+                data-flow="edit" data-edit="5"
+                data-desc-edit="After transform, engine calls opService.applyOperation(doc, op'). doc.applyInsert(pos', text) mutates the StringBuilder; doc.incrementVersion() bumps to rev+1."></line>
+
+          <!-- E6 — Operation Service → Op Log Table (col2→col3 horizontal, row 4) -->
+          <line class="arrow" x1="570" y1="282" x2="640" y2="282" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah14)"
+                data-flow="edit" data-edit="6"
+                data-desc-edit="opService persists (docId, revision, op) into the sharded Op Log Table (Postgres shard = hash(docId) % 5). Same transaction updates documents.current_revision = revision (atomic)."></line>
+
+          <!-- E7 — Collaboration Service → Broadcast Service (col2 vertical, row 2 → row 5 via right gutter L-path) -->
+          <path class="arrow" d="M570,120 L605,120 L605,357 L570,357" fill="none" stroke="var(--muted)" stroke-width="1.8" marker-end="url(#ah14)"
+                data-flow="edit" data-edit="7"
+                data-desc-edit="Facade also invokes broadcastService.broadcastOperation(docId, op', excludeUser=Alice). The transformed op is the payload — the same bytes every remote client will apply."></path>
+
+          <!-- E8 — Broadcast → Kafka (col2→col3, R5→R2 diagonal via right gutter L-path at x=620) -->
+          <path class="arrow" d="M570,340 L620,340 L620,140 L640,140" fill="none" stroke="var(--warn)" stroke-width="1.8" marker-end="url(#ah14w)"
+                data-flow="edit" data-edit="8"
+                data-desc-edit="Broadcast Service publishes to Kafka topic ops.{docId} (partition = hash(docId) % 100). At-least-once producer, key = docId → per-doc total order preserved."></path>
+
+          <!-- E9 — Kafka → other WS Gateway (col3→col1, R2→R3 long route, upper gutters — dashed = fan-out) -->
+          <path class="arrow" d="M640,132 L295,132 L295,180" fill="none" stroke="var(--warn)" stroke-width="1.5" stroke-dasharray="4 3" marker-end="url(#ah14w)"
+                data-flow="edit" data-edit="9"
+                data-desc-edit="Every WS Gateway pod is a Kafka consumer for the topics of docs whose editors it hosts. Non-authoring gateways receive the op within ~10 ms."></path>
+          <text class="edge-label" x="475" y="125" text-anchor="middle" font-size="10">fan-out (all gateways)</text>
+
+          <!-- E10 — WS Gateway → other Clients (col1 upward) -->
+          <line class="arrow" x1="140" y1="180" x2="140" y2="84" stroke="var(--muted)" stroke-width="1.8" stroke-dasharray="4 3" marker-end="url(#ah14)"
+                data-flow="edit" data-edit="10"
+                data-desc-edit="Gateway pushes REMOTE_OPERATION frame to Bob's / Charlie's sockets on the same doc. Client OT engine transforms any pending local op against this remote, then applies."></line>
+
+          <!-- ═══════ join flow (remaining steps 3-8) ═══════ -->
+          <!-- J3 — API Gateway → Permission Service (col 1 vertical) -->
+          <line class="arrow" x1="140" y1="309" x2="140" y2="330" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah14)"
+                data-flow="join" data-join="3"
+                data-desc-join="Gateway calls permissionService.canView(docId, userId). Redis cache lookup perm:{doc}:{user} → EDITOR/VIEWER/null. Cache miss → PG SELECT with 60 s TTL warm."></line>
+
+          <!-- J4 — Permission → Document Service (col 1 vertical) -->
+          <line class="arrow" x1="140" y1="384" x2="140" y2="405" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah14)"
+                data-flow="join" data-join="4"
+                data-desc-join="Permission OK → documentService.getDocument(docId). Service resolves the load path: fetch snapshot + replay tail ops."></line>
+
+          <!-- J5 — Document Service → Snapshot Store (col1→col3, R6→R5, diagonal via long right route) -->
+          <line class="arrow" x1="260" y1="432" x2="640" y2="357" stroke="var(--muted)" stroke-width="1.8" marker-end="url(#ah14)"
+                data-flow="join" data-join="5"
+                data-desc-join="doc.snapshotRevision points at the latest snapshot (e.g. rev 100). Doc Service fetches that snapshot blob from S3 / GCS — ~50 KB, ~30 ms."></line>
+
+          <!-- J6 — Document Service → Op Log Table (col1→col3, R6→R4, diagonal shorter) -->
+          <line class="arrow" x1="260" y1="425" x2="640" y2="295" stroke="var(--muted)" stroke-width="1.8" stroke-dasharray="4 3" marker-end="url(#ah14)"
+                data-flow="join" data-join="6"
+                data-desc-join="SELECT * FROM operations WHERE docId = ? AND revision &gt; snapshotRevision ORDER BY revision. Replay these ops on top of the snapshot → current content."></line>
+
+          <!-- J7 — WS Gateway → Presence Service (col1→col2, R3→R1, diagonal upward) -->
+          <line class="arrow" x1="260" y1="200" x2="330" y2="57" stroke="var(--muted)" stroke-width="1.8" marker-end="url(#ah14)"
+                data-flow="join" data-join="7"
+                data-desc-join="On WS handshake, gateway calls presenceService.joinDocument(userId, docId). Assigns cursor colour from a rotating pool. Registers user in the doc's active set."></line>
+
+          <!-- J8 — Presence → Redis (col2→col3, R1→R1 horizontal via gutter2) -->
+          <line class="arrow" x1="570" y1="57" x2="640" y2="57" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah14)"
+                data-flow="join" data-join="8"
+                data-desc-join="ZADD presence:{docId} {now} {userId} + HSET cursor:{docId} {userId} {json}. TTL 120 s. Broadcasts PRESENCE_UPDATE(joined) via Kafka topic presence.{docId}."></line>
+
+          <!-- ═══════ non-flow infra edges (dashed, unnumbered) ═══════ -->
+          <!-- Operation Service → PostgreSQL docs (dashed — perms/comments/doc metadata) -->
+          <line class="arrow" x1="570" y1="270" x2="640" y2="207" stroke="var(--muted)" stroke-width="1.2" stroke-dasharray="2 3" marker-end="url(#ah14)"></line>
+          <!-- Async worker → Op Log Table (compaction) -->
+          <line class="arrow" x1="570" y1="490" x2="640" y2="309" stroke="var(--muted)" stroke-width="1.2" stroke-dasharray="2 3" marker-end="url(#ah14)"></line>
+          <!-- Async worker → Snapshot Store (writes snapshots) -->
+          <line class="arrow" x1="570" y1="510" x2="640" y2="357" stroke="var(--muted)" stroke-width="1.2" stroke-dasharray="2 3" marker-end="url(#ah14)"></line>
+          <!-- Version Service → Snapshot Store (dashed — snapshot on trigger) -->
+          <line class="arrow" x1="260" y1="500" x2="640" y2="370" stroke="var(--muted)" stroke-width="1.2" stroke-dasharray="2 3" marker-end="url(#ah14)"></line>
+
+          <!-- ═══════ NODES ═══════ -->
+
+          <!-- Col 1 — ingress + reads -->
+          <g data-node style="cursor:pointer" data-title="Clients (Web · Desktop · Mobile)" data-detail="<b>Entry point.</b> Browser (Google Docs, Notion), Electron (Figma desktop), iOS/Android. Each holds a <b>local OT engine</b> for optimistic apply (&lt; 1 ms echo).<br><b>Two channels:</b><br>• REST — <code>GET /documents/{id}</code>, snapshots, permissions.<br>• WebSocket — persistent <code>wss://collab/ws/documents/{id}</code>. Sends OPERATION / CURSOR / PRESENCE / UNDO frames.<br><b>Reconnection:</b> exponential backoff; on reconnect sends buffered ops with the last ACK'd base version so the server can transform them."><rect x="20" y="30" width="240" height="54" rx="9" fill="var(--panel-2)" stroke="var(--eden)"></rect><text x="140" y="55" text-anchor="middle" fill="var(--eden)" font-size="13" font-weight="600">Clients</text><text x="140" y="72" text-anchor="middle" fill="var(--faint)" font-size="11">web · desktop · mobile</text></g>
+
+          <g data-node style="cursor:pointer" data-title="L7 Load Balancer (sticky by docId)" data-detail="<b>Role:</b> HTTPS + WSS termination. Routes REST to any API Gateway; routes WSS to the WS Gateway node bound to this doc's hash.<br><b>Sticky:</b> consistent hash on <code>documentId + userId</code>. All editors of one doc likely land on the same gateway → zero-hop local broadcast.<br><b>Draining:</b> on rolling upgrade, LB sends a control frame telling clients to reconnect elsewhere before the pod dies (avoids abrupt disconnects mid-edit)."><rect x="20" y="105" width="240" height="54" rx="9" fill="var(--panel-2)" stroke="var(--border)"></rect><text x="140" y="130" text-anchor="middle" fill="var(--text)" font-size="13" font-weight="600">L7 Load Balancer</text><text x="140" y="147" text-anchor="middle" fill="var(--faint)" font-size="11">sticky by docId</text></g>
+
+          <g data-node style="cursor:pointer" data-title="WebSocket Gateway (100 nodes · 50 K conns each)" data-detail="<b>Role:</b> long-lived socket termination. Each node holds ~50 000 WSS connections; 100 nodes = 5 M concurrent.<br><b>Duties:</b> JWT check on connect, 30 s heartbeat (2 misses = disconnect), 5 s reconnect grace, subscribes to Kafka topic <code>ops.{docId}</code> for docs it hosts, fan-outs REMOTE_OPERATION to local sockets.<br><b>Memory / node:</b> 50 K × ~10 KB session state ≈ 500 MB.<br><b>Failure:</b> node dies → clients reconnect; LB re-routes; new node replays last N ops from Kafka."><rect x="20" y="180" width="240" height="54" rx="9" fill="var(--panel-2)" stroke="var(--border)"></rect><text x="140" y="205" text-anchor="middle" fill="var(--text)" font-size="13" font-weight="600">WebSocket Gateway</text><text x="140" y="222" text-anchor="middle" fill="var(--faint)" font-size="11">sticky · 50 K conns/node</text></g>
+
+          <g data-node style="cursor:pointer" data-title="API Gateway (REST · JWT)" data-detail="<b>Role:</b> stateless HTTP surface for CRUD, doc load, permission grants, comment CRUD, version list.<br><b>Endpoints:</b> <code>POST /documents</code> · <code>GET /documents/{id}</code> · <code>PUT /documents/{id}/permissions</code> · <code>GET /documents/{id}/history</code>.<br><b>Rate limits:</b> 100 write ops/user/min · 300 reads/user/min (per-user token bucket in Redis).<br><b>Not on the edit hot path</b> — pure OT lives on the WebSocket side; REST handles the periphery."><rect x="20" y="255" width="240" height="54" rx="9" fill="var(--panel-2)" stroke="var(--border)"></rect><text x="140" y="280" text-anchor="middle" fill="var(--text)" font-size="13" font-weight="600">API Gateway</text><text x="140" y="297" text-anchor="middle" fill="var(--faint)" font-size="11">REST · JWT auth</text></g>
+
+          <g data-node style="cursor:pointer" data-title="Permission Service" data-detail="<b>Role:</b> access control. Checks role (OWNER / EDITOR / COMMENTER / VIEWER) for every op + every REST read.<br><b>Fast path:</b> Redis cache <code>perm:{doc}:{user} → role</code> (60 s TTL). ~99 % hit rate.<br><b>Slow path:</b> Postgres <code>SELECT role FROM permissions WHERE doc_id = ? AND user_id = ?</code>.<br><b>Link sharing:</b> resolves anonymous share tokens to a role + expiry. Revoked user → cache-invalidate on write."><rect x="20" y="330" width="240" height="54" rx="9" fill="var(--panel-2)" stroke="var(--survivor)"></rect><text x="140" y="355" text-anchor="middle" fill="var(--survivor)" font-size="13" font-weight="600">Permission Service</text><text x="140" y="372" text-anchor="middle" fill="var(--faint)" font-size="11">role check · Redis cache</text></g>
+
+          <g data-node style="cursor:pointer" data-title="Document Service (load path)" data-detail="<b>Role:</b> CRUD + document load. NOT on the edit hot path.<br><b>Load protocol:</b><br>(1) Fetch <code>documents.snapshot_revision</code> from PG.<br>(2) Fetch snapshot blob from S3.<br>(3) SELECT ops WHERE rev &gt; snapshot_rev.<br>(4) Replay ops on snapshot in-memory → return content.<br><b>Cost:</b> ~30 ms S3 + ~5 ms PG + ~5 ms replay ≈ 40 ms p50, ~500 ms p99 for cold big docs.<br><b>Also:</b> createDocument, delete/archive, title update."><rect x="20" y="405" width="240" height="54" rx="9" fill="var(--panel-2)" stroke="var(--survivor)"></rect><text x="140" y="430" text-anchor="middle" fill="var(--survivor)" font-size="13" font-weight="600">Document Service</text><text x="140" y="447" text-anchor="middle" fill="var(--faint)" font-size="11">load · snapshot+replay</text></g>
+
+          <g data-node style="cursor:pointer" data-title="Version Service (snapshots · history)" data-detail="<b>Role:</b> event-sourcing companion to the op log. Owns snapshots + version diffs + restore.<br><b>Snapshot trigger:</b> every 100 ops OR every 5 min OR on last-editor-disconnect. Whichever fires first.<br><b>Restore:</b> not a rollback — creates NEW ops that diff current → target version, run through normal saga. Original history preserved.<br><b>Diff:</b> Myers diff (O(ND)) between two snapshots; annotated with who-changed-what from op metadata."><rect x="20" y="480" width="240" height="54" rx="9" fill="var(--panel-2)" stroke="var(--survivor)"></rect><text x="140" y="505" text-anchor="middle" fill="var(--survivor)" font-size="13" font-weight="600">Version Service</text><text x="140" y="522" text-anchor="middle" fill="var(--faint)" font-size="11">snapshot every 100 ops</text></g>
+
+          <!-- Col 2 — services + engine -->
+          <g data-node style="cursor:pointer" data-title="Presence Service" data-detail="<b>Role:</b> ephemeral state — who's online per doc, where their cursor is.<br><b>Storage:</b> Redis sorted-set <code>presence:{doc}</code> scored by heartbeat time; hash <code>cursor:{doc}</code> keyed by userId → {pos, selection, colour}.<br><b>Heartbeat:</b> client pings every 30 s. Miss 2 → IDLE. Miss 4 → LEFT (evict).<br><b>Cursor throttle:</b> 50 ms client-side (20 updates/s cap) — reduces network by ~40 % with no perceptible lag.<br><b>AP semantics:</b> stale by ~1–2 s is fine — a lingering cursor is a UI nit, not a correctness bug."><rect x="330" y="30" width="240" height="54" rx="9" fill="var(--panel-2)" stroke="var(--survivor)"></rect><text x="450" y="55" text-anchor="middle" fill="var(--survivor)" font-size="13" font-weight="600">Presence Service</text><text x="450" y="72" text-anchor="middle" fill="var(--faint)" font-size="11">heartbeat · Redis TTL</text></g>
+
+          <g data-node style="cursor:pointer" data-title="Collaboration Service (Facade)" data-detail="<b>The one door for edits.</b> Method: <code>processOperation(docId, userId, op)</code>.<br><b>Sequence:</b><br>(1) permissionService.canEdit(docId, userId).<br>(2) documentService.getDocument(docId).<br>(3) opService.getOperationsSince(docId, op.baseVersion) → pending list.<br>(4) syncStrategy.applyOperation(doc, op, pending) — <b>enters OT engine</b>.<br>(5) opService.saveOperation(op'), persistenceStrategy.saveOperation(op').<br>(6) broadcastService.broadcastOperation(docId, op', excludeUser).<br>(7) presenceService.updateCursor + adjustCursors for other users.<br>(8) versionService.createSnapshot every SNAPSHOT_INTERVAL ops."><rect x="330" y="105" width="240" height="54" rx="9" fill="var(--panel-2)" stroke="var(--survivor)"></rect><text x="450" y="130" text-anchor="middle" fill="var(--survivor)" font-size="13" font-weight="600">Collaboration Service</text><text x="450" y="147" text-anchor="middle" fill="var(--faint)" font-size="11">Facade · orchestrator</text></g>
+
+          <g data-node style="cursor:pointer" data-title="OT / CRDT Engine (the STAR)" data-detail="<b>The algorithm.</b> Two pluggable impls behind a single ConflictResolver interface:<br><br><b>OTResolver</b> (Google Docs model — centralised OT):<br>Given local op vs each pending op, produce (local′, remote′) such that <code>apply(A, B′) = apply(B, A′)</code> (TP1).<br>Four cases: INSERT×INSERT (tie-break by userId), INSERT×DELETE, DELETE×INSERT, DELETE×DELETE (overlap shrinks lengths).<br><br><b>CRDTResolver</b> (Figma model — RGA):<br>Each char has a unique <code>(siteId, counter)</code> ID; ops reference IDs, not positions → commute by design → transform is a no-op.<br><br><b>Choice today:</b> OT — cheaper metadata, well-understood, dominant in production. CRDT swap-in via strategy for offline-heavy clients."><rect x="330" y="180" width="240" height="54" rx="9" fill="var(--panel-2)" stroke="var(--warn)" stroke-width="2"></rect><text x="450" y="205" text-anchor="middle" fill="var(--warn)" font-size="14" font-weight="700">OT / CRDT Engine</text><text x="450" y="222" text-anchor="middle" fill="var(--faint)" font-size="11">transform · commutative</text></g>
+
+          <g data-node style="cursor:pointer" data-title="Operation Service (validate · persist)" data-detail="<b>Role:</b> after the engine has resolved conflicts, this service applies the op to the Document and persists it. Not a compensable step — the transform already produced the safe op.<br><b>Ops:</b> <code>applyOperation(doc, op)</code> — validates bounds, dispatches to <code>doc.applyInsert / applyDelete</code>, then <code>doc.incrementVersion()</code>.<br><code>saveOperation(op)</code> — writes to the sharded Op Log Table.<br><code>getOperationsSince(docId, version)</code> — fetches pending ops for OT transform (indexed on <code>(doc_id, revision)</code>).<br><b>Concurrency:</b> Document.applyInsert / applyDelete are synchronized — belt-and-braces even under the doc-level lock."><rect x="330" y="255" width="240" height="54" rx="9" fill="var(--panel-2)" stroke="var(--survivor)"></rect><text x="450" y="280" text-anchor="middle" fill="var(--survivor)" font-size="13" font-weight="600">Operation Service</text><text x="450" y="297" text-anchor="middle" fill="var(--faint)" font-size="11">validate · persist ops</text></g>
+
+          <g data-node style="cursor:pointer" data-title="Broadcast Service (per-doc fan-out)" data-detail="<b>Role:</b> after persist, push the (transformed) op to every editor of the doc EXCEPT the author.<br><b>Local fast path:</b> if all editors of this doc are on the same gateway (sticky helps), a local map lookup → direct send. ~2 ms.<br><b>Cross-gateway path:</b> publish to Kafka <code>ops.{docId}</code>. All gateways with active editors on this doc consume and push.<br><b>Cursor updates:</b> same channel, throttled 50 ms.<br><b>Payload:</b> transformed op JSON — same bytes every recipient applies to their local doc via client-side OT."><rect x="330" y="330" width="240" height="54" rx="9" fill="var(--panel-2)" stroke="var(--survivor)"></rect><text x="450" y="355" text-anchor="middle" fill="var(--survivor)" font-size="13" font-weight="600">Broadcast Service</text><text x="450" y="372" text-anchor="middle" fill="var(--faint)" font-size="11">fan-out per doc</text></g>
+
+          <g data-node style="cursor:pointer" data-title="Async workers (compact · GC)" data-detail="<b>Role:</b> background jobs that keep storage sane.<br><b>Snapshot job:</b> every 100 ops (or 5 min) → build snapshot from prev snapshot + replay; write blob to S3; UPDATE documents.snapshot_revision atomically.<br><b>Op compaction:</b> after 7 days, coalesce individual char INSERTs into paragraph blocks; after 30 days, keep daily snapshots only.<br><b>CRDT tombstone GC:</b> when all sites have acked a delete op, physically remove the tombstoned char.<br><b>Stale presence sweeper:</b> every 10 s, ZRANGEBYSCORE presence sets for heartbeats older than 60/120 s → mark IDLE / LEFT."><rect x="330" y="480" width="240" height="54" rx="9" fill="var(--panel-2)" stroke="var(--survivor)"></rect><text x="450" y="505" text-anchor="middle" fill="var(--survivor)" font-size="13" font-weight="600">Async workers</text><text x="450" y="522" text-anchor="middle" fill="var(--faint)" font-size="11">compact · GC tombstones</text></g>
+
+          <!-- Col 3 — data stores + async -->
+          <g data-node style="cursor:pointer" data-title="Redis (cursor · presence · lock)" data-detail="<b>Role:</b> sub-ms latency store for everything ephemeral + critical-section locks.<br><b>Keys:</b><br>• <code>presence:{docId}</code> — sorted set of active userIds by heartbeat ts.<br>• <code>cursor:{docId}</code> — hash user → cursor JSON.<br>• <code>lock:{docId}</code> — SETNX with 5 s TTL — the doc-level write lock.<br>• <code>perm:{doc}:{user}</code> — permission cache, 60 s TTL.<br>• <code>ws_conn:{userId}:{docId}</code> — which gateway node hosts this connection.<br><b>Cluster:</b> 10 nodes, ~8–10 GB total — everything fits in memory."><rect x="640" y="30" width="240" height="54" rx="9" fill="var(--panel-2)" stroke="var(--old)"></rect><text x="760" y="55" text-anchor="middle" fill="var(--old)" font-size="13" font-weight="600">Redis</text><text x="760" y="72" text-anchor="middle" fill="var(--faint)" font-size="11">cursor · presence · lock</text></g>
+
+          <g data-node style="cursor:pointer" data-title="Kafka (op fan-out · per-doc topic)" data-detail="<b>Role:</b> the cross-gateway message bus. Also acts as a short-term op log (24 h retention) for gateway restart replay.<br><b>Topic:</b> <code>document-operations</code> — 100 partitions, key = documentId → per-doc total order preserved.<br><b>Consumers:</b> every WS Gateway pod subscribes ONLY to the topics matching docs it currently hosts (subscription rebalances on doc join/leave).<br><b>Guarantees:</b> at-least-once — client OT engine is idempotent via <code>local_op_id</code> dedup.<br><b>Throughput:</b> 100 M msgs/s × 100 B ≈ 10 GB/s → 15 brokers, RF=3, NVMe SSD."><rect x="640" y="105" width="240" height="54" rx="9" fill="var(--panel-2)" stroke="var(--warn)"></rect><text x="760" y="130" text-anchor="middle" fill="var(--warn)" font-size="13" font-weight="600">Kafka</text><text x="760" y="147" text-anchor="middle" fill="var(--faint)" font-size="11">op fan-out · per-doc</text></g>
+
+          <g data-node style="cursor:pointer" data-title="PostgreSQL (docs · perms · comments)" data-detail="<b>Storage:</b> Aurora PostgreSQL, sharded by <code>hash(document_id) % 5</code>.<br><b>Tables:</b><br>• <code>documents</code> — 100 M rows · docId, title, owner, current_revision, snapshot_revision, content_snapshot.<br>• <code>permissions</code> — ~200 M rows.<br>• <code>comments</code> — anchored to (start, end, anchor_revision).<br><b>ACID:</b> the op-persist + revision-bump is a single transaction. UNIQUE on (docId, revision) guarantees no gaps / no dupes.<br><b>Read replicas:</b> 3 per shard for doc load + history browsing (eventual, &lt; 100 ms lag)."><rect x="640" y="180" width="240" height="54" rx="9" fill="var(--panel-2)" stroke="var(--old)"></rect><text x="760" y="205" text-anchor="middle" fill="var(--old)" font-size="13" font-weight="600">PostgreSQL</text><text x="760" y="222" text-anchor="middle" fill="var(--faint)" font-size="11">docs · perms · comments</text></g>
+
+          <g data-node style="cursor:pointer" data-title="Op Log Table (sharded by docId)" data-detail="<b>Storage:</b> the <code>operations</code> table lives on the same Postgres shard as its parent document — same 5-shard scheme.<br><b>Row:</b> <code>(operation_id, doc_id, user_id, revision, op_type, position, content, length, base_revision, created_at)</code>. ~100 bytes.<br><b>Volume:</b> ~5 B ops/day × 100 B = 500 GB/day; 30-day rolling retention = ~15 TB.<br><b>Indexes:</b><br>• <code>(doc_id, revision)</code> — critical for &lt; 5 ms tail-fetch on OT transform.<br>• <code>(doc_id, created_at)</code> — history + audit.<br><b>Compaction:</b> after 7 days, coalesce single-char INSERTs into paragraph blocks — 60–70 % savings."><rect x="640" y="255" width="240" height="54" rx="9" fill="var(--panel-2)" stroke="var(--old)"></rect><text x="760" y="280" text-anchor="middle" fill="var(--old)" font-size="13" font-weight="600">Op Log Table</text><text x="760" y="297" text-anchor="middle" fill="var(--faint)" font-size="11">sharded by docId</text></g>
+
+          <g data-node style="cursor:pointer" data-title="Snapshot Store (S3 · Cloud Storage)" data-detail="<b>Role:</b> immutable blobs — the pre-computed document content at snapshot revision N.<br><b>Layout:</b> <code>s3://collab-snapshots/{docId}/{revision}.txt</code>. Avg blob ~50 KB, ~1 KB compressed for structured docs.<br><b>Retention:</b> last 50 snapshots per doc (covers ~5 000 ops of history). Then 1 per day for 30 days. Then 1 per week for 1 year.<br><b>Cost:</b> 100 M docs × 50 snapshots × 5 KB ≈ 25 TB. At S3 Standard-IA ~$0.0125/GB/mo ≈ $320/mo — negligible next to the op log."><rect x="640" y="330" width="240" height="54" rx="9" fill="var(--panel-2)" stroke="var(--old)"></rect><text x="760" y="355" text-anchor="middle" fill="var(--old)" font-size="13" font-weight="600">Snapshot Store</text><text x="760" y="372" text-anchor="middle" fill="var(--faint)" font-size="11">S3 · Cloud Storage</text></g>
+
+        </svg>
+      </div>
+      <div class="node-detail"><span class="nd-title">Click any component</span><div class="nd-body">Its role, storage layout, and consistency model appear here. Then use the buttons below to walk the <b>edit</b> path (client → OT → fan-out) and the <b>join / load</b> path (auth → snapshot → replay → presence).</div></div>
+
+      <div class="flowctl" data-flowctl>
+        <button class="btn" data-flow="edit">Edit — real-time (10 steps · CP)</button>
+        <button class="btn" data-flow="join">Join / load (8 steps · AP presence)</button>
+        <span style="flex:1"></span>
+        <button class="btn" data-flowstep="prev">◀ Prev</button>
+        <button class="btn" data-flowstep="next">Next ▶</button>
+      </div>
+      <div class="flowlabel" data-flowlabel>Pick <b>Edit</b> or <b>Join / load</b>, then press "Next ▶" to walk the numbered request flow one hop at a time.</div>
+
+      <div class="cloudmap">
+        <div class="kicker" style="margin-top:4px">Managed-service mapping — the same design on each cloud</div>
+        <table class="cloudtable">
+          <thead><tr>
+            <th>Component</th>
+            <th><span class="hdrlogo"><span class="logochip"><img src="../assets/logos/aws.svg" alt="AWS"></span>AWS</span></th>
+            <th><span class="hdrlogo"><span class="logochip"><img src="../assets/logos/gcp.svg" alt="GCP"></span>GCP</span></th>
+            <th><span class="hdrlogo"><span class="logochip"><img src="../assets/logos/azure.svg" alt="Azure"></span>Azure</span></th>
+          </tr></thead>
+          <tbody>
+            <tr><td><b>WebSocket Gateway</b></td><td><img class="svcicon" src="../assets/logos/services/aws-apigw.svg" alt="">API Gateway (WS) + ECS/EKS</td><td><img class="svcicon" src="../assets/logos/services/gcp-run.svg" alt="">Cloud Run / GKE</td><td><img class="svcicon" src="../assets/logos/services/azure-aks.svg" alt="">AKS + SignalR Service</td></tr>
+            <tr><td>REST API Gateway</td><td><img class="svcicon" src="../assets/logos/services/aws-apigw.svg" alt="">API Gateway</td><td><img class="svcicon" src="../assets/logos/services/gcp-apigw.svg" alt="">API Gateway / Apigee</td><td><img class="svcicon" src="../assets/logos/services/azure-apim.svg" alt="">API Management</td></tr>
+            <tr><td>Compute (Collab / Presence / Doc)</td><td><img class="svcicon" src="../assets/logos/services/aws-ecs.svg" alt="">ECS Fargate / EKS</td><td><img class="svcicon" src="../assets/logos/services/gcp-run.svg" alt="">Cloud Run / GKE</td><td><img class="svcicon" src="../assets/logos/services/azure-aks.svg" alt="">AKS / Container Apps</td></tr>
+            <tr><td>Docs · perms · comments</td><td><img class="svcicon" src="../assets/logos/services/aws-rds.svg" alt="">Aurora PostgreSQL</td><td><img class="svcicon" src="../assets/logos/services/gcp-cloudsql.svg" alt="">Cloud SQL / AlloyDB</td><td><img class="svcicon" src="../assets/logos/services/azure-sql.svg" alt="">Azure Database for PG</td></tr>
+            <tr><td>Op log (sharded, indexed)</td><td><img class="svcicon" src="../assets/logos/services/aws-rds.svg" alt="">Aurora PG (sharded)</td><td><img class="svcicon" src="../assets/logos/services/gcp-cloudsql.svg" alt="">Cloud SQL PG</td><td><img class="svcicon" src="../assets/logos/services/azure-sql.svg" alt="">Azure DB for PG</td></tr>
+            <tr><td>Cursor · presence · locks</td><td><img class="svcicon" src="../assets/logos/services/aws-elasticache.svg" alt="">ElastiCache Redis</td><td><img class="svcicon" src="../assets/logos/services/gcp-memorystore.svg" alt="">Memorystore Redis</td><td><img class="svcicon" src="../assets/logos/services/azure-redis.svg" alt="">Azure Cache for Redis</td></tr>
+            <tr><td>Op fan-out (per-doc topic)</td><td><img class="svcicon" src="../assets/logos/services/aws-msk.svg" alt="">MSK Kafka</td><td><img class="svcicon" src="../assets/logos/services/gcp-pubsub.svg" alt="">Pub/Sub</td><td><img class="svcicon" src="../assets/logos/services/azure-eventhubs.svg" alt="">Event Hubs</td></tr>
+            <tr><td>Snapshot blobs</td><td><img class="svcicon" src="../assets/logos/services/aws-s3.svg" alt="">S3 (Standard-IA)</td><td><img class="svcicon" src="../assets/logos/services/gcp-cloudstorage.svg" alt="">Cloud Storage (Nearline)</td><td><img class="svcicon" src="../assets/logos/services/azure-blob.svg" alt="">Blob Storage (Cool)</td></tr>
+            <tr><td>Managed WS (alternative)</td><td>AppSync + subscriptions</td><td>Firebase Realtime DB</td><td>Azure SignalR Service</td></tr>
+            <tr><td>Load Balancer (WSS)</td><td><img class="svcicon" src="../assets/logos/services/aws-elb.svg" alt="">ALB (WS sticky)</td><td><img class="svcicon" src="../assets/logos/services/gcp-elb.svg" alt="">Cloud Load Balancing</td><td><img class="svcicon" src="../assets/logos/services/azure-appgw.svg" alt="">Application Gateway</td></tr>
+            <tr><td>Cursor CDN (avatars)</td><td><img class="svcicon" src="../assets/logos/services/aws-cloudfront.svg" alt="">CloudFront</td><td><img class="svcicon" src="../assets/logos/services/gcp-cloudcdn.svg" alt="">Cloud CDN</td><td><img class="svcicon" src="../assets/logos/services/azure-cdn.svg" alt="">Azure CDN</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+
+  <!-- D · API -->
+  <section>
+    <div class="sec-h"><span class="n">D</span><h2>API design</h2><span class="tag">REST + WebSocket frames</span></div>
+    <div class="grid g2">
+      <div class="card">
+        <div class="kicker">REST (document CRUD + version)</div>
+        <table>
+          <thead><tr><th>Endpoint</th><th>Purpose</th></tr></thead>
+          <tbody>
+            <tr><td><code>POST /documents</code></td><td>Create empty / template doc; auto-grant OWNER perm</td></tr>
+            <tr><td><code>GET /documents/{id}</code></td><td>Load — snapshot + replayed ops + <code>revision</code></td></tr>
+            <tr><td><code>PATCH /documents/{id}/ops</code></td><td>Batched op submit (fallback for HTTP-only clients)</td></tr>
+            <tr><td><code>PUT /documents/{id}/permissions</code></td><td>Grant / revoke role or link share</td></tr>
+            <tr><td><code>GET /documents/{id}/history</code></td><td>List snapshots with metadata + labels</td></tr>
+            <tr><td><code>POST /documents/{id}/restore</code></td><td>Restore to a prior revision (creates NEW ops)</td></tr>
+            <tr><td><code>POST /documents/{id}/comments</code></td><td>Add anchored comment (start, end, anchor_revision)</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="card">
+        <div class="kicker">WebSocket protocol (<code>wss://collab/ws/documents/{id}</code>)</div>
+<pre class="code"><span class="cm">// Client → Server</span>
+OPERATION       { type, ops[], base_revision, local_op_id }
+CURSOR          { position, selection:{start,end} }
+PRESENCE        { status:"ACTIVE" }        <span class="cm">// heartbeat every 30 s</span>
+UNDO            { base_revision }
+REDO            { base_revision }
+
+<span class="cm">// Server → Client</span>
+DOCUMENT_STATE  { content, revision, active_users[] }
+OPERATION_ACK   { local_op_id, server_revision }
+REMOTE_OPERATION{ user_id, ops[], server_revision }
+CURSOR_UPDATE   { user_id, position, colour }
+PRESENCE_UPDATE { user_id, status, active_users_count }
+ERROR           { code, message, current_revision }
+                <span class="cm">// e.g. REVISION_MISMATCH → client resync</span></pre>
+      </div>
+    </div>
+    <p class="muted"><b>Correctness contract:</b> every OPERATION carries <code>base_revision</code> (client's last-seen server rev) + <code>local_op_id</code> (client UUID). Server transforms against ops (base_revision, current_revision], assigns a new revision, and echoes <code>local_op_id</code> in the ACK so the client can move the op from "pending" → "confirmed" — the CRDT idempotency pattern applied to OT.</p>
+  </section>
+
+  <!-- E · DATA MODEL -->
+  <section>
+    <div class="sec-h"><span class="n">E</span><h2>Data model — persistent vs ephemeral</h2><span class="tag">Postgres for truth · Redis for now</span></div>
+    <div class="grid g2">
+      <div class="card">
+        <div class="kicker">persistent (Postgres, sharded by docId)</div>
+<pre class="code">documents                      <span class="cm">// 100 M rows</span>
+  document_id (PK)
+  title
+  owner_id, workspace_id
+  current_revision  BIGINT     <span class="cm">// monotonic per doc</span>
+  content_snapshot  TEXT       <span class="cm">// latest full content</span>
+  snapshot_revision BIGINT     <span class="cm">// rev at snapshot time</span>
+  status ENUM                   <span class="cm">// ACTIVE/ARCHIVED/DELETED</span>
+
+operations                     <span class="cm">// ~5 B rows/day, 30-d retention</span>
+  operation_id (PK)
+  document_id, user_id
+  revision BIGINT              <span class="cm">// server-assigned</span>
+  op_type ENUM                  <span class="cm">// INSERT/DELETE/RETAIN</span>
+  position INT, content TEXT
+  length INT, attributes JSONB
+  base_revision, client_id, local_op_id
+  created_at
+  <span class="cm">// idx (document_id, revision) — fetch tail</span>
+
+versions                       <span class="cm">// snapshots + labels</span>
+  version_id (PK)
+  document_id, revision
+  content TEXT, label
+  contributing_users JSONB
+
+permissions                    <span class="cm">// role per (doc, user)</span>
+  document_id, user_id, role, expires_at
+
+comments                       <span class="cm">// anchored ranges</span>
+  comment_id, document_id, user_id
+  anchor_start, anchor_end
+  anchor_revision   <span class="cm">// re-anchor on later ops</span>
+  content, status</pre>
+      </div>
+      <div class="card">
+        <div class="kicker">ephemeral (Redis, TTL-backed)</div>
+<pre class="code">presence:{docId}               <span class="cm">// Sorted Set</span>
+  score = heartbeat epoch ms
+  member = userId
+  TTL 120 s                    <span class="cm">// auto-evict LEFT users</span>
+
+cursor:{docId}                 <span class="cm">// Hash</span>
+  field  = userId
+  value  = {pos, selection, colour, ts}
+  TTL 120 s
+
+user_presence:{userId}         <span class="cm">// Hash</span>
+  document_id, status
+  display_name, avatar_url
+  cursor_colour
+  connected_server, last_heartbeat
+
+ws_conn:{userId}:{docId}       <span class="cm">// String</span>
+  {serverId, connectedAt}
+  TTL 120 s
+
+lock:{docId}                   <span class="cm">// String, SETNX</span>
+  {serverId, acquiredAt}
+  TTL 5 s                      <span class="cm">// auto-release on crash</span>
+
+perm:{docId}:{userId}          <span class="cm">// String</span>
+  role, TTL 60 s               <span class="cm">// invalidate on revoke</span></pre>
+      </div>
+    </div>
+    <div class="callout tip"><b>Rule of thumb:</b> if data survives a full cluster reboot without pain, it's Postgres. If losing it means "the UI is a bit stale for 60 s," it's Redis. This is why cursors are Redis (a stale cursor is fine) and permissions are Postgres (a stale permission grants access after revoke — not fine).</div>
+  </section>
+
+  <!-- F · KEY CHOICES -->
+  <section>
+    <div class="sec-h"><span class="n">F</span><h2>Key design choices (deep-dived on canvas 3)</h2><span class="tag">defend these</span></div>
+    <div class="grid g3">
+      <div class="card"><div class="kicker">algorithm</div><h3>OT (centralised) as primary</h3><p class="muted">Google Docs' proven approach. Server is the single order authority; late ops transform against pending. CRDT swappable for offline-heavy clients via strategy. <span class="run">→ canvas 3 · OT vs CRDT</span></p></div>
+      <div class="card"><div class="kicker">consistency</div><h3>CP edits · AP presence</h3><p class="muted">Convergence non-negotiable → edits refuse under partition. Cursors stale is fine → presence stays available always. <span class="run">→ canvas 3 · CAP split</span></p></div>
+      <div class="card"><div class="kicker">concurrency</div><h3>Doc-level Redis lock (SETNX)</h3><p class="muted">Serialises ops per doc (~1 ms hold, ~1 000 ops/s ceiling). Cross-doc ops fully parallel. 20× headroom over the 50 ops/s per-doc peak. <span class="run">→ canvas 3 · concurrency</span></p></div>
+      <div class="card"><div class="kicker">transport</div><h3>WebSocket + sticky sessions</h3><p class="muted">Persistent duplex &lt; 100 ms; 50 K conns/node × 100 nodes = 5 M. Sticky by docId keeps editors co-located → in-process broadcast. <span class="run">→ canvas 3 · WS scaling</span></p></div>
+      <div class="card"><div class="kicker">storage</div><h3>Snapshot + op replay</h3><p class="muted">Snapshots every 100 ops → doc load in O(≤ 100 ops) instead of O(N). Event-sourcing for full audit trail; compaction after 7 days. <span class="run">→ canvas 3 · snapshot cadence</span></p></div>
+      <div class="card"><div class="kicker">fan-out</div><h3>Kafka per-doc topic</h3><p class="muted">Ordering per partition = ordering per doc. Non-authoring gateways subscribe only to docs they host. Durable, replayable on gateway restart. <span class="run">→ canvas 3 · fan-out</span></p></div>
+    </div>
+  </section>
+
+  <!-- GLOSSARY -->
+  <section>
+    <div class="sec-h"><span class="n">§</span><h2>Glossary — one-liners</h2></div>
+    <div class="grid g2">
+      <div class="card"><table><tbody>
+        <tr><td><b>OT (Operational Transform)</b></td><td>algorithm that adjusts a concurrent op's position so both orders converge to the same doc</td></tr>
+        <tr><td><b>TP1</b></td><td>Transformation Property 1: <code>apply(A, B') = apply(B, A')</code>. The correctness proof for OT</td></tr>
+        <tr><td><b>CRDT (RGA)</b></td><td>char has unique <code>(siteId, counter)</code> ID → ops commute → no transform needed → offline works</td></tr>
+        <tr><td><b>Tombstone</b></td><td>deleted char kept in the CRDT so later parent-references still resolve; GC'd after all sites ACK</td></tr>
+        <tr><td><b>base_revision</b></td><td>the server rev the client had seen when it created the op; server transforms against (base_rev, current_rev]</td></tr>
+        <tr><td><b>Doc-level lock</b></td><td>Redis SETNX with 5 s TTL — one op processed at a time per doc → total order</td></tr>
+      </tbody></table></div>
+      <div class="card"><table><tbody>
+        <tr><td><b>Sticky session</b></td><td>hash(docId) routing → all editors of one doc land on the same gateway pod</td></tr>
+        <tr><td><b>Snapshot cadence</b></td><td>every 100 ops or 5 min — bounds doc-load replay cost to O(≤ 100)</td></tr>
+        <tr><td><b>Causal consistency</b></td><td>if op B was created after seeing A, every client applies A before B (enforced by revision numbers)</td></tr>
+        <tr><td><b>Cursor transform</b></td><td>same rules as text ops — remote INSERT before cursor → cursor shifts right by insert length</td></tr>
+        <tr><td><b>Op compaction</b></td><td>coalesce N single-char INSERTs into one paragraph INSERT after 7 days; 60–70 % storage cut</td></tr>
+        <tr><td><b>REVISION_MISMATCH</b></td><td>server error when client's base_revision is too old to transform (past retention) → client resync</td></tr>
+      </tbody></table></div>
+    </div>
+  </section>
+
+  <footer>
+    <p>Use case 14 · Real-time Collaboration (Google Docs / Figma) — Canvas 1 of 3 (HLD). Grounded in <code>14-realtime-collaboration/docs/hld/HIGH_LEVEL_DESIGN.md</code> and the real Java under <code>14-realtime-collaboration/src/</code>.</p>
+    <p class="run">This use case: HLD · <a href="lld.html">Canvas 2 · LLD</a> · <a href="deepdive.html">Canvas 3 · Deep-dive &amp; Trade-offs</a> &nbsp;|&nbsp; <a href="../index.html">Hub</a></p>
+  </footer>
+
+</div>
+<script src="../assets/canvas.js"></script>
+</body>
+</html>

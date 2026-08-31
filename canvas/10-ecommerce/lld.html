@@ -1,0 +1,507 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>10 · E-Commerce — LLD</title>
+<link rel="stylesheet" href="../assets/canvas.css">
+</head>
+<body>
+
+<div class="wrap">
+
+  <header class="hero">
+    <h1>E-Commerce — Low-Level Design</h1>
+    <div class="sub">Canvas 2 of 3. Real Java classes under <code>10-ecommerce/src/main/java/com/systemdesign/ecommerce/</code>. Composition root <code>AppConfig</code> → controller → <b>Facade <code>OrderService</code></b> → <b><code>OrderSagaOrchestrator</code></b> (3 steps + compensate) → 3 saga-participant services (Inventory · Payment · Shipping) → 3 strategy families (Pricing · Payment · Shipping) → 5 in-memory repositories. Click any class for its methods. Includes verbatim <code>execute</code> saga loop, compensation matrix, and the <code>Order</code> state machine.</div>
+    <div class="badges">
+      <span class="badge lvl">Use case 10 · LLD</span>
+      <span class="badge">Canvas 2 of 3</span>
+      <span class="badge">grounded in code</span>
+      <span class="badge">Saga · Strategy · State-Machine · Decorator · Repository · Facade</span>
+    </div>
+    <div class="legend">
+      <span><i class="dot" style="background:var(--eden)"></i> composition root / entry</span>
+      <span><i class="dot" style="background:var(--survivor)"></i> facade &amp; services</span>
+      <span><i class="dot" style="background:var(--warn)"></i> saga engine (star)</span>
+      <span><i class="dot" style="background:var(--fig)"></i> strategies (swappable)</span>
+      <span><i class="dot" style="background:var(--old)"></i> domain models &amp; repos</span>
+    </div>
+  </header>
+
+  <!-- A · CLASS MAP -->
+  <section>
+    <div class="sec-h"><span class="n">A</span><h2>Class map — click any class</h2><span class="tag">from <code>src/main/java/com/systemdesign/ecommerce/</code></span></div>
+    <div>
+      <div class="arch">
+        <svg viewBox="0 0 900 520" width="100%" style="max-width:900px" role="img" aria-label="E-commerce class map">
+          <defs>
+            <marker id="ah10l" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" fill="var(--muted)"></path></marker>
+          </defs>
+          <!-- Grid: 3 cols (x=20 w=240, x=330 w=240, x=640 w=240), 6 rows (y=30,110,190,270,350,430, h=54).
+               Gutters at x=260-330 (70px) and x=570-640 (70px). Row-gaps ~26px (e.g. 84-110). -->
+
+          <!-- ═══════ arrows ═══════ -->
+
+          <!-- Col 1 verticals (composition + facade lane) -->
+          <line class="arrow" x1="140" y1="84" x2="140" y2="110" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah10l)"></line>
+          <line class="arrow" x1="140" y1="164" x2="140" y2="190" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah10l)"></line>
+          <line class="arrow" x1="140" y1="244" x2="140" y2="270" stroke="var(--muted)" stroke-width="1.5" stroke-dasharray="4 3" marker-end="url(#ah10l)"></line>
+
+          <!-- ★ OrderService → OrderSagaOrchestrator — THE STAR CALL — L-path through col1-2 gutter -->
+          <path class="arrow" d="M260,217 L295,217 L295,137 L330,137" fill="none" stroke="var(--warn)" stroke-width="2.5" marker-end="url(#ah10l)"></path>
+          <text class="edge-label" x="295" y="180" text-anchor="middle" fill="var(--warn)" font-weight="700">execute(order)</text>
+
+          <!-- Saga → InventoryService · Step 1 (short vertical inside col 2) -->
+          <line class="arrow" x1="450" y1="164" x2="450" y2="190" stroke="var(--muted)" stroke-width="1.8" marker-end="url(#ah10l)"></line>
+          <!-- Saga → PaymentService · Step 2 — routed via right gutter to skip InvSvc -->
+          <path class="arrow" d="M570,140 L605,140 L605,297 L570,297" fill="none" stroke="var(--muted)" stroke-width="1.5" marker-end="url(#ah10l)"></path>
+          <!-- Saga → ShippingService · Step 3 — further out in right gutter -->
+          <path class="arrow" d="M570,150 L625,150 L625,377 L570,377" fill="none" stroke="var(--muted)" stroke-width="1.5" marker-end="url(#ah10l)"></path>
+          <!-- Saga → NotificationService (async fan-out, dashed) — dips furthest into right gutter -->
+          <path class="arrow" d="M570,160 L620,160 L620,457 L570,457" fill="none" stroke="var(--muted)" stroke-width="1.2" stroke-dasharray="4 3" marker-end="url(#ah10l)"></path>
+
+          <!-- Saga → SagaResult (returns, dashed) — top-right diagonal to col 3 row 1 -->
+          <line class="arrow" x1="570" y1="120" x2="640" y2="57" stroke="var(--muted)" stroke-width="1.2" stroke-dasharray="4 3" marker-end="url(#ah10l)"></line>
+
+          <!-- Service → its strategy/model (horizontal via col2-3 gutter, dashed = uses) -->
+          <line class="arrow" x1="570" y1="217" x2="640" y2="217" stroke="var(--muted)" stroke-width="1.5" stroke-dasharray="4 3" marker-end="url(#ah10l)"></line>
+          <line class="arrow" x1="570" y1="297" x2="640" y2="297" stroke="var(--muted)" stroke-width="1.5" stroke-dasharray="4 3" marker-end="url(#ah10l)"></line>
+          <line class="arrow" x1="570" y1="377" x2="640" y2="377" stroke="var(--muted)" stroke-width="1.5" stroke-dasharray="4 3" marker-end="url(#ah10l)"></line>
+
+          <!-- ═══════ NODES (16 total) ═══════ -->
+
+          <!-- Col 1 — composition + facade + reads -->
+          <g data-node style="cursor:pointer" data-title="AppConfig (Factory · composition root)" data-detail="<b>Path:</b> <code>config/AppConfig.java</code>. The ONLY place where <code>new ConcreteClass()</code> appears.<br><b>Layers wired (in order):</b> Repositories → Services → SagaOrchestrator → OrderService (Facade) → Controller → Strategies (pluggable per call).<br><b>Seed helpers:</b> <code>seedProducts()</code>, <code>seedInventory()</code>, <code>seedLimitedInventory(...)</code> — for demos.<br><b>Strategy defaults:</b> StandardPricing (wrappable with DiscountPricing decorator), CreditCard payment (95 % success in demo), StandardShipping ($5.99 / 7 days)."><rect x="20" y="30" width="240" height="54" rx="9" fill="var(--panel-2)" stroke="var(--eden)"></rect><text x="140" y="55" text-anchor="middle" fill="var(--eden)" font-size="13" font-weight="600">AppConfig</text><text x="140" y="72" text-anchor="middle" fill="var(--faint)" font-size="11">composition root · lazy init</text></g>
+
+          <g data-node style="cursor:pointer" data-title="ECommerceController (REST adapter)" data-detail="<b>Path:</b> <code>controller/ECommerceController.java</code>. Simulated REST — maps HTTP-shaped calls to service methods.<br><b>Handlers:</b> <code>handleGetProducts</code>, <code>handleSearchProducts(query)</code>, <code>handleGetProductsByCategory(cat)</code>, <code>handleAddToCart</code>, <code>handleRemoveFromCart</code>, <code>handleGetCart(userId)</code>, <code>handleCheckout(userId, method, address)</code>, <code>handleCancelOrder</code>, <code>handleGetOrder</code>, <code>handleGetOrdersByUser</code>.<br><b>Never contains business logic</b> — it's a thin adapter over ProductService / CartService / OrderService."><rect x="20" y="110" width="240" height="54" rx="9" fill="var(--panel-2)" stroke="var(--border)"></rect><text x="140" y="135" text-anchor="middle" fill="var(--text)" font-size="13" font-weight="600">ECommerceController</text><text x="140" y="152" text-anchor="middle" fill="var(--faint)" font-size="11">REST adapter · thin</text></g>
+
+          <g data-node style="cursor:pointer" data-title="OrderService (Facade)" data-detail="<b>Path:</b> <code>service/OrderService.java</code>. The ONE DOOR for order writes.<br><b>Method:</b> <code>Order placeOrder(String userId, PaymentStrategy pay, String address, ShippingStrategy ship)</code>:<br>(1) Order = cartService.checkout(userId, pay-name, address).<br>(2) sagaOrchestrator.setPaymentStrategy(pay); shippingService.setShippingStrategy(ship).<br>(3) SagaResult result = sagaOrchestrator.execute(order).<br>(4) orderRepository.save(order).<br>(5) if success → cartService.clearCart(userId).<br><b>Also:</b> <code>cancelOrder(id)</code>, <code>getOrder(id)</code>, <code>getOrdersByUser(userId)</code>, <code>getAllOrders()</code>."><rect x="20" y="190" width="240" height="54" rx="9" fill="var(--panel-2)" stroke="var(--survivor)"></rect><text x="140" y="215" text-anchor="middle" fill="var(--survivor)" font-size="13" font-weight="600">OrderService</text><text x="140" y="232" text-anchor="middle" fill="var(--faint)" font-size="11">Facade · placeOrder</text></g>
+
+          <g data-node style="cursor:pointer" data-title="CartService" data-detail="<b>Path:</b> <code>service/CartService.java</code>.<br><b>Wraps:</b> CartRepository.<br><b>Methods:</b> <code>addToCart(userId, product, qty)</code> — takes <b>price snapshot</b> at add time; <code>removeFromCart</code>, <code>updateQuantity</code>, <code>getCart(userId)</code>, <code>clearCart(userId)</code>.<br><b>Checkout coupling:</b> <code>checkout(userId, paymentMethod, address) → Order</code> — builds an Order draft from current cart items. The draft has status CREATED and total, ready for the saga.<br><b>AP semantics:</b> merge on conflict (union of items)."><rect x="20" y="270" width="240" height="54" rx="9" fill="var(--panel-2)" stroke="var(--survivor)"></rect><text x="140" y="295" text-anchor="middle" fill="var(--survivor)" font-size="13" font-weight="600">CartService</text><text x="140" y="312" text-anchor="middle" fill="var(--faint)" font-size="11">add · checkout · clear</text></g>
+
+          <g data-node style="cursor:pointer" data-title="ProductService (browse / search)" data-detail="<b>Path:</b> <code>service/ProductService.java</code>. Catalog reads.<br><b>Wraps:</b> ProductRepository.<br><b>Methods:</b> <code>addProduct(Product)</code>, <code>getProduct(id)</code>, <code>getAllProducts()</code>, <code>deleteProduct(id)</code>, <code>searchByName(query)</code> — linear <code>String.contains</code> in demo (Elasticsearch in prod), <code>searchByCategory(cat)</code>.<br><b>Read-heavy:</b> in prod fronted by CDN + Redis L2; here just an in-memory Map."><rect x="20" y="350" width="240" height="54" rx="9" fill="var(--panel-2)" stroke="var(--survivor)"></rect><text x="140" y="375" text-anchor="middle" fill="var(--survivor)" font-size="13" font-weight="600">ProductService</text><text x="140" y="392" text-anchor="middle" fill="var(--faint)" font-size="11">read-only catalog</text></g>
+
+          <g data-node style="cursor:pointer" data-title="Exception hierarchy" data-detail="<b>Path:</b> <code>exception/</code>.<br><b>Base:</b> <code>ECommerceException extends RuntimeException</code>.<br><b>Types:</b><br>• <code>InsufficientStockException(productId, requested, available)</code> → HTTP 409.<br>• <code>PaymentFailedException(msg)</code> → HTTP 402 or 500.<br>• <code>OrderNotFoundException(orderId)</code> → HTTP 404.<br>• <code>InvalidOrderStateException(msg)</code> → HTTP 409 (state-machine guard).<br><b>Saga uses these to decide compensation</b> — catches InsufficientStock at Step 1, PaymentFailed at Step 2, ECommerceException at Step 3."><rect x="20" y="430" width="240" height="54" rx="9" fill="var(--panel-2)" stroke="var(--warn)"></rect><text x="140" y="455" text-anchor="middle" fill="var(--warn)" font-size="13" font-weight="600">Exceptions (5)</text><text x="140" y="472" text-anchor="middle" fill="var(--faint)" font-size="11">extend ECommerceException</text></g>
+
+          <!-- Col 2 — saga engine + participants + async -->
+          <g data-node style="cursor:pointer" data-title="SagaOrchestrator (interface)" data-detail="<b>Path:</b> <code>saga/SagaOrchestrator.java</code>. Contract:<br><code>SagaResult execute(Order order);</code><br><b>Why an interface:</b> so <code>OrderSagaOrchestrator</code> is one impl today; tomorrow you could plug in a <code>StepFunctionsSagaOrchestrator</code> that delegates to AWS Step Functions with no facade change."><rect x="330" y="30" width="240" height="54" rx="9" fill="var(--panel-2)" stroke="var(--survivor)"></rect><text x="450" y="55" text-anchor="middle" fill="var(--survivor)" font-size="13" font-weight="600">SagaOrchestrator</text><text x="450" y="72" text-anchor="middle" fill="var(--faint)" font-size="11">interface · execute(Order)</text></g>
+
+          <g data-node style="cursor:pointer" data-title="OrderSagaOrchestrator (engine · THE STAR)" data-detail="<b>Path:</b> <code>saga/OrderSagaOrchestrator.java</code>. The 3-step distributed transaction.<br><b>execute(Order):</b><br>Step 1 RESERVE_INVENTORY (for each item → inventoryService.reserve) → on fail: compensate partial reservations, return.<br>Step 2 PROCESS_PAYMENT (paymentService.processPayment via injected strategy) → on FAILED: <b>compensate Step 1</b> (releaseInventory) + notify, return.<br>Step 3 CREATE_SHIPMENT (shippingService.createShipment) → on fail: <b>compensate Step 2</b> (refundPayment) + <b>compensate Step 1</b> (releaseInventory), return.<br><b>Success:</b> confirmReservation for each item (permanent stock deduct) + notify confirmed + shipped.<br><b>Full code in Section B.</b>"><rect x="330" y="110" width="240" height="54" rx="9" fill="var(--panel-2)" stroke="var(--warn)" stroke-width="2"></rect><text x="450" y="135" text-anchor="middle" fill="var(--warn)" font-size="14" font-weight="700">OrderSagaOrchestrator</text><text x="450" y="152" text-anchor="middle" fill="var(--faint)" font-size="11">execute · compensate reverse</text></g>
+
+          <g data-node style="cursor:pointer" data-title="InventoryService · Saga Step 1" data-detail="<b>Path:</b> <code>service/InventoryService.java</code>. Gateway to stock mutations.<br><b>Methods:</b> <code>reserve(productId, qty)</code> — delegates to <code>Inventory.reserve</code>; throws <code>InsufficientStockException</code>.<br><code>confirmReservation(productId, qty)</code> — permanent deduct.<br><code>releaseReservation(productId, qty)</code> — compensation.<br><code>getStock(productId)</code>, <code>getAllInventory()</code>.<br><b>Idempotent compensation:</b> release ×2 == release ×1 (safe in a retry storm)."><rect x="330" y="190" width="240" height="54" rx="9" fill="var(--panel-2)" stroke="var(--survivor)"></rect><text x="450" y="215" text-anchor="middle" fill="var(--survivor)" font-size="13" font-weight="600">InventoryService · Step 1</text><text x="450" y="232" text-anchor="middle" fill="var(--faint)" font-size="11">reserve · confirm · release</text></g>
+
+          <g data-node style="cursor:pointer" data-title="PaymentService · Saga Step 2" data-detail="<b>Path:</b> <code>service/PaymentService.java</code>. Idempotent payment gateway.<br><b>Method:</b> <code>Payment processPayment(Order order, PaymentStrategy strategy)</code>:<br>(1) <code>paymentRepository.findByOrderId(orderId)</code> — if COMPLETED, return existing (short-circuit).<br>(2) delegate to strategy.processPayment(amount, orderId).<br>(3) paymentRepository.save(payment).<br><code>Payment refundPayment(paymentId)</code> — inverse call to gateway; used for Step 3 compensation.<br><code>Optional&lt;Payment&gt; getPaymentByOrderId(id)</code>.<br><b>Full code in Section C.</b>"><rect x="330" y="270" width="240" height="54" rx="9" fill="var(--panel-2)" stroke="var(--survivor)"></rect><text x="450" y="295" text-anchor="middle" fill="var(--survivor)" font-size="13" font-weight="600">PaymentService · Step 2</text><text x="450" y="312" text-anchor="middle" fill="var(--faint)" font-size="11">idempotent · refund</text></g>
+
+          <g data-node style="cursor:pointer" data-title="ShippingService · Saga Step 3" data-detail="<b>Path:</b> <code>service/ShippingService.java</code>. Creates + tracks shipments.<br><b>State:</b> <code>ConcurrentHashMap&lt;String, Shipment&gt;</code> keyed by shipmentId + a mutable <code>ShippingStrategy</code>.<br><b>Methods:</b> <code>setShippingStrategy(ShippingStrategy)</code> — called per order by OrderService; <code>Shipment createShipment(Order)</code> — computes cost + ETA via strategy, creates Shipment (status PENDING → SHIPPED); <code>updateStatus(shipmentId, ShipmentStatus)</code>, <code>Shipment getShipment(id)</code>.<br><b>Compensation:</b> shipment cancel documented but not implemented in demo."><rect x="330" y="350" width="240" height="54" rx="9" fill="var(--panel-2)" stroke="var(--survivor)"></rect><text x="450" y="375" text-anchor="middle" fill="var(--survivor)" font-size="13" font-weight="600">ShippingService · Step 3</text><text x="450" y="392" text-anchor="middle" fill="var(--faint)" font-size="11">create shipment · strategy</text></g>
+
+          <g data-node style="cursor:pointer" data-title="NotificationService (async fan-out)" data-detail="<b>Path:</b> <code>service/NotificationService.java</code>. Customer notifications (Observer stub).<br><b>Methods:</b> <code>notifyOrderConfirmed(Order)</code>, <code>notifyOrderShipped(Order, Shipment)</code>, <code>notifyOrderCancelled(Order)</code>, <code>notifyPaymentFailed(Order)</code>.<br><b>Demo:</b> System.out.println — in prod: Kafka consumer that fans out to SES / FCM / Twilio.<br><b>Off critical path:</b> a late/failed notification never blocks the order."><rect x="330" y="430" width="240" height="54" rx="9" fill="var(--panel-2)" stroke="var(--survivor)"></rect><text x="450" y="455" text-anchor="middle" fill="var(--survivor)" font-size="13" font-weight="600">NotificationService</text><text x="450" y="472" text-anchor="middle" fill="var(--faint)" font-size="11">async · Kafka consumer</text></g>
+
+          <!-- Col 3 — domain models + strategies + repos -->
+          <g data-node style="cursor:pointer" data-title="Saga audit (SagaResult + SagaStepRecord)" data-detail="<b>SagaResult</b> (<code>saga/SagaResult.java</code>): immutable outcome. Fields: success, completedSteps, compensatedSteps, failedStep, message. Builder API.<br><b>SagaStepRecord</b> (<code>model/SagaStepRecord.java</code>): per-step lifecycle. Fields: stepName, status (PENDING · COMPLETED · FAILED · COMPENSATING · COMPENSATED), attemptedAt, completedAt. Methods: <code>markCompleted / markFailed / markCompensating / markCompensated</code>.<br><b>Stored on Order</b> via <code>addSagaStep(record)</code>. Feeds SLA dashboards + debug tools."><rect x="640" y="30" width="240" height="54" rx="9" fill="var(--panel-2)" stroke="var(--old)"></rect><text x="760" y="55" text-anchor="middle" fill="var(--old)" font-size="13" font-weight="600">Saga audit</text><text x="760" y="72" text-anchor="middle" fill="var(--faint)" font-size="11">SagaResult + StepRecord</text></g>
+
+          <g data-node style="cursor:pointer" data-title="Order (aggregate · state machine)" data-detail="<b>Path:</b> <code>model/Order.java</code>. Aggregate root with GUARDED transitions.<br><b>States (enum OrderStatus):</b> CREATED · INVENTORY_RESERVED · PAYMENT_PENDING · PAYMENT_CONFIRMED · SHIPPED · DELIVERED · CANCELLED · REFUNDED.<br><b>Transitions:</b> <code>confirmInventory()</code>, <code>confirmPayment()</code>, <code>ship(trackingNumber)</code>, <code>deliver()</code>, <code>cancel()</code>, <code>refund()</code>.<br><b>Guard:</b> each transition asserts the current status is in an <code>allowed</code> Set — else throws <code>InvalidOrderStateException</code>.<br><b>Also:</b> <code>addSagaStep(record)</code>, <code>getSagaSteps()</code>. See Section E for the full guard code."><rect x="640" y="110" width="240" height="54" rx="9" fill="var(--panel-2)" stroke="var(--old)"></rect><text x="760" y="135" text-anchor="middle" fill="var(--old)" font-size="13" font-weight="600">Order (aggregate)</text><text x="760" y="152" text-anchor="middle" fill="var(--faint)" font-size="11">state machine · Builder</text></g>
+
+          <g data-node style="cursor:pointer" data-title="Inventory (model + prod mapping)" data-detail="<b>Path:</b> <code>model/Inventory.java</code>. The concurrency core.<br><b>Fields:</b> <code>productId</code>, <code>totalStock</code>, <code>reservedStock</code>. Derived: <code>availableStock = totalStock − reservedStock</code>.<br><b>All 3 mutators are <code>synchronized</code></b>: <code>reserve(qty)</code>, <code>confirmReservation(qty)</code>, <code>releaseReservation(qty)</code>.<br><b>Prod mapping (same semantics):</b><br>• <b>DynamoDB conditional write</b> — <code>UpdateItem ... IF availableStock &gt;= :qty</code>.<br>• <b>Postgres <code>SELECT FOR UPDATE</code></b> — pessimistic row lock (&lt;10 K QPS OK).<br>• <b>Redis <code>DECR</code></b> gate — for flash sales, 100 K QPS trivially."><rect x="640" y="190" width="240" height="54" rx="9" fill="var(--panel-2)" stroke="var(--old)"></rect><text x="760" y="215" text-anchor="middle" fill="var(--old)" font-size="13" font-weight="600">Inventory (model + prod)</text><text x="760" y="232" text-anchor="middle" fill="var(--faint)" font-size="11">sync / DDB / Redis DECR</text></g>
+
+          <g data-node style="cursor:pointer" data-title="PaymentStrategy (3 impls)" data-detail="<b>Path:</b> <code>strategy/payment/</code>.<br><b>Interface:</b> <code>Payment processPayment(double amount, String orderId)</code>.<br><b>Impls:</b><br>• <code>CreditCardPaymentStrategy</code> — 95 % success (demo); real: HTTPS to Stripe with Idempotency-Key.<br>• <code>WalletPaymentStrategy</code> — 99 % success; real: PayPal / Amazon Pay OAuth.<br>• <code>CODPaymentStrategy</code> — always PENDING (collect at delivery).<br><b>Section D — tabs.</b>"><rect x="640" y="270" width="240" height="54" rx="9" fill="var(--panel-2)" stroke="var(--fig)"></rect><text x="760" y="295" text-anchor="middle" fill="var(--fig)" font-size="13" font-weight="600">PaymentStrategy</text><text x="760" y="312" text-anchor="middle" fill="var(--faint)" font-size="11">CreditCard · Wallet · COD</text></g>
+
+          <g data-node style="cursor:pointer" data-title="Shipping + Pricing strategies" data-detail="<b>ShippingStrategy</b> (<code>strategy/shipping/</code>): <code>double calculateShippingCost(int itemCount, double orderTotal)</code>, <code>int getEstimatedDays()</code>.<br>• <code>StandardShippingStrategy</code> — $5.99 flat; <b>free</b> if orderTotal ≥ $50; 7 days ETA.<br>• <code>ExpressShippingStrategy</code> — $14.99 flat; 2 days ETA.<br><br><b>PricingStrategy</b> (<code>strategy/pricing/</code>): <code>double calculatePrice(List&lt;OrderItem&gt; items)</code>.<br>• <code>StandardPricingStrategy</code> — sum of (qty × priceSnapshot).<br>• <code>DiscountPricingStrategy(delegate)</code> — <b>Decorator</b>: wraps delegate; 10 % if subtotal &gt; $100 OR 5 % if items ≥ 5. Composable — stack for promo codes."><rect x="640" y="350" width="240" height="54" rx="9" fill="var(--panel-2)" stroke="var(--fig)"></rect><text x="760" y="375" text-anchor="middle" fill="var(--fig)" font-size="13" font-weight="600">Shipping + Pricing</text><text x="760" y="392" text-anchor="middle" fill="var(--faint)" font-size="11">Standard/Express + Decorator</text></g>
+
+          <g data-node style="cursor:pointer" data-title="Repositories (5 · in-memory)" data-detail="<b>Path:</b> <code>repository/</code>.<br><b>Interfaces:</b> ProductRepository · CartRepository · OrderRepository · PaymentRepository (dual index by id + orderId — for idempotency) · InventoryRepository.<br><b>Impls:</b> InMemory*Repository — each backed by <code>ConcurrentHashMap</code>.<br><b>Payment quirk:</b> <code>findByOrderId</code> is what enables the idempotency short-circuit — critical for exactly-once effect.<br><b>Prod:</b> Product+Category on ES + PG · Cart on Redis+DDB · Order+Payment on Aurora PG · Inventory on DynamoDB."><rect x="640" y="430" width="240" height="54" rx="9" fill="var(--panel-2)" stroke="var(--old)"></rect><text x="760" y="455" text-anchor="middle" fill="var(--old)" font-size="13" font-weight="600">Repositories (5)</text><text x="760" y="472" text-anchor="middle" fill="var(--faint)" font-size="11">in-memory · dual index</text></g>
+
+        </svg>
+      </div>
+      <div class="node-detail"><span class="nd-title">Click any class</span><div class="nd-body">Its file path, method signatures, and how it plugs into the saga appear here.</div></div>
+    </div>
+  </section>
+
+  <!-- B · SAGA CODE -->
+  <section>
+    <div class="sec-h"><span class="n">B</span><h2>The saga — <code>OrderSagaOrchestrator.execute</code></h2><span class="tag">verbatim · 3 steps · compensate reverse</span></div>
+    <div class="card">
+      <div class="kicker">from <code>saga/OrderSagaOrchestrator.java</code></div>
+      <pre class="code">public SagaResult execute(Order order) {
+  SagaResult.Builder resultBuilder = new SagaResult.Builder();
+  List&lt;OrderItem&gt; reservedItems = new ArrayList&lt;&gt;();
+  Payment payment = null;
+
+  <span class="cm">// ─── Step 1 · RESERVE_INVENTORY ───</span>
+  SagaStepRecord inventoryStep = new SagaStepRecord("RESERVE_INVENTORY");
+  order.addSagaStep(inventoryStep);
+  try {
+    for (OrderItem item : order.getItems()) {
+      inventoryService.reserve(item.getProductId(), item.getQuantity());
+      reservedItems.add(item);          <span class="cm">// track what to release on failure</span>
+    }
+    inventoryStep.markCompleted();
+    order.confirmInventory();            <span class="cm">// state → INVENTORY_RESERVED</span>
+    resultBuilder.addCompletedStep("RESERVE_INVENTORY");
+  } catch (InsufficientStockException e) {
+    inventoryStep.markFailed();
+    compensateInventory(reservedItems, order);   <span class="cm">// release any partial reservations</span>
+    return resultBuilder.success(false).failedStep("RESERVE_INVENTORY")
+        .message("Inventory reservation failed: " + e.getMessage()).build();
+  }
+
+  <span class="cm">// ─── Step 2 · PROCESS_PAYMENT ───</span>
+  SagaStepRecord paymentStep = new SagaStepRecord("PROCESS_PAYMENT");
+  order.addSagaStep(paymentStep);
+  try {
+    payment = paymentService.processPayment(order, paymentStrategy);
+    if (payment.getStatus() == PaymentStatus.FAILED) {
+      throw new PaymentFailedException("Payment declined for order " + order.getOrderId());
+    }
+    paymentStep.markCompleted();
+    order.confirmPayment();              <span class="cm">// state → PAYMENT_CONFIRMED</span>
+    resultBuilder.addCompletedStep("PROCESS_PAYMENT");
+  } catch (PaymentFailedException e) {
+    paymentStep.markFailed();
+    compensateInventory(reservedItems, order);         <span class="cm">// release Step 1</span>
+    notificationService.notifyPaymentFailed(order);
+    return resultBuilder.success(false).failedStep("PROCESS_PAYMENT")
+        .message("Payment failed: " + e.getMessage()).build();
+  }
+
+  <span class="cm">// ─── Step 3 · CREATE_SHIPMENT ───</span>
+  SagaStepRecord shippingStep = new SagaStepRecord("CREATE_SHIPMENT");
+  order.addSagaStep(shippingStep);
+  try {
+    Shipment shipment = shippingService.createShipment(order);
+    shippingStep.markCompleted();
+    order.ship(shipment.getTrackingNumber());  <span class="cm">// state → SHIPPED</span>
+    resultBuilder.addCompletedStep("CREATE_SHIPMENT");
+
+    <span class="cm">// ─── Success path: confirm reservations + notify ───</span>
+    for (OrderItem item : order.getItems()) {
+      inventoryService.confirmReservation(item.getProductId(), item.getQuantity());
+    }
+    notificationService.notifyOrderConfirmed(order);
+    notificationService.notifyOrderShipped(order, shipment);
+    return resultBuilder.success(true).build();
+
+  } catch (ECommerceException e) {                     <span class="cm">// Step 3 failed → compensate BOTH prior steps</span>
+    shippingStep.markFailed();
+    if (payment != null) {
+      paymentService.refundPayment(payment.getPaymentId());
+      resultBuilder.addCompensatedStep("PROCESS_PAYMENT");
+    }
+    compensateInventory(reservedItems, order);
+    resultBuilder.addCompensatedStep("RESERVE_INVENTORY");
+    return resultBuilder.success(false).failedStep("CREATE_SHIPMENT")
+        .message("Shipment creation failed: " + e.getMessage()).build();
+  }
+}
+
+private void compensateInventory(List&lt;OrderItem&gt; reservedItems, Order order) {
+  order.getSagaSteps().stream()
+      .filter(s -&gt; s.getStepName().equals("RESERVE_INVENTORY"))
+      .findFirst()
+      .ifPresent(s -&gt; {
+        s.markCompensating();
+        for (OrderItem item : reservedItems) {
+          inventoryService.releaseReservation(item.getProductId(), item.getQuantity());
+        }
+        s.markCompensated();
+      });
+}</pre>
+    </div>
+    <div class="callout tip"><b>Why <b>reverse-order</b> compensation matters:</b> Step 3 fails → we must undo Step 2 (refund payment) BEFORE undoing Step 1 (release inventory). If we released inventory first and refund failed halfway, we'd have a paid order with released stock — the customer's money is charged but no one is committed to shipping. Reverse order plus <b>idempotent</b> compensations (release ×2 = release ×1, refund an already-refunded payment is a no-op) makes the whole thing crash-safe.</div>
+  </section>
+
+  <!-- C · COMPENSATION TABS -->
+  <section>
+    <div class="sec-h"><span class="n">C</span><h2>Compensation matrix — 3 failure modes</h2><span class="tag">where each failure lands</span></div>
+    <div data-tabscope>
+      <div class="tabs">
+        <div class="tab active" data-tab="fail-step1">Fail at Step 1 (inventory)</div>
+        <div class="tab" data-tab="fail-step2">Fail at Step 2 (payment)</div>
+        <div class="tab" data-tab="fail-step3">Fail at Step 3 (shipping)</div>
+        <div class="tab" data-tab="compensate-cmp">matrix table</div>
+      </div>
+      <div class="tabpanel active" data-panel="fail-step1">
+        <div class="kicker">RESERVE_INVENTORY fails partway</div>
+        <p>Example: 3-item order — item #1 reserved OK, item #2 reserved OK, item #3 throws <code>InsufficientStockException</code>.</p>
+        <pre class="code">catch (InsufficientStockException e) {
+  inventoryStep.markFailed();
+  compensateInventory(reservedItems, order);   <span class="cm">// release items 1 &amp; 2 only</span>
+  return resultBuilder
+      .success(false)
+      .failedStep("RESERVE_INVENTORY")
+      .message(e.getMessage())                 <span class="cm">// "product SKU-42: requested 5, available 2"</span>
+      .build();
+}</pre>
+        <p class="muted"><b>Compensation:</b> ONE step (release the items we already reserved). No payment to refund yet. HTTP 409 to client.</p>
+      </div>
+      <div class="tabpanel" data-panel="fail-step2">
+        <div class="kicker">PROCESS_PAYMENT declined by gateway</div>
+        <p>Example: Stripe returns <code>card_declined</code>. All 3 items already reserved.</p>
+        <pre class="code">catch (PaymentFailedException e) {
+  paymentStep.markFailed();
+  compensateInventory(reservedItems, order);      <span class="cm">// STEP 1 compensation</span>
+  notificationService.notifyPaymentFailed(order); <span class="cm">// email the customer</span>
+  return resultBuilder
+      .success(false)
+      .failedStep("PROCESS_PAYMENT")
+      .message("Payment failed: " + e.getMessage())
+      .build();
+}</pre>
+        <p class="muted"><b>Compensation:</b> Release ALL reserved inventory. Payment was never authorised → nothing to refund. HTTP 402 to client with a "try another card" nudge.</p>
+      </div>
+      <div class="tabpanel" data-panel="fail-step3">
+        <div class="kicker">CREATE_SHIPMENT fails (carrier down)</div>
+        <p>Example: FedEx API returns 503. Payment is already captured, inventory reserved.</p>
+        <pre class="code">catch (ECommerceException e) {
+  shippingStep.markFailed();
+  if (payment != null) {
+    paymentService.refundPayment(payment.getPaymentId());   <span class="cm">// STEP 2 compensation (FIRST)</span>
+    resultBuilder.addCompensatedStep("PROCESS_PAYMENT");
+  }
+  compensateInventory(reservedItems, order);                <span class="cm">// STEP 1 compensation (LAST)</span>
+  resultBuilder.addCompensatedStep("RESERVE_INVENTORY");
+  return resultBuilder
+      .success(false)
+      .failedStep("CREATE_SHIPMENT")
+      .message(e.getMessage())
+      .build();
+}</pre>
+        <p class="muted"><b>Compensation:</b> BOTH — refund payment first (money back to customer), then release inventory. Reverse order matters if refund fails: paid but no stock reserved &gt;&gt; stock released but customer charged.</p>
+      </div>
+      <div class="tabpanel" data-panel="compensate-cmp">
+        <table>
+          <thead><tr><th>Failed step</th><th>Compensate</th><th>Client HTTP</th><th>Notify</th><th>Idempotent?</th></tr></thead>
+          <tbody>
+            <tr><td><b>Step 1 · RESERVE_INVENTORY</b></td><td>release partial reservations</td><td>409 Conflict</td><td>—</td><td>yes (release ×2 == release ×1)</td></tr>
+            <tr><td><b>Step 2 · PROCESS_PAYMENT</b></td><td>release inventory (Step 1)</td><td>402 Payment Required</td><td><code>notifyPaymentFailed</code></td><td>yes</td></tr>
+            <tr><td><b>Step 3 · CREATE_SHIPMENT</b></td><td><b>refund payment (Step 2) → release inventory (Step 1)</b></td><td>500 Internal</td><td>customer email + on-call</td><td>yes (refund a refunded charge is no-op)</td></tr>
+          </tbody>
+        </table>
+        <p class="muted"><b>Interview point:</b> production Step Functions uses <code>Catch</code> branches with <code>Retry</code> policies — 3× on inventory (backoff 1/2/4 s), 2× on payment (backoff 2/5 s), 5× on shipping (backoff 1/2/4/8/16 s). Only after retries exhaust does compensation trigger.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- D · PAYMENT STRATEGY TABS -->
+  <section>
+    <div class="sec-h"><span class="n">D</span><h2>Payment strategy + idempotency guard</h2><span class="tag">swap via <code>OrderService.placeOrder(..., strategy, ...)</code></span></div>
+    <div data-tabscope>
+      <div class="tabs">
+        <div class="tab active" data-tab="idem">PaymentService.processPayment (idempotency)</div>
+        <div class="tab" data-tab="cc">CreditCard</div>
+        <div class="tab" data-tab="wallet">Wallet</div>
+        <div class="tab" data-tab="cod">COD</div>
+        <div class="tab" data-tab="pay-cmp">comparison</div>
+      </div>
+      <div class="tabpanel active" data-panel="idem">
+        <div class="kicker">from <code>service/PaymentService.java</code></div>
+        <pre class="code">public Payment processPayment(Order order, PaymentStrategy paymentStrategy) {
+  <span class="cm">// ─── Idempotency guard — the exactly-once effect ───</span>
+  Optional&lt;Payment&gt; existing = paymentRepository.findByOrderId(order.getOrderId());
+  if (existing.isPresent() &amp;&amp; existing.get().getStatus() == PaymentStatus.COMPLETED) {
+    return existing.get();          <span class="cm">// short-circuit — never re-charge</span>
+  }
+
+  <span class="cm">// Delegate to injected strategy — HTTPS call to Stripe / UPI / wallet</span>
+  Payment payment = paymentStrategy.processPayment(order.getTotalAmount(), order.getOrderId());
+  paymentRepository.save(payment);
+  return payment;
+}</pre>
+        <p class="muted"><b>Why this alone is enough:</b> in prod, <code>orderId</code> is used as the Stripe <code>Idempotency-Key</code> — Stripe stores the response for 24 h. Our DB check catches the case where the retry happens AFTER Stripe already returned but before we saved. Together: at-least-once retry + idempotent gateway + local dedup = <b>exactly-once effect</b>. The customer is never double-charged.</p>
+      </div>
+      <div class="tabpanel" data-panel="cc">
+        <div class="kicker">from <code>strategy/payment/CreditCardPaymentStrategy.java</code></div>
+        <pre class="code">private static final double SUCCESS_RATE = 0.95;   <span class="cm">// demo only</span>
+
+public Payment processPayment(double amount, String orderId) {
+  <span class="cm">// In prod: HTTPS POST to https://api.stripe.com/v1/charges</span>
+  <span class="cm">//         with header "Idempotency-Key: {orderId}"</span>
+  <span class="cm">//         Retry on 5xx / 429 with exponential backoff.</span>
+  boolean success = ThreadLocalRandom.current().nextDouble() &lt; SUCCESS_RATE;
+
+  return new Payment.Builder(UUID.randomUUID().toString(), orderId, amount, PaymentMethod.CREDIT_CARD)
+      .status(success ? PaymentStatus.COMPLETED : PaymentStatus.FAILED)
+      .transactionId(success ? "ch_" + UUID.randomUUID() : null)
+      .build();
+}</pre>
+        <p class="muted">Rate 95 % simulates real card decline rates. In prod: Stripe / Adyen / Braintree — all use idempotency keys the same way. <b>Latency dominates checkout p99</b> (500–1 500 ms).</p>
+      </div>
+      <div class="tabpanel" data-panel="wallet">
+        <div class="kicker">from <code>strategy/payment/WalletPaymentStrategy.java</code></div>
+        <pre class="code">private static final double SUCCESS_RATE = 0.99;
+
+public Payment processPayment(double amount, String orderId) {
+  <span class="cm">// PayPal / Amazon Pay / UPI — the customer already OAuth'd,</span>
+  <span class="cm">// so the "does the card work" uncertainty is gone.</span>
+  boolean success = ThreadLocalRandom.current().nextDouble() &lt; SUCCESS_RATE;
+  return new Payment.Builder(UUID.randomUUID().toString(), orderId, amount, PaymentMethod.WALLET)
+      .status(success ? PaymentStatus.COMPLETED : PaymentStatus.FAILED)
+      .transactionId(success ? "wallet_" + UUID.randomUUID() : null)
+      .build();
+}</pre>
+        <p class="muted">Higher success rate — customer's balance already verified. Preferred for repeat customers.</p>
+      </div>
+      <div class="tabpanel" data-panel="cod">
+        <div class="kicker">from <code>strategy/payment/CODPaymentStrategy.java</code></div>
+        <pre class="code">public Payment processPayment(double amount, String orderId) {
+  <span class="cm">// No money moves at checkout — collect at delivery.</span>
+  <span class="cm">// Payment stays PENDING; state advances on delivery confirmation.</span>
+  return new Payment.Builder(UUID.randomUUID().toString(), orderId, amount, PaymentMethod.COD)
+      .status(PaymentStatus.PENDING)
+      .build();
+}</pre>
+        <p class="muted"><b>Interview twist:</b> COD breaks the "payment before ship" invariant. Handled by treating PENDING as a saga success at Step 2 (order ships anyway); a delivery-side flow later marks Payment COMPLETED. Adds a whole new failure mode: undelivered COD → auto-refund is a no-op, but inventory was consumed.</p>
+      </div>
+      <div class="tabpanel" data-panel="pay-cmp">
+        <table>
+          <thead><tr><th>Strategy</th><th>Success rate</th><th>Money moves at</th><th>Idempotency</th><th>Refund path</th></tr></thead>
+          <tbody>
+            <tr><td><b>CreditCard</b></td><td>95 %</td><td>checkout (immediate)</td><td>Stripe Idempotency-Key (24 h)</td><td>Stripe refund API</td></tr>
+            <tr><td><b>Wallet</b></td><td>99 %</td><td>checkout (from balance)</td><td>Wallet TX id</td><td>Wallet credit API</td></tr>
+            <tr><td><b>COD</b></td><td>100 % (stays PENDING)</td><td>delivery</td><td>orderId natural key</td><td>no-op (never charged)</td></tr>
+          </tbody>
+        </table>
+        <p class="muted"><b>Pluggability:</b> new impl = one class implementing <code>PaymentStrategy</code>. Zero changes to <code>OrderSagaOrchestrator</code>, <code>OrderService</code>, or the API surface. That's the Strategy pattern doing its job.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- E · ORDER STATE MACHINE -->
+  <section>
+    <div class="sec-h"><span class="n">E</span><h2>Order state machine — guarded transitions</h2><span class="tag">from <code>model/Order.java</code></span></div>
+    <div class="card">
+      <div class="kicker">the transition guard (verbatim)</div>
+      <pre class="code">public void confirmInventory() {
+  guardTransition("confirmInventory", status, Set.of(OrderStatus.CREATED));
+  transitionTo(OrderStatus.INVENTORY_RESERVED);
+}
+
+public void confirmPayment() {
+  guardTransition("confirmPayment", status,
+      Set.of(OrderStatus.INVENTORY_RESERVED, OrderStatus.PAYMENT_PENDING));
+  transitionTo(OrderStatus.PAYMENT_CONFIRMED);
+}
+
+public void ship(String trackingNumber) {
+  guardTransition("ship", status, Set.of(OrderStatus.PAYMENT_CONFIRMED));
+  this.trackingNumber = trackingNumber;
+  transitionTo(OrderStatus.SHIPPED);
+}
+
+public void deliver() {
+  guardTransition("deliver", status, Set.of(OrderStatus.SHIPPED));
+  transitionTo(OrderStatus.DELIVERED);
+}
+
+public void cancel() {
+  guardTransition("cancel", status,
+      Set.of(OrderStatus.CREATED, OrderStatus.INVENTORY_RESERVED, OrderStatus.PAYMENT_PENDING));
+  transitionTo(OrderStatus.CANCELLED);
+}
+
+public void refund() {
+  guardTransition("refund", status,
+      Set.of(OrderStatus.PAYMENT_CONFIRMED, OrderStatus.SHIPPED, OrderStatus.DELIVERED));
+  transitionTo(OrderStatus.REFUNDED);
+}
+
+private void guardTransition(String action, OrderStatus current, Set&lt;OrderStatus&gt; allowed) {
+  if (!allowed.contains(current)) {
+    throw new InvalidOrderStateException(
+        String.format("Cannot %s: order %s is in %s (allowed: %s)",
+            action, orderId, current, allowed));
+  }
+}</pre>
+    </div>
+    <div class="callout tip"><b>Why encode transitions in the model, not the service:</b> the service can (and will) be called concurrently by admin tools, webhooks, and background jobs. If the guard lives in the service, a rogue caller can just <code>order.setStatus(SHIPPED)</code> directly. In the model, there is no setter — only guarded transitions. An <code>InvalidOrderStateException</code> is your last line of defense against a bug that would corrupt an order.</div>
+    <div class="grid g2" style="margin-top:14px">
+      <div class="card"><div class="kicker">success path</div><pre class="code">CREATED
+  ↓ confirmInventory()
+INVENTORY_RESERVED
+  ↓ confirmPayment()
+PAYMENT_CONFIRMED
+  ↓ ship(trackingNumber)
+SHIPPED
+  ↓ deliver()
+DELIVERED</pre></div>
+      <div class="card"><div class="kicker">cancel / refund paths</div><pre class="code">CREATED / INVENTORY_RESERVED / PAYMENT_PENDING
+  ↓ cancel()
+CANCELLED     <span class="cm">// only pre-paid states</span>
+
+PAYMENT_CONFIRMED / SHIPPED / DELIVERED
+  ↓ refund()
+REFUNDED       <span class="cm">// only post-paid states</span>
+
+<span class="cm">// InvalidOrderStateException on any other transition</span></pre></div>
+    </div>
+  </section>
+
+  <!-- F · SEQUENCE DIAGRAM -->
+  <section>
+    <div class="sec-h"><span class="n">F</span><h2>Sequence — happy path checkout</h2><span class="tag">who calls whom, in order</span></div>
+    <div class="card">
+      <pre class="code">Client                            Controller                OrderService                 CartService     SagaOrchestrator      InventoryService  PaymentService  ShippingService
+  │  POST /checkout                     │                              │                            │                    │                        │                │                │
+  │────────────────────────────────────►│                              │                            │                    │                        │                │                │
+  │                                     │  handleCheckout(...)         │                            │                    │                        │                │                │
+  │                                     │─────────────────────────────►│                            │                    │                        │                │                │
+  │                                     │                              │  cartService.checkout()    │                    │                        │                │                │
+  │                                     │                              │───────────────────────────►│                    │                        │                │                │
+  │                                     │                              │  Order (draft, CREATED)    │                    │                        │                │                │
+  │                                     │                              │◄───────────────────────────│                    │                        │                │                │
+  │                                     │                              │  sagaOrchestrator.execute(order)                │                        │                │                │
+  │                                     │                              │────────────────────────────────────────────────►│                        │                │                │
+  │                                     │                              │                                                 │  reserve(sku, qty) × N │                │                │
+  │                                     │                              │                                                 │───────────────────────►│                │                │
+  │                                     │                              │                                                 │  processPayment(order) │                │                │
+  │                                     │                              │                                                 │────────────────────────────────────────►│                │
+  │                                     │                              │                                                 │  createShipment(order) │                │                │
+  │                                     │                              │                                                 │────────────────────────────────────────────────────────►│
+  │                                     │                              │                                                 │  confirmReservation × N│                │                │
+  │                                     │                              │                                                 │───────────────────────►│                │                │
+  │                                     │                              │  SagaResult(success=true)  │                    │                        │                │                │
+  │                                     │                              │◄────────────────────────────────────────────────│                        │                │                │
+  │                                     │                              │  orderRepository.save + cartService.clearCart   │                        │                │                │
+  │  201 Created + Order (SHIPPED)      │                              │                            │                    │                        │                │                │
+  │◄────────────────────────────────────│◄─────────────────────────────│                            │                    │                        │                │                │</pre>
+    </div>
+    <div class="callout tip"><b>Latency budget (typical happy path):</b> Cart read 1 ms · Saga entry 1 ms · Inventory reserve (N items × 5 ms DB) 15 ms · Payment (Stripe RTT) 800 ms · Shipping (in-process) 5 ms · Confirm inventory 15 ms · Notifications (async) 0 ms · Order save 10 ms = <b>~850 ms end-to-end</b>. Payment gateway dominates. Failed-fast checkouts (out of stock) return in ~30 ms.</div>
+  </section>
+
+  <!-- FILE MAP + GLOSSARY -->
+  <section>
+    <div class="sec-h"><span class="n">§</span><h2>File map + Glossary</h2></div>
+    <div class="grid g2">
+      <div class="card"><div class="kicker">file map</div><table><tbody>
+        <tr><td><code>config/AppConfig.java</code></td><td>Composition root — factory + lazy init</td></tr>
+        <tr><td><code>controller/ECommerceController.java</code></td><td>REST adapter — 10 handlers</td></tr>
+        <tr><td><code>service/OrderService.java</code></td><td>Facade — <code>placeOrder</code></td></tr>
+        <tr><td><code>service/CartService.java</code></td><td>Cart CRUD + <code>checkout</code> conversion</td></tr>
+        <tr><td><code>service/{Inventory,Payment,Shipping,Notification,Product}Service.java</code></td><td>Saga participants + reads</td></tr>
+        <tr><td><code>saga/OrderSagaOrchestrator.java</code></td><td><b>The engine</b> — execute + compensate</td></tr>
+        <tr><td><code>saga/SagaOrchestrator.java · SagaResult.java</code></td><td>Interface + audit DTO</td></tr>
+        <tr><td><code>strategy/{payment,shipping,pricing}/*Strategy.java</code></td><td>3 families, 8 impls</td></tr>
+        <tr><td><code>model/*.java</code></td><td>13 files — Order, Inventory (sync), Payment, Cart, enums</td></tr>
+        <tr><td><code>repository/*.java · InMemory*.java</code></td><td>5 interfaces + 5 impls (dual index on Payment)</td></tr>
+        <tr><td><code>exception/*.java</code></td><td>5 exceptions, all extend <code>ECommerceException</code></td></tr>
+      </tbody></table></div>
+      <div class="card"><div class="kicker">glossary</div><table><tbody>
+        <tr><td><b>Saga</b></td><td>a distributed transaction as a sequence of local TXs + matching compensations</td></tr>
+        <tr><td><b>Compensation</b></td><td>the "undo" for a completed step; must be idempotent</td></tr>
+        <tr><td><b>Reserve / confirm / release</b></td><td>3-phase stock protocol; confirm makes deduct permanent, release undoes reserve</td></tr>
+        <tr><td><b>Idempotency guard</b></td><td>look up by natural key (orderId) before executing; short-circuit if already done</td></tr>
+        <tr><td><b>State-machine guard</b></td><td>guardTransition throws on illegal state; encoded in the aggregate, not the service</td></tr>
+        <tr><td><b>Decorator (Pricing)</b></td><td><code>DiscountPricing(StandardPricing())</code> — wraps to add behaviour without changing the interface</td></tr>
+        <tr><td><b>Facade (OrderService)</b></td><td>one door for order writes; hides Cart + Saga + Repo + Shipping wiring</td></tr>
+        <tr><td><b>Strategy pluggability</b></td><td>swap PaymentStrategy at call site — <code>OrderService.placeOrder(..., new WalletPaymentStrategy(), ...)</code></td></tr>
+      </tbody></table></div>
+    </div>
+  </section>
+
+  <footer>
+    <p>Use case 10 · E-Commerce — Canvas 2 of 3 (LLD). All classes verified against real Java under <code>10-ecommerce/src/</code>. No invented method signatures.</p>
+    <p class="run"><a href="hld.html">← Canvas 1 · HLD</a> · Canvas 2 · LLD · <a href="deepdive.html">Canvas 3 · Deep-dive &amp; Trade-offs →</a> &nbsp;|&nbsp; <a href="../index.html">Hub</a></p>
+  </footer>
+
+</div>
+<script src="../assets/canvas.js"></script>
+</body>
+</html>

@@ -1,0 +1,373 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>19 · API Gateway &amp; Service Mesh — HLD</title>
+<link rel="stylesheet" href="../assets/canvas.css">
+</head>
+<body>
+<div class="wrap">
+
+  <header class="hero">
+    <h1>API Gateway &amp; Service Mesh — High-Level Design</h1>
+    <div class="sub">Use case 19 · Canvas 1 of 3. Two traffic planes, one design: <b>North-South</b> (external clients → API Gateway → services) and <b>East-West</b> (service ↔ service via sidecar mesh). Every request runs the pipeline: route → auth → rate-limit → circuit-breaker → load-balance → forward. Sidecars (Envoy-style) apply mTLS, retries, and observability transparently. Click a component, then step both flows.</div>
+    <div class="badges">
+      <span class="badge lvl">Use case 19 · HLD</span>
+      <span class="badge">Canvas 1 of 3</span>
+      <span class="badge">interactive</span>
+      <span class="badge">Kong · Envoy · Istio · Zuul</span>
+      <span class="badge">&lt; 1 ms gateway overhead</span>
+    </div>
+    <div class="legend">
+      <span><i class="dot" style="background:var(--eden)"></i> client / entry</span>
+      <span><i class="dot" style="background:var(--survivor)"></i> gateway &amp; sidecars</span>
+      <span><i class="dot" style="background:var(--fig)"></i> engines (pluggable)</span>
+      <span><i class="dot" style="background:var(--old)"></i> data / registry</span>
+      <span><i class="dot" style="background:var(--warn)"></i> control plane / observability</span>
+    </div>
+  </header>
+
+  <!-- A · PROBLEM & REQUIREMENTS -->
+  <section>
+    <div class="sec-h"><span class="n">A</span><h2>Problem &amp; requirements</h2><span class="tag">why gateway ≠ mesh</span></div>
+    <div class="grid g2">
+      <div class="card">
+        <div class="kicker">functional</div>
+        <ul class="tight">
+          <li><b>Routing</b> — path (<code>/api/users/**</code>) + header + method → target service; glob wildcards; priority sort.</li>
+          <li><b>Authentication</b> — JWT (decode + claim extraction) OR API key (trusted keystore lookup); pluggable via <code>AuthStrategy</code>.</li>
+          <li><b>Authorization</b> — role-based per-route via metadata (<code>required-role</code>).</li>
+          <li><b>Rate limiting</b> — token bucket per-client + per-route; return 429 with <code>Retry-After</code>.</li>
+          <li><b>Circuit breaker</b> — CLOSED / OPEN / HALF_OPEN state machine per target service.</li>
+          <li><b>Load balancing</b> — Round-Robin / Weighted / Consistent-Hash across healthy instances.</li>
+          <li><b>Service discovery</b> — instance registration + heartbeat + stale eviction.</li>
+          <li><b>Service mesh (E-W)</b> — sidecar per pod: mTLS enforcement, circuit-break, LB, retries.</li>
+          <li><b>Canary deploys</b> — traffic split by weight (95/5) or header (<code>X-Canary: true</code>).</li>
+          <li><b>Observability</b> — <code>X-Trace-Id</code> propagation, mesh headers, metrics per pipeline step.</li>
+        </ul>
+      </div>
+      <div class="card">
+        <div class="kicker">non-functional</div>
+        <ul class="tight">
+          <li><b>Gateway overhead</b> &lt; 1 ms p99 (excluding upstream latency).</li>
+          <li><b>Throughput</b> 100 K RPS/instance; 2 M RPS at fleet level (Netflix-scale).</li>
+          <li><b>Availability</b> 99.99 % (~52 min/yr downtime).</li>
+          <li><b>Route table updates</b> propagate &lt; 5 s (eventual consistency).</li>
+          <li><b>Circuit-breaker state</b> transitions within 1 request of threshold.</li>
+          <li><b>Rate limiter accuracy</b> within 1 % of configured rate.</li>
+          <li><b>mTLS validation</b> &lt; 0.1 ms (cached cert chains).</li>
+          <li><b>Health-check</b> detection of failed instances &lt; 10 s.</li>
+          <li><b>Canary rollback</b> &lt; 60 s of anomaly detection.</li>
+          <li><b>Zero-downtime deploys</b> — rolling restart with graceful drain.</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <!-- B · ESTIMATION -->
+  <section>
+    <div class="sec-h"><span class="n">B</span><h2>Capacity estimation</h2><span class="tag">Netflix / Uber scale</span></div>
+    <div class="chips">
+      <div class="chip"><span class="k">External RPS</span><span class="v">100 K (mid) · 2 M (Netflix)</span></div>
+      <div class="chip"><span class="k">Internal RPCs (10× fan-out)</span><span class="v">1 M–100 M/s</span></div>
+      <div class="chip"><span class="k">Microservices</span><span class="v">100–5 000</span></div>
+      <div class="chip"><span class="k">Instances</span><span class="v">1 K–200 K</span></div>
+      <div class="chip"><span class="k">Routes</span><span class="v">200–50 000</span></div>
+      <div class="chip"><span class="k">Certificate rotations</span><span class="v">200 K+/day</span></div>
+      <div class="chip"><span class="k">Deploys / day</span><span class="v">1 000+</span></div>
+      <div class="chip"><span class="k">P99 gateway latency target</span><span class="v">&lt; 1 ms overhead</span></div>
+      <div class="chip"><span class="k">Ingress bandwidth</span><span class="v">100 K × 2 KB = 1.6 Gbps</span></div>
+      <div class="chip"><span class="k">Egress bandwidth</span><span class="v">100 K × 10 KB = 8 Gbps</span></div>
+      <div class="chip"><span class="k">Mesh bandwidth</span><span class="v">1 M × 5 KB = 40 Gbps</span></div>
+      <div class="chip"><span class="k">Gateway instances</span><span class="v">2–4 (50 K RPS each) + 2× headroom</span></div>
+    </div>
+    <div class="callout tip"><b>Why the mesh is bigger than the gateway:</b> N-S traffic hits the gateway once; E-W fans out ~10× per external request (microservices call each other). At 100 K external RPS you already have ~1 M internal RPCs — every one of them wants auth, retry, and mTLS. That's why sidecars exist: it's infeasible to route 1 M RPS through a central gateway.</div>
+  </section>
+
+  <!-- C · INTERACTIVE ARCHITECTURE -->
+  <section data-flowscope>
+    <div class="sec-h"><span class="n">C</span><h2>Architecture — click components, then step both flows</h2><span class="tag">north-south + east-west</span></div>
+    <div>
+      <div class="arch">
+        <svg viewBox="0 0 900 420" width="100%" style="max-width:900px" role="img" aria-label="API gateway + service mesh architecture">
+          <defs>
+            <marker id="ah3" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" fill="var(--muted)"></path></marker>
+          </defs>
+
+          <!-- ═══════ arrows ═══════ -->
+          <!-- North-South flow -->
+
+          <!-- N1: Client → Gateway -->
+          <line class="arrow" x1="160" y1="48" x2="205" y2="48" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah3)"
+                data-flow="north" data-north="1"
+                data-desc-north="External client (mobile, web, partner) sends HTTPS request to the gateway. TLS termination happens here."></line>
+          <!-- N2: Gateway → Auth -->
+          <line class="arrow" x1="345" y1="42" x2="395" y2="42" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah3)"
+                data-flow="north" data-north="2"
+                data-desc-north="Gateway calls the AuthEngine — JWT: decode header.payload.signature, verify signature with provider's public key, extract 'sub' claim → principal. API-key path: lookup in trusted keystore. On failure → 401 Unauthorized."></line>
+          <!-- N3: Gateway → RateLimiter -->
+          <line class="arrow" x1="345" y1="55" x2="395" y2="105" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah3)"
+                data-flow="north" data-north="3"
+                data-desc-north="RateLimiterEngine (token bucket per client + per route). If tokens exhausted → 429 Too Many Requests with Retry-After header. Bucket state in-memory per instance; distributed via Redis in production."></line>
+          <!-- N4: Gateway → CircuitBreaker -->
+          <line class="arrow" x1="345" y1="62" x2="395" y2="172" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah3)"
+                data-flow="north" data-north="4"
+                data-desc-north="CircuitBreakerEngine check for target service. If state = OPEN → 503 fast-fail. If HALF_OPEN → allow test request. If CLOSED → allow normally."></line>
+          <!-- N5: Gateway → LoadBalancer -->
+          <line class="arrow" x1="345" y1="70" x2="395" y2="232" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah3)"
+                data-flow="north" data-north="5"
+                data-desc-north="LoadBalancerService picks a healthy instance using the configured strategy (RoundRobin / Weighted / ConsistentHash). Filters to healthy instances first."></line>
+          <!-- N6: LB → Registry -->
+          <line class="arrow" x1="465" y1="254" x2="465" y2="270" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah3)"
+                data-flow="north" data-north="6"
+                data-desc-north="LB queries ServiceRegistry for the current list of healthy instances of the target service. Registry is updated by heartbeats; stale instances evicted after 10 s."></line>
+          <!-- N7: Gateway → Sidecar B (forward) -->
+          <line class="arrow" x1="345" y1="42" x2="620" y2="108" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah3)"
+                data-flow="north" data-north="7"
+                data-desc-north="Gateway forwards to the selected instance's sidecar (or directly to service; sidecar is optional at ingress). Adds X-Trace-Id, X-Gateway-Service, X-Gateway-Instance headers."></line>
+          <!-- N8: Sidecar B → Service B -->
+          <line class="arrow" x1="695" y1="86" x2="695" y2="70" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah3)"
+                data-flow="north" data-north="8"
+                data-desc-north="Sidecar delivers to the service on localhost:port. Response follows the reverse path; gateway records success/failure back into the CircuitBreaker."></line>
+
+          <!-- East-West flow (mesh) -->
+
+          <!-- E1: Service A → Sidecar A -->
+          <line class="arrow" x1="160" y1="292" x2="205" y2="292" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah3)"
+                data-flow="east" data-east="1"
+                data-desc-east="Service A calls http://user-service:8080/... — its LOCAL sidecar (Envoy on localhost:15001) intercepts transparently via iptables rules. Application code doesn't know."></line>
+          <!-- E2: Sidecar A → TLS -->
+          <line class="arrow" x1="345" y1="310" x2="395" y2="352" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah3)"
+                data-flow="east" data-east="2"
+                data-desc-east="TlsEngine — the sidecar validates mTLS on outgoing: presents Service A's client cert (issued by mesh CA), verifies target sidecar's server cert. Cert cache hit &lt; 0.1 ms."></line>
+          <!-- E3: Sidecar A → CircuitBreaker -->
+          <line class="arrow" x1="345" y1="285" x2="395" y2="172" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah3)"
+                data-flow="east" data-east="3"
+                data-desc-east="Sidecar A checks CircuitBreaker state for target Service B. Same 3-state machine as N-S; per-target-service. On OPEN → fail-fast without a network call."></line>
+          <!-- E4: Sidecar A → LoadBalancer -->
+          <line class="arrow" x1="345" y1="290" x2="395" y2="232" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah3)"
+                data-flow="east" data-east="4"
+                data-desc-east="Sidecar picks a healthy instance of Service B — usually via ConsistentHash (cache affinity) or Weighted (canary). Registry lookup is cached locally by sidecar; refreshed via xDS push."></line>
+          <!-- E5: Sidecar A → Sidecar B -->
+          <line class="arrow" x1="345" y1="282" x2="620" y2="130" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah3)"
+                data-flow="east" data-east="5"
+                data-desc-east="Sidecar A opens (or reuses) an HTTP/2 mTLS connection to Sidecar B on the wire. All bytes encrypted; both sides authenticate via cert. Sidecar B is on the target Service B's pod on localhost."></line>
+          <!-- E6: Sidecar B → Service B -->
+          <line class="arrow" x1="695" y1="86" x2="695" y2="70" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah3)"
+                data-flow="east" data-east="6"
+                data-desc-east="Sidecar B delivers to Service B on localhost:8080. Adds X-Mesh-Source, X-Mesh-Target, X-Mesh-Instance headers. Service B never sees the wire; only local HTTP."></line>
+
+          <!-- Control plane arrows (dashed) -->
+
+          <!-- Control Plane → Gateway (config push) -->
+          <path class="arrow" d="M620,220 C 500,150 450,90 345,68" fill="none" stroke="var(--muted)" stroke-width="1.5" stroke-dasharray="4 3" marker-end="url(#ah3)"></path>
+          <text class="edge-label" x="415" y="145">route + policy config</text>
+          <!-- Control Plane → Sidecar A -->
+          <path class="arrow" d="M620,232 C 480,260 380,270 345,275" fill="none" stroke="var(--muted)" stroke-width="1.5" stroke-dasharray="4 3" marker-end="url(#ah3)"></path>
+          <text class="edge-label" x="540" y="262">xDS push</text>
+          <!-- Control Plane → Sidecar B (below on col4) -->
+          <line class="arrow" x1="620" y1="210" x2="620" y2="130" stroke="var(--muted)" stroke-width="1.5" stroke-dasharray="4 3" marker-end="url(#ah3)"></line>
+
+          <!-- Sidecar A → Metrics (emit telemetry) -->
+          <path class="arrow" d="M275,314 C 400,360 550,360 620,352" fill="none" stroke="var(--muted)" stroke-width="1.2" stroke-dasharray="2 3" marker-end="url(#ah3)"></path>
+          <text class="edge-label" x="430" y="392">span · metric · log</text>
+          <!-- Gateway → Metrics -->
+          <path class="arrow" d="M275,70 C 350,340 550,360 620,352" fill="none" stroke="var(--muted)" stroke-width="1.2" stroke-dasharray="2 3" marker-end="url(#ah3)"></path>
+          <!-- Sidecar B → Metrics -->
+          <line class="arrow" x1="620" y1="130" x2="620" y2="330" stroke="var(--muted)" stroke-width="1.2" stroke-dasharray="2 3" marker-end="url(#ah3)"></line>
+
+          <!-- ═══════ NODES ═══════ -->
+
+          <!-- Col 1 -->
+          <g data-node style="cursor:pointer" data-title="External Clients (Mobile · Web · Partner)" data-detail="<b>N-S entry.</b> Mobile apps, browsers, partner APIs, third-party integrations. Each has different SLAs and auth schemes.<br><b>Auth options they use:</b> JWT (mobile / web sessions), API keys (server-to-server partners), OAuth2 delegated (third-party apps).<br><b>Rate limits</b> per-client — a mobile user might get 100 req/s, a partner API 1 000 req/s. Configured on Route metadata."><rect x="20" y="26" width="140" height="44" rx="9" fill="var(--panel-2)" stroke="var(--eden)"></rect><text x="90" y="46" text-anchor="middle" fill="var(--eden)" font-size="12" font-weight="600">External Clients</text><text x="90" y="60" text-anchor="middle" fill="var(--faint)" font-size="10">mobile · web · partner</text></g>
+
+          <g data-node style="cursor:pointer" data-title="Service A (in-cluster caller — e.g. Order)" data-detail="<b>E-W caller.</b> A regular microservice (Order, Cart, etc.) that needs to call another service (User, Payment).<br><b>Key insight:</b> app code writes <code>http://user-service:8080/api/users/123</code> — no mesh awareness. The local sidecar intercepts via iptables (or eBPF) transparently.<br><b>Pod topology:</b> Service A container + Sidecar A container in the same pod, sharing localhost."><rect x="20" y="270" width="140" height="44" rx="9" fill="var(--panel-2)" stroke="var(--eden)"></rect><text x="90" y="290" text-anchor="middle" fill="var(--eden)" font-size="12" font-weight="600">Service A</text><text x="90" y="304" text-anchor="middle" fill="var(--faint)" font-size="10">Order svc (E-W caller)</text></g>
+
+          <!-- Col 2 -->
+          <g data-node style="cursor:pointer" data-title="API Gateway (Facade — Kong / Zuul / AWS APIGW)" data-detail="<b>N-S facade — one door.</b> Terminates TLS from clients, runs the pipeline: route → auth → rate-limit → circuit-breaker → load-balance → forward. Adds X-Trace-Id per request.<br><b>Fleet:</b> 2–4 instances behind an L4 load balancer, each handling ~50 K RPS. Stateless — any instance can serve any request.<br><b>Overhead target:</b> &lt; 1 ms p99 excluding upstream. Achieved by keeping the whole pipeline in-process (no cross-service calls) and caching auth results per request-id."><rect x="205" y="26" width="140" height="44" rx="9" fill="var(--panel-2)" stroke="var(--survivor)"></rect><text x="275" y="46" text-anchor="middle" fill="var(--survivor)" font-size="12" font-weight="600">API Gateway</text><text x="275" y="60" text-anchor="middle" fill="var(--faint)" font-size="10">10-step pipeline · &lt; 1 ms</text></g>
+
+          <g data-node style="cursor:pointer" data-title="Sidecar A (Envoy proxy on Service A's pod)" data-detail="<b>Envoy-style sidecar.</b> Runs as a container inside Service A's pod on localhost:15001. Traffic from Service A is intercepted via iptables (or eBPF) — <b>zero app-code changes</b>.<br><b>Responsibilities:</b> egress mTLS (present client cert), circuit breaker per-target, retries with backoff, timeout enforcement, telemetry emission.<br><b>Config:</b> pulled from Control Plane via xDS (Discovery Service) gRPC stream — updates in &lt; 5 s."><rect x="205" y="270" width="140" height="44" rx="9" fill="var(--panel-2)" stroke="var(--survivor)"></rect><text x="275" y="290" text-anchor="middle" fill="var(--survivor)" font-size="12" font-weight="600">Sidecar A (Envoy)</text><text x="275" y="304" text-anchor="middle" fill="var(--faint)" font-size="10">iptables intercept · mTLS</text></g>
+
+          <!-- Col 3: engines -->
+          <g data-node style="cursor:pointer" data-title="Auth Engine (JWT / API Key — pluggable)" data-detail="<b>AuthStrategy interface</b> with two impls in this codebase:<br>• <code>JwtAuthStrategy(roleMap)</code> — decodes JWT header.payload.signature, verifies signature via provider's public key (JWKS), extracts <code>sub</code> claim → principal, maps to roles via injected roleMap.<br>• <code>ApiKeyAuthStrategy</code> — lookup in trusted keystore (Redis / Postgres); each key maps to principal + roles.<br><b>Failure:</b> 401 Unauthorized. <b>Latency:</b> &lt; 0.5 ms with warm JWKS cache."><rect x="395" y="26" width="140" height="44" rx="9" fill="var(--panel-2)" stroke="var(--fig)"></rect><text x="465" y="46" text-anchor="middle" fill="var(--fig)" font-size="12" font-weight="600">Auth Engine</text><text x="465" y="60" text-anchor="middle" fill="var(--faint)" font-size="10">JWT · API Key (strategy)</text></g>
+
+          <g data-node style="cursor:pointer" data-title="Rate Limiter (Token Bucket)" data-detail="<b>RateLimiterEngine — token bucket per (client, route).</b> Refill rate = configured RPS; capacity = burst allowance.<br><b>Algorithm:</b> bucket has N tokens; each request consumes 1; refills every 1/rate ms; if bucket empty → deny with 429 + <code>Retry-After: (1/rate) sec</code>.<br><b>Distributed:</b> Redis <code>Lua</code> script for atomic decrement to enforce global limits across gateway fleet. Local-only for per-gateway soft limits.<br><b>Accuracy target:</b> ±1 % of configured rate."><rect x="395" y="86" width="140" height="44" rx="9" fill="var(--panel-2)" stroke="var(--fig)"></rect><text x="465" y="106" text-anchor="middle" fill="var(--fig)" font-size="12" font-weight="600">Rate Limiter</text><text x="465" y="120" text-anchor="middle" fill="var(--faint)" font-size="10">token bucket</text></g>
+
+          <g data-node style="cursor:pointer" data-title="Circuit Breaker (3-state machine)" data-detail="<b>CircuitBreakerEngine — per-target-service state machine.</b><br><b>States (from code):</b> CLOSED (allow) → OPEN (deny after N failures) → HALF_OPEN (test-request after cooldown) → CLOSED (recovery confirmed) or → OPEN (recovery failed).<br><b>Defaults (from code):</b> FAILURE_THRESHOLD=5, SUCCESS_THRESHOLD=3, OPEN_DURATION=30 s.<br><b>Why:</b> prevents cascading failure — one slow backend doesn't tie up gateway threads waiting for timeout. Fast-fail with 503; backend recovers under reduced load."><rect x="395" y="150" width="140" height="44" rx="9" fill="var(--panel-2)" stroke="var(--fig)"></rect><text x="465" y="170" text-anchor="middle" fill="var(--fig)" font-size="12" font-weight="600">Circuit Breaker</text><text x="465" y="184" text-anchor="middle" fill="var(--faint)" font-size="10">CLOSED · OPEN · HALF_OPEN</text></g>
+
+          <g data-node style="cursor:pointer" data-title="Load Balancer (RR · Weighted · Consistent-Hash)" data-detail="<b>LoadBalancingStrategy — 3 impls in code:</b><br>• <code>RoundRobinLoadBalancer</code> — atomic counter mod healthy count. Default.<br>• <code>WeightedLoadBalancer</code> — instances have weights; higher-weight = more traffic. For canary deploys.<br>• <code>ConsistentHashLoadBalancer</code> — TreeMap ring, 150 vnodes/instance; hash(request.path) → same instance for same key. For cache-affinity workloads.<br>All filter to healthy first."><rect x="395" y="210" width="140" height="44" rx="9" fill="var(--panel-2)" stroke="var(--fig)"></rect><text x="465" y="230" text-anchor="middle" fill="var(--fig)" font-size="12" font-weight="600">Load Balancer</text><text x="465" y="244" text-anchor="middle" fill="var(--faint)" font-size="10">RR · Weighted · Hash</text></g>
+
+          <g data-node style="cursor:pointer" data-title="Service Registry (instances + health)" data-detail="<b>ServiceRegistry.</b> Backs the LB with the current list of instances per service.<br><b>Registration:</b> instances POST /gateway/services on startup with {id, serviceName, host, port, weight, zone}.<br><b>Health tracking:</b> heartbeat every 5 s; stale = &gt; 10 s since last beat → mark UNHEALTHY.<br><b>Backends:</b> etcd / Consul / Zookeeper (mesh); in-memory for the gateway process (small fleet). Sidecars cache locally and refresh via xDS."><rect x="395" y="270" width="140" height="44" rx="9" fill="var(--panel-2)" stroke="var(--old)"></rect><text x="465" y="290" text-anchor="middle" fill="var(--old)" font-size="12" font-weight="600">Service Registry</text><text x="465" y="304" text-anchor="middle" fill="var(--faint)" font-size="10">instances · heartbeat · health</text></g>
+
+          <g data-node style="cursor:pointer" data-title="TLS Engine (mTLS between sidecars)" data-detail="<b>TlsEngine — mutual TLS for zero-trust E-W traffic.</b><br><b>Every service pair authenticates each other:</b> caller presents client cert (issued by mesh CA); target presents server cert; both validate.<br><b>Certs auto-rotated</b> daily by the mesh CA (SPIFFE/SPIRE model). No human touches PEM files at scale.<br><b>Latency:</b> &lt; 0.1 ms per request with warm cert-chain cache; handshake amortized over HTTP/2 connection lifetime."><rect x="395" y="330" width="140" height="44" rx="9" fill="var(--panel-2)" stroke="var(--fig)"></rect><text x="465" y="350" text-anchor="middle" fill="var(--fig)" font-size="12" font-weight="600">TLS Engine</text><text x="465" y="364" text-anchor="middle" fill="var(--faint)" font-size="10">mTLS · cert rotation</text></g>
+
+          <!-- Col 4 -->
+          <g data-node style="cursor:pointer" data-title="Service B (target — e.g. User)" data-detail="<b>N-S &amp; E-W target.</b> Backend microservice, N horizontal replicas.<br><b>Every replica has a sidecar</b> co-located in its pod. Service B code binds to localhost:8080; Sidecar B listens on the pod's external interface and forwards inbound traffic to localhost:8080.<br><b>Registration:</b> on pod start, sidecar registers instance with Service Registry; on pod termination, deregisters gracefully."><rect x="620" y="26" width="170" height="44" rx="9" fill="var(--panel-2)" stroke="var(--eden)"></rect><text x="705" y="46" text-anchor="middle" fill="var(--eden)" font-size="12" font-weight="600">Service B (instances)</text><text x="705" y="60" text-anchor="middle" fill="var(--faint)" font-size="10">User svc · N replicas</text></g>
+
+          <g data-node style="cursor:pointer" data-title="Sidecar B (Envoy on Service B's pod)" data-detail="<b>Envoy on Service B's pod.</b> Receives inbound mTLS traffic on the pod's port; validates client cert; forwards to Service B on localhost:8080.<br><b>Adds mesh headers:</b> X-Mesh-Source, X-Mesh-Target, X-Mesh-Instance — used by observability.<br><b>Runs the inbound half</b> of the mesh policy: authorization (only allowed callers), rate-limit, telemetry emission.<br><b>Same binary as Sidecar A</b> — Envoy is symmetric; direction is a config concern."><rect x="620" y="86" width="170" height="44" rx="9" fill="var(--panel-2)" stroke="var(--survivor)"></rect><text x="705" y="106" text-anchor="middle" fill="var(--survivor)" font-size="12" font-weight="600">Sidecar B (Envoy)</text><text x="705" y="120" text-anchor="middle" fill="var(--faint)" font-size="10">inbound mTLS · localhost fwd</text></g>
+
+          <g data-node style="cursor:pointer" data-title="Control Plane (Istio Pilot / Consul / etcd)" data-detail="<b>Control Plane — the mesh brain.</b> Istio Pilot, Consul, Linkerd control plane, or your homegrown equivalent.<br><b>Responsibilities:</b><br>• Distribute routing rules, traffic-split policies, and retry configs to all sidecars via <b>xDS</b> gRPC streams.<br>• Manage the mesh CA — issue and rotate mTLS certs.<br>• Aggregate discovery data from all registries.<br>• Expose an admin API for policy changes (canary rollouts, kill switches).<br><b>Failure mode:</b> sidecars operate on last-known-good config if control plane is unreachable — data plane is <b>resilient to control plane outages</b>."><rect x="620" y="210" width="170" height="44" rx="9" fill="var(--panel-2)" stroke="var(--warn)"></rect><text x="705" y="230" text-anchor="middle" fill="var(--warn)" font-size="12" font-weight="600">Control Plane</text><text x="705" y="244" text-anchor="middle" fill="var(--faint)" font-size="10">xDS push · CA · policy</text></g>
+
+          <g data-node style="cursor:pointer" data-title="Metrics · Tracing · Logs (observability)" data-detail="<b>Observability backend.</b> Sidecars &amp; gateway emit:<br>• <b>Metrics</b> (Prometheus): RPS, latency histogram, error rate, circuit-breaker state, saturation — per (source, target, route).<br>• <b>Traces</b> (Jaeger / Tempo): X-Trace-Id propagates across the whole call graph; every hop is a span. See exactly which service was slow in a 20-hop request.<br>• <b>Logs</b>: structured JSON with traceId — grep by request across services.<br><b>Sampling:</b> 100 % errors, 1 % success (adaptive)."><rect x="620" y="330" width="170" height="44" rx="9" fill="var(--panel-2)" stroke="var(--warn)"></rect><text x="705" y="350" text-anchor="middle" fill="var(--warn)" font-size="12" font-weight="600">Observability</text><text x="705" y="364" text-anchor="middle" fill="var(--faint)" font-size="10">metrics · traces · logs</text></g>
+
+        </svg>
+      </div>
+      <div class="node-detail"><span class="nd-title">Click any component</span><div class="nd-body">Its role, config, and latency budget appear here. Then use the buttons below to step through <b>North-South</b> (external → gateway → service) and <b>East-West</b> (service → sidecar → sidecar → service) flows.</div></div>
+
+      <div class="flowctl" data-flowctl>
+        <button class="btn" data-flow="north">North-South (8 steps · gateway)</button>
+        <button class="btn" data-flow="east">East-West (6 steps · mesh)</button>
+        <span style="flex:1"></span>
+        <button class="btn" data-flowstep="prev">◀ Prev</button>
+        <button class="btn" data-flowstep="next">Next ▶</button>
+      </div>
+      <div class="flowlabel" data-flowlabel>Pick <b>N-S</b> or <b>E-W</b>, then press "Next ▶" to walk the numbered request flow one hop at a time.</div>
+
+      <div class="cloudmap">
+        <div class="kicker" style="margin-top:4px">Managed-service mapping — the same design on each cloud</div>
+        <table class="cloudtable">
+          <thead><tr>
+            <th>Component</th>
+            <th><span class="hdrlogo"><span class="logochip"><img src="../assets/logos/aws.svg" alt="AWS"></span>AWS</span></th>
+            <th><span class="hdrlogo"><span class="logochip"><img src="../assets/logos/gcp.svg" alt="GCP"></span>GCP</span></th>
+            <th><span class="hdrlogo"><span class="logochip"><img src="../assets/logos/azure.svg" alt="Azure"></span>Azure</span></th>
+          </tr></thead>
+          <tbody>
+            <tr><td><b>API Gateway</b></td><td><img class="svcicon" src="../assets/logos/services/aws-apigw.svg" alt="">API Gateway / ALB + Cognito</td><td><img class="svcicon" src="../assets/logos/services/gcp-apigw.svg" alt="">API Gateway / Apigee</td><td><img class="svcicon" src="../assets/logos/services/azure-apim.svg" alt="">API Management</td></tr>
+            <tr><td><b>Service Mesh</b></td><td><img class="svcicon" src="../assets/logos/services/aws-ecs.svg" alt="">App Mesh / EKS + Istio</td><td><img class="svcicon" src="../assets/logos/services/gcp-run.svg" alt="">Anthos Service Mesh (Istio)</td><td><img class="svcicon" src="../assets/logos/services/azure-aks.svg" alt="">Open Service Mesh / AKS + Istio</td></tr>
+            <tr><td>Load Balancer (L4/L7)</td><td><img class="svcicon" src="../assets/logos/services/aws-elb.svg" alt="">NLB / ALB</td><td><img class="svcicon" src="../assets/logos/services/gcp-elb.svg" alt="">Cloud Load Balancing</td><td><img class="svcicon" src="../assets/logos/services/azure-appgw.svg" alt="">Azure Load Balancer / App GW</td></tr>
+            <tr><td>Service Discovery</td><td><img class="svcicon" src="../assets/logos/services/aws-ecs.svg" alt="">Cloud Map / ECS SD</td><td><img class="svcicon" src="../assets/logos/services/gcp-run.svg" alt="">Traffic Director</td><td><img class="svcicon" src="../assets/logos/services/azure-aks.svg" alt="">Traffic Manager</td></tr>
+            <tr><td>Certificate Mgmt (mTLS CA)</td><td>ACM Private CA</td><td>Certificate Authority Service</td><td>Key Vault (cert manager)</td></tr>
+            <tr><td>Rate limiter (distributed)</td><td><img class="svcicon" src="../assets/logos/services/aws-elasticache.svg" alt="">ElastiCache Redis (Lua)</td><td><img class="svcicon" src="../assets/logos/services/gcp-memorystore.svg" alt="">Memorystore Redis</td><td><img class="svcicon" src="../assets/logos/services/azure-redis.svg" alt="">Azure Cache for Redis</td></tr>
+            <tr><td>Observability</td><td>X-Ray + CloudWatch</td><td>Cloud Trace + Monitoring</td><td>Azure Monitor / App Insights</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+
+  <!-- D · API -->
+  <section>
+    <div class="sec-h"><span class="n">D</span><h2>API design</h2><span class="tag">external (N-S) + control-plane admin</span></div>
+    <table>
+      <thead><tr><th>Endpoint</th><th>Purpose</th><th>Response</th></tr></thead>
+      <tbody>
+        <tr><td><code>* /api/**</code></td><td>Any client request — routed through the full gateway pipeline</td><td>200 / 401 / 403 / 429 / 502 / 503 + <code>X-Trace-Id</code></td></tr>
+        <tr><td><code>POST /gateway/routes</code></td><td>Register a route (pathPattern, targetService, methods, rate, timeout, priority)</td><td>201 Created</td></tr>
+        <tr><td><code>POST /gateway/services</code></td><td>Register a service instance (id, host, port, weight, zone)</td><td>201 Created</td></tr>
+        <tr><td><code>DELETE /gateway/services/{id}</code></td><td>Deregister instance (graceful drain)</td><td>204</td></tr>
+        <tr><td><code>GET /gateway/circuit-breakers</code></td><td>Current CB state per service</td><td>200 + <code>{svcA: "CLOSED", svcB: "OPEN"}</code></td></tr>
+        <tr><td><code>POST /gateway/canary</code></td><td>Set traffic split (e.g., 95 % v1, 5 % v2)</td><td>200</td></tr>
+        <tr><td><code>GET /gateway/status</code></td><td>Route count, instance health, CB summary</td><td>200 + status JSON</td></tr>
+        <tr><td><code>POST /mesh/config</code> (control plane)</td><td>Push xDS config to all sidecars</td><td>200</td></tr>
+      </tbody>
+    </table>
+    <p class="muted"><b>Response headers on every request:</b> <code>X-Trace-Id</code> (end-to-end), <code>X-Gateway-Service</code>, <code>X-Gateway-Instance</code>, <code>X-RateLimit-Remaining</code>, <code>Retry-After</code> (on 429).</p>
+  </section>
+
+  <!-- E · DATA MODEL -->
+  <section>
+    <div class="sec-h"><span class="n">E</span><h2>Data model — configuration &amp; runtime state</h2><span class="tag">most fits in memory (small &amp; hot)</span></div>
+    <div class="grid g2">
+      <div class="card">
+        <div class="kicker">config (persisted in control plane)</div>
+        <pre class="code">Route
+  id
+  pathPattern           <span class="cm">// /api/users/**</span>
+  targetService
+  methods[]             <span class="cm">// GET, POST, ...</span>
+  rateLimitPerSecond
+  timeoutMs
+  retryCount
+  priority              <span class="cm">// higher = matched first</span>
+  metadata              <span class="cm">// required-role: user, ...</span>
+
+ServiceInstance
+  id, serviceName
+  host, port, weight
+  zone                  <span class="cm">// us-east-1a</span>
+  healthStatus
+  lastHeartbeat
+
+TrafficSplit
+  routeId
+  targets[]             <span class="cm">// [{v1: 95%}, {v2: 5%}]</span>
+  headerCondition?      <span class="cm">// X-Canary: true</span></pre>
+      </div>
+      <div class="card">
+        <div class="kicker">runtime state (in-memory per gateway/sidecar)</div>
+        <pre class="code">CircuitBreakerState (per service)
+  serviceName
+  state                 <span class="cm">// CLOSED | OPEN | HALF_OPEN</span>
+  failureCount
+  successCount
+  lastFailureTime
+  failureThreshold      <span class="cm">// 5</span>
+  successThreshold      <span class="cm">// 3</span>
+  openDurationMs        <span class="cm">// 30_000</span>
+
+RateLimitBucket (per client × route)
+  clientId
+  routeId
+  tokens                <span class="cm">// current count</span>
+  capacity              <span class="cm">// burst size</span>
+  refillRatePerSec
+  lastRefillAt
+
+RequestContext (per in-flight request)
+  traceId
+  route
+  authResult            <span class="cm">// principal, roles</span>
+  selectedInstance
+  startedAt</pre>
+      </div>
+    </div>
+    <div class="callout tip"><b>Why 'small &amp; hot' works:</b> route table (1 000 routes × 1 KB = 1 MB), instances (5 000 × 500 B = 2.5 MB), rate buckets (100 K × 100 B = 10 MB), CB state (500 × 200 B = 100 KB). Total &lt; 15 MB per gateway instance — trivially in-process. That's how you hit &lt; 1 ms p99: zero cross-service calls on the hot path.</div>
+  </section>
+
+  <!-- F · KEY CHOICES -->
+  <section>
+    <div class="sec-h"><span class="n">F</span><h2>Key design choices (deep-dived on canvas 3)</h2><span class="tag">defend these</span></div>
+    <div class="grid g3">
+      <div class="card"><div class="kicker">separation</div><h3>Gateway (N-S) vs mesh (E-W)</h3><p class="muted">Central gateway for external ingress; per-pod sidecars for internal RPCs. Mesh scales linearly with fleet — no central bottleneck. <span class="run">→ canvas 3 · gateway-vs-mesh</span></p></div>
+      <div class="card"><div class="kicker">resilience</div><h3>Circuit breaker</h3><p class="muted">CLOSED → OPEN → HALF_OPEN state machine per target service. Stops cascading failures — one slow backend doesn't tie up threads. <span class="run">→ canvas 3 · CB deep-dive</span></p></div>
+      <div class="card"><div class="kicker">security</div><h3>Zero-trust via mTLS</h3><p class="muted">Every service pair authenticates via cert. Mesh CA auto-rotates daily. No implicit trust based on network location. <span class="run">→ canvas 3 · zero-trust</span></p></div>
+      <div class="card"><div class="kicker">balancing</div><h3>Strategy-pattern load balancer</h3><p class="muted">Round-Robin default, Weighted for canary, ConsistentHash for cache-affinity. Swap by config. <span class="run">→ canvas 2 · LB tabs</span></p></div>
+      <div class="card"><div class="kicker">deploys</div><h3>Canary via traffic split</h3><p class="muted">95/5 by weight OR header-based (<code>X-Canary: true</code>) for targeted testing. Rollback in 60 s. <span class="run">→ canvas 3 · canary</span></p></div>
+      <div class="card"><div class="kicker">observability</div><h3>Trace ID propagation</h3><p class="muted">Gateway generates X-Trace-Id; sidecars propagate. Every hop is a span in Jaeger. Debug a 20-hop request in one dashboard.</p></div>
+    </div>
+  </section>
+
+  <!-- GLOSSARY -->
+  <section>
+    <div class="sec-h"><span class="n">§</span><h2>Glossary — one-liners</h2></div>
+    <div class="grid g2">
+      <div class="card"><table><tbody>
+        <tr><td><b>North-South (N-S)</b></td><td>traffic between external clients and the cluster (ingress)</td></tr>
+        <tr><td><b>East-West (E-W)</b></td><td>traffic between services inside the cluster (RPC fan-out)</td></tr>
+        <tr><td><b>Sidecar</b></td><td>a proxy container in the same pod as the service; intercepts all traffic</td></tr>
+        <tr><td><b>Service mesh</b></td><td>the collection of sidecars + control plane managing E-W traffic uniformly</td></tr>
+        <tr><td><b>Circuit breaker</b></td><td>3-state machine that fast-fails when a backend is unhealthy, preventing cascading failure</td></tr>
+        <tr><td><b>Token bucket</b></td><td>rate-limit algorithm: bucket refills at rate R, each request consumes 1 token, deny when empty</td></tr>
+      </tbody></table></div>
+      <div class="card"><table><tbody>
+        <tr><td><b>mTLS</b></td><td>mutual TLS — both sides present certs; enables zero-trust networking</td></tr>
+        <tr><td><b>Consistent hash</b></td><td>LB scheme where the same key always routes to the same instance; adding nodes only shuffles 1/N of keys</td></tr>
+        <tr><td><b>xDS</b></td><td>Envoy's Discovery Service API — control plane pushes config to sidecars via gRPC stream</td></tr>
+        <tr><td><b>Canary deploy</b></td><td>send small % of traffic to new version; rollback if error rate spikes</td></tr>
+        <tr><td><b>SPIFFE / SPIRE</b></td><td>standard + runtime for issuing short-lived service identities (mTLS certs)</td></tr>
+        <tr><td><b>Trace ID propagation</b></td><td>a request-level UUID passed through every hop so distributed calls can be reconstructed</td></tr>
+      </tbody></table></div>
+    </div>
+  </section>
+
+  <footer>
+    <p>Use case 19 · API Gateway &amp; Service Mesh — Canvas 1 of 3 (HLD). Grounded in <code>19-api-gateway-service-mesh/docs/hld/HIGH_LEVEL_DESIGN.md</code> and the real Java under <code>19-api-gateway-service-mesh/src/</code>.</p>
+    <p class="run">This use case: HLD · <a href="lld.html">Canvas 2 · LLD</a> · <a href="deepdive.html">Canvas 3 · Deep-dive &amp; Trade-offs</a> &nbsp;|&nbsp; <a href="../index.html">Hub</a></p>
+  </footer>
+
+</div>
+<script src="../assets/canvas.js"></script>
+</body>
+</html>

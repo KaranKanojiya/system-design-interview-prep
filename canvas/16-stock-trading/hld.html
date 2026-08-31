@@ -1,0 +1,429 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>16 · Stock Trading — HLD</title>
+<link rel="stylesheet" href="../assets/canvas.css">
+</head>
+<body>
+
+<div class="wrap">
+
+  <header class="hero">
+    <h1>Stock Trading Platform (NASDAQ · NYSE · Robinhood) — High-Level Design</h1>
+    <div class="sub">Use case 16 · Canvas 1 of 3. Two planes, one design: the <b>order plane</b> (CP — every order must persist, no double-fills, correctness is regulatory) and the <b>market-data plane</b> (AP — a 50 ms stale price is fine for display, matching still reads the real book). At the heart sits a <b>single-threaded matching engine per symbol</b> whose in-memory <b>TreeMap order book</b> matches with <b>price-time priority</b>. Click a component, then step both flows.</div>
+    <div class="badges">
+      <span class="badge lvl">Use case 16 · HLD</span>
+      <span class="badge">Canvas 1 of 3</span>
+      <span class="badge">interactive</span>
+      <span class="badge">Price-Time Priority · CP orders · AP market-data</span>
+      <span class="badge">22 K OPS peak · 110 K OPS burst · &lt; 10 ms p99</span>
+    </div>
+    <div class="legend">
+      <span><i class="dot" style="background:var(--eden)"></i> client / entry</span>
+      <span><i class="dot" style="background:var(--survivor)"></i> services &amp; engines</span>
+      <span><i class="dot" style="background:var(--warn)"></i> matching engine (star)</span>
+      <span><i class="dot" style="background:var(--fig)"></i> risk / strategy</span>
+      <span><i class="dot" style="background:var(--old)"></i> data stores</span>
+    </div>
+  </header>
+
+  <!-- A · PROBLEM & REQUIREMENTS -->
+  <section>
+    <div class="sec-h"><span class="n">A</span><h2>Problem &amp; requirements</h2><span class="tag">orders CP · market-data AP</span></div>
+    <div class="grid g2">
+      <div class="card">
+        <div class="kicker">functional</div>
+        <ul class="tight">
+          <li><b>Place order</b> — market, limit, stop-loss, stop-limit. Fields: <code>symbol · side · type · qty · price · validity</code>.</li>
+          <li><b>Cancel / modify</b> — cancel resting orders; modify = cancel + re-place (loses time priority).</li>
+          <li><b>Matching engine</b> — <b>price-time priority</b>: best price wins; at same price, earliest order wins (FIFO).</li>
+          <li><b>Order book</b> — bids (desc price) / asks (asc price) per symbol; publish top 5–20 depth levels.</li>
+          <li><b>Pre-trade risk</b> — margin check · position limit · circuit-breaker · rate limit. Reject BEFORE the book.</li>
+          <li><b>Real-time market data</b> — LTP, best bid/ask, volume, OHLCV via WebSocket to 500 K concurrent clients.</li>
+          <li><b>Portfolio &amp; P&amp;L</b> — positions, avg cost, realized (FIFO or AvgCost) + unrealized (mark-to-market).</li>
+          <li><b>Settlement (T+1)</b> — end-of-day netting; move cash + shares between clearing accounts.</li>
+          <li><b>Audit trail</b> — every order &amp; state change immutably logged (SEC Rule 613 · SEBI · WORM S3).</li>
+        </ul>
+      </div>
+      <div class="card">
+        <div class="kicker">non-functional</div>
+        <ul class="tight">
+          <li><b>Order latency</b> p99 &lt; 10 ms (API → ACK) · <b>matching latency</b> p99 &lt; 1 ms per match.</li>
+          <li><b>Tick-to-client</b> p99 &lt; 50 ms · burst 1 M msg/sec (NBBO consolidation).</li>
+          <li><b>Throughput</b> 50 M orders/day (~2 K OPS avg) · <b>22 K OPS peak</b> · <b>110 K OPS burst</b> at open.</li>
+          <li><b>Availability</b> 99.999 % during market hours (~2 sec/day) — regulators watch this.</li>
+          <li><b>Durability</b> zero data loss for orders — Kafka <code>acks=all</code>, WAL to disk, replay from log on crash.</li>
+          <li><b>Consistency</b> <b>strong (CP) for orders + trades</b> (single-writer per symbol) · AP for market data.</li>
+          <li><b>No double-fills, no phantom trades</b> — deterministic single-threaded matching per symbol.</li>
+          <li><b>Recoverability</b> &lt; 30 s failover — replay from Kafka offset rebuilds order book.</li>
+          <li><b>Regulatory</b> SEC Rule 613 (CAT), SIP consolidation, best-execution (Reg NMS / NBBO).</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <!-- B · ESTIMATION -->
+  <section>
+    <div class="sec-h"><span class="n">B</span><h2>Capacity estimation</h2><span class="tag">10 M users · 500 K concurrent · 5 K symbols</span></div>
+    <div class="chips">
+      <div class="chip"><span class="k">Total registered users</span><span class="v">10 M</span></div>
+      <div class="chip"><span class="k">DAU / concurrent (market hrs)</span><span class="v">1 M / 500 K</span></div>
+      <div class="chip"><span class="k">Listed symbols</span><span class="v">5 000</span></div>
+      <div class="chip"><span class="k">Daily orders</span><span class="v">50 M</span></div>
+      <div class="chip"><span class="k">Order QPS (avg → peak)</span><span class="v">~2 200 → ~22 000</span></div>
+      <div class="chip"><span class="k">Market-open burst</span><span class="v">~110 000 OPS (50×)</span></div>
+      <div class="chip"><span class="k">Daily trades</span><span class="v">~30 M (60 % fill rate)</span></div>
+      <div class="chip"><span class="k">Market data ticks/sec</span><span class="v">~5 M (5 K × 1 K)</span></div>
+      <div class="chip"><span class="k">WebSocket connections</span><span class="v">500 K concurrent</span></div>
+      <div class="chip"><span class="k">Order book memory</span><span class="v">~10 GB (5 K × 2 MB)</span></div>
+      <div class="chip"><span class="k">Orders storage / day</span><span class="v">~25 GB</span></div>
+      <div class="chip"><span class="k">Tick history / day</span><span class="v">~11 TB raw · &lt; 1 TB compressed</span></div>
+    </div>
+    <div class="callout tip"><b>Why the numbers look small but are scary:</b> 22 K OPS is trivial in isolation — but each order needs <b>durable persistence + risk check + deterministic match + trade persistence + notification</b>, all under <b>10 ms p99</b>. If risk-check p99 spikes to 20 ms you serialize the whole fleet; if the matching engine leader hangs you lose the exchange. The design is dominated by tail latency and correctness — not raw throughput.</div>
+    <div class="callout warn"><b>The market-open (9:30 AM) problem:</b> 50× spike + hot symbols (top 100 tickers see 80 % of the volume) + everyone reading the same order book. Mitigations: <b>partition by symbol</b> (one engine thread per ticker), <b>Kafka partition = symbol</b> (ordered delivery), <b>Redis snapshot of L2 book</b> for display so risk checks don't hit the engine, <b>circuit breakers</b> that halt trading if price band breached.</div>
+  </section>
+
+  <!-- C · INTERACTIVE ARCHITECTURE -->
+  <section data-flowscope>
+    <div class="sec-h"><span class="n">C</span><h2>Architecture — click components, then step both flows</h2><span class="tag">order plane (CP) + market-data plane (AP)</span></div>
+    <div>
+      <div class="arch">
+        <svg viewBox="0 0 900 560" width="100%" style="max-width:900px" role="img" aria-label="Stock trading architecture — orders + market data">
+          <defs>
+            <marker id="ah16" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" fill="var(--muted)"></path></marker>
+            <marker id="ah16w" markerWidth="10" markerHeight="10" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" fill="var(--warn)"></path></marker>
+          </defs>
+          <!-- Grid: 3 cols (x=20, x=330, x=640 · w=240 each), 7 rows (y=30, 105, 180, 255, 330, 405, 480 · h=54).
+               Gutters at x=260-330 (70 px) and x=570-640 (70 px). Row-gaps 21 px.
+               Mid-y per row: 57, 132, 207, 282, 357, 432, 507. -->
+
+          <!-- ═══════ ORDER FLOW (10 steps · CP) ═══════ -->
+
+          <!-- O1 — Clients → API Gateway (col 1 vertical, row-gap 1→2) -->
+          <line class="arrow" x1="140" y1="84" x2="140" y2="105" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah16)"
+                data-flow="order" data-order="1"
+                data-desc-order="Trader app sends POST /orders with JWT + Idempotency-Key. Body: symbol · side · type · qty · price · validity. FIX 4.4 for institutional API — REST/WebSocket for retail."></line>
+
+          <!-- O2 — API Gateway → Order Service (col 1 vertical, row-gap 2→3) -->
+          <line class="arrow" x1="140" y1="159" x2="140" y2="180" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah16)"
+                data-flow="order" data-order="2"
+                data-desc-order="Gateway does JWT auth · WAF · rate-limit (100 orders/sec/user) · payload validation · TLS. Routes to stateless Order Service behind ALB."></line>
+
+          <!-- O3 — Order Service → Risk Engine (col 1 vertical, row-gap 3→4) -->
+          <line class="arrow" x1="140" y1="234" x2="140" y2="255" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah16)"
+                data-flow="order" data-order="3"
+                data-desc-order="Order Service persists Order (status=PENDING_RISK) to Aurora, then invokes RiskService.runChecks(order, account, marketData). Chain: MarginCheck → PositionLimit → CircuitBreaker. Fail-fast."></line>
+
+          <!-- O4 — Risk Engine → Redis (diagonal to col 3 R3, dashed = read cache) -->
+          <line class="arrow" x1="260" y1="282" x2="640" y2="207" stroke="var(--muted)" stroke-width="1.5" stroke-dasharray="4 3" marker-end="url(#ah16)"
+                data-flow="order" data-order="4"
+                data-desc-order="Risk chain reads live state from Redis (sub-ms): available margin, current position, symbol circuit band, halt status. Redis is populated from Kafka trades stream — hot path never touches DDB directly."></line>
+
+          <!-- O5 — Order Service → Orders DB (persist PENDING, dashed diagonal to col 3 R1) -->
+          <line class="arrow" x1="260" y1="200" x2="640" y2="60" stroke="var(--muted)" stroke-width="1.5" stroke-dasharray="4 3" marker-end="url(#ah16)"
+                data-flow="order" data-order="5"
+                data-desc-order="Order Service INSERTs the Order row (status=PENDING_RISK, then ACCEPTED after risk pass) into Aurora PG. Idempotency-Key is UNIQUE — retry of same key returns the stored response."></line>
+
+          <!-- O6 — Order Service → Kafka orders.SYMBOL (col 1 vertical, row-gap 3→5, skips risk row) -->
+          <path class="arrow" d="M180,234 L200,234 L200,330 L140,330" fill="none" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah16)"
+                data-flow="order" data-order="6"
+                data-desc-order="Order Service publishes to Kafka topic orders.{symbol} (partition-key = symbol → all RELIANCE orders arrive at ONE partition in strict submission order). acks=all, no data loss."></path>
+
+          <!-- O7 — ★ Kafka → Matching Engine (STAR call, diagonal across gutter 1) -->
+          <line class="arrow" x1="260" y1="345" x2="330" y2="282" stroke="var(--warn)" stroke-width="2.5" marker-end="url(#ah16w)"
+                data-flow="order" data-order="7"
+                data-desc-order="THE STAR CALL. Matching engine consumer (one thread per symbol) reads orders.{symbol}. Deterministic: same orders in same sequence → same trades. Zero locks. Rebuilds order book from Kafka replay on crash."></line>
+          <text class="edge-label" x="295" y="315" text-anchor="middle" fill="var(--warn)" font-weight="700" font-size="10">match(order)</text>
+
+          <!-- O8 — Matching Engine → Order Book (row 4 horizontal via gutter 2) -->
+          <line class="arrow" x1="570" y1="282" x2="640" y2="282" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah16)"
+                data-flow="order" data-order="8"
+                data-desc-order="Engine looks up OrderBook for symbol (TreeMap bids desc + TreeMap asks asc). Matches against opposite side within price limit. Partial fill: remaining rests in book. Full fill: order removed."></line>
+
+          <!-- O9 — Matching Engine → Trade Service via Kafka trades.SYMBOL (col 2 vertical, row-gap 4→5) -->
+          <line class="arrow" x1="450" y1="309" x2="450" y2="330" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah16)"
+                data-flow="order" data-order="9"
+                data-desc-order="Engine publishes trades.{symbol} to Kafka (buyer/seller order_ids, price, qty, timestamp). Trade Service (independent consumer) persists trades to Aurora, updates order status FILLED/PARTIAL, writes S3 audit."></line>
+
+          <!-- O10 — Trade Service → Positions Store (diagonal col 2 R5 → col 3 R2, dashed) -->
+          <line class="arrow" x1="570" y1="345" x2="640" y2="132" stroke="var(--muted)" stroke-width="1.5" stroke-dasharray="4 3" marker-end="url(#ah16)"
+                data-flow="order" data-order="10"
+                data-desc-order="Trade Service (via PortfolioService) updates buyer/seller positions in DynamoDB: qty += fill, avg_cost recalc (FIFO or AvgCost strategy). Idempotent by trade_id. Also releases blocked margin excess."></line>
+
+          <!-- ═══════ MARKET DATA FLOW (6 steps · AP) ═══════ -->
+
+          <!-- M1 — Matching Engine → Market Data Service (col 2 vertical up, row-gap 4→3, dashed) -->
+          <line class="arrow" x1="480" y1="255" x2="480" y2="234" stroke="var(--muted)" stroke-width="1.5" stroke-dasharray="4 3" marker-end="url(#ah16)"
+                data-flow="marketdata" data-marketdata="1"
+                data-desc-marketdata="Market Data Service consumes trades.{symbol} from Kafka (same events Trade Service reads). Updates LTP, high, low, volume, best bid/ask from the book. Fan-out point for read side."></line>
+
+          <!-- M2 — Market Data Service → Redis LTP (row 3 horizontal via gutter 2) -->
+          <line class="arrow" x1="570" y1="200" x2="640" y2="200" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah16)"
+                data-flow="marketdata" data-marketdata="2"
+                data-desc-marketdata="Market Data Service writes LTP · best-bid · best-ask · volume · circuit-band to Redis (TTL 500 ms — auto-expire stale ticks). Sub-ms reads for risk chain + display."></line>
+
+          <!-- M3 — Market Data Service → WebSocket Hub (col 2 R3 → col 1 R7, L-path through left gutter) -->
+          <path class="arrow" d="M330,215 L295,215 L295,507 L260,507" fill="none" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah16)"
+                data-flow="marketdata" data-marketdata="3"
+                data-desc-marketdata="Market Data Service pushes to WebSocket Hub via Kafka market.ticks (or in-process broadcast). Hub batches ticks in 100 ms windows to protect the wire — dropped duplicate ticks are fine (AP)."></path>
+
+          <!-- M4 — WebSocket Hub → Clients (col 1 vertical UP - dashed arc back to R1) -->
+          <path class="arrow" d="M90,507 C 50,300 50,80 130,60" fill="none" stroke="var(--muted)" stroke-width="1.5" stroke-dasharray="4 3" marker-end="url(#ah16)"
+                data-flow="marketdata" data-marketdata="4"
+                data-desc-marketdata="WebSocket Hub fans out to 500 K concurrent clients subscribed to their symbols. Topic per symbol; average user watches 20 symbols. Batched 100 ms window keeps p99 tick-to-client under 50 ms."></path>
+
+          <!-- M5 — Market Data Service → Timestream (col 2 R3 → col 3 R6, dashed L-path via right gutter) -->
+          <path class="arrow" d="M570,215 L605,215 L605,432 L640,432" fill="none" stroke="var(--muted)" stroke-width="1.2" stroke-dasharray="4 3" marker-end="url(#ah16)"
+                data-flow="marketdata" data-marketdata="5"
+                data-desc-marketdata="Market Data Service also emits OHLCV candles (1m · 5m · 15m · 1h · 1D) to Timestream. Batch write every second. Used by charting UI + historical analytics."></path>
+
+          <!-- M6 — Trade Service → S3 Audit Log (col 2 R5 → col 3 R7, L-path via right gutter, dashed) -->
+          <path class="arrow" d="M570,370 L615,370 L615,507 L640,507" fill="none" stroke="var(--muted)" stroke-width="1.2" stroke-dasharray="4 3" marker-end="url(#ah16)"
+                data-flow="marketdata" data-marketdata="6"
+                data-desc-marketdata="Every order state change + every trade appended to S3 (WORM object-lock). Regulatory: SEC Rule 613 (CAT) requires 7-year immutable audit trail. Off critical path — Kafka is the source of truth for hot data."></path>
+
+          <!-- ═══════ non-flow infra edges (dashed, no numbers) ═══════ -->
+          <!-- Order Service → Portfolio Service (query positions before risk) -->
+          <line class="arrow" x1="260" y1="195" x2="330" y2="60" stroke="var(--muted)" stroke-width="1.2" stroke-dasharray="2 3" marker-end="url(#ah16)"></line>
+          <!-- Portfolio Service → Positions Store (dashed, read) -->
+          <line class="arrow" x1="570" y1="57" x2="640" y2="115" stroke="var(--muted)" stroke-width="1.2" stroke-dasharray="2 3" marker-end="url(#ah16)"></line>
+          <!-- Account Service → Positions Store (dashed) -->
+          <line class="arrow" x1="570" y1="132" x2="640" y2="132" stroke="var(--muted)" stroke-width="1.2" stroke-dasharray="2 3" marker-end="url(#ah16)"></line>
+          <!-- Trade Service → Trades DB (row 5 horizontal via gutter 2) -->
+          <line class="arrow" x1="570" y1="357" x2="640" y2="357" stroke="var(--muted)" stroke-width="1.2" stroke-dasharray="2 3" marker-end="url(#ah16)"></line>
+          <!-- Settlement → Positions Store (dashed diagonal, T+1 batch) -->
+          <line class="arrow" x1="570" y1="418" x2="640" y2="140" stroke="var(--muted)" stroke-width="1.2" stroke-dasharray="2 3" marker-end="url(#ah16)"></line>
+          <!-- Kafka → Notification Service (col 1 vertical, async fan-out) -->
+          <line class="arrow" x1="140" y1="384" x2="140" y2="405" stroke="var(--muted)" stroke-width="1.2" stroke-dasharray="2 3" marker-end="url(#ah16)"></line>
+          <!-- External Exchange → Settlement Service (T+1 clearing house link, short vertical) -->
+          <line class="arrow" x1="450" y1="480" x2="450" y2="459" stroke="var(--muted)" stroke-width="1.2" stroke-dasharray="2 3" marker-end="url(#ah16)"></line>
+
+          <!-- ═══════ NODES ═══════ -->
+
+          <!-- Col 1 — ingress + backbone -->
+          <g data-node style="cursor:pointer" data-title="Clients (Mobile · Web · FIX API)" data-detail="<b>Entry point.</b> iOS/Android apps, browsers, and institutional FIX 4.4 terminals. Sends REST calls with JWT + <b>Idempotency-Key</b> header, plus a WebSocket for market-data + order-updates.<br><b>Payload:</b> ~500 B per order · ~50 B per tick · ~5 KB per portfolio snapshot.<br><b>Retry:</b> exponential backoff on 5xx; deduped by idempotency key so a retry is safe."><rect x="20" y="30" width="240" height="54" rx="9" fill="var(--panel-2)" stroke="var(--eden)"></rect><text x="140" y="55" text-anchor="middle" fill="var(--eden)" font-size="13" font-weight="600">Clients</text><text x="140" y="72" text-anchor="middle" fill="var(--faint)" font-size="11">mobile · web · FIX 4.4</text></g>
+
+          <g data-node style="cursor:pointer" data-title="API Gateway + WAF" data-detail="<b>Role:</b> single ingress — JWT auth, per-user rate limit (<b>100 orders/sec</b>, 300 queries/min), request validation, TLS termination, WAF, DDoS (Shield/Cloud Armor).<br><b>Tech:</b> AWS API Gateway + WAF · Apigee + Cloud Armor · Azure APIM + Front Door.<br><b>Idempotency:</b> extracts <code>Idempotency-Key</code>, passes to Order Service. Duplicate keys within 24 h short-circuit to the stored response.<br><b>Financial services:</b> also handles WebSocket upgrade for /ws/market-data + /ws/orders."><rect x="20" y="105" width="240" height="54" rx="9" fill="var(--panel-2)" stroke="var(--border)"></rect><text x="140" y="130" text-anchor="middle" fill="var(--text)" font-size="13" font-weight="600">API Gateway + WAF</text><text x="140" y="147" text-anchor="middle" fill="var(--faint)" font-size="11">auth · rate-limit · WAF</text></g>
+
+          <g data-node style="cursor:pointer" data-title="Order Service (Facade)" data-detail="<b>Role:</b> stateless — validate order fields, persist to Aurora (PENDING_RISK), invoke Risk chain, block margin, publish to Kafka.<br><b>Class:</b> <code>TradingService.placeOrder(userId, symbol, side, type, price, qty)</code>. Wraps <code>OrderService</code>, <code>RiskService</code>, <code>AccountService</code>, <code>MatchingService</code> from the Java demo.<br><b>Scale:</b> 22 K OPS peak · 200 pods behind ALB · each ~110 OPS with 3× headroom.<br><b>NEVER</b> matches orders — it hands the accepted order off to Kafka and the engine takes over."><rect x="20" y="180" width="240" height="54" rx="9" fill="var(--panel-2)" stroke="var(--survivor)"></rect><text x="140" y="205" text-anchor="middle" fill="var(--survivor)" font-size="13" font-weight="600">Order Service</text><text x="140" y="222" text-anchor="middle" fill="var(--faint)" font-size="11">validate · persist · publish</text></g>
+
+          <g data-node style="cursor:pointer" data-title="Risk Engine (Chain of Responsibility)" data-detail="<b>Role:</b> pre-trade validation — reject bad orders BEFORE the engine sees them.<br><b>Chain (fail-fast):</b><br>1 · <code>CircuitBreakerStrategy</code> — price within +-20 % band? Trading halted?<br>2 · <code>MarginCheckStrategy</code> — <code>account.availableMargin >= price × qty × marginPercent</code> (CNC 1.0, MIS 0.20).<br>3 · <code>PositionLimitStrategy</code> — <code>currentQty + orderQty <= maxLimit</code> (10 % of free float).<br><b>Reads from Redis</b> (sub-ms) — never DDB direct.<br><b>Fail-fast:</b> first reject returns <code>RiskResult.reject(reason)</code>; downstream checks skipped."><rect x="20" y="255" width="240" height="54" rx="9" fill="var(--panel-2)" stroke="var(--fig)"></rect><text x="140" y="280" text-anchor="middle" fill="var(--fig)" font-size="13" font-weight="600">Risk Engine</text><text x="140" y="297" text-anchor="middle" fill="var(--faint)" font-size="11">margin · limit · circuit</text></g>
+
+          <g data-node style="cursor:pointer" data-title="Kafka (event bus · partition = symbol)" data-detail="<b>Role:</b> the central nervous system.<br><b>Topics:</b><br>• <code>orders.{symbol}</code> — one partition per hot symbol; RELIANCE orders arrive in submission order.<br>• <code>trades.{symbol}</code> — outgoing trades fan out to Trade Svc, Market Data Svc, Notifications, Audit.<br>• <code>market.ticks</code> — consolidated for WebSocket Hub.<br><b>Guarantees:</b> <b>acks=all</b>, replication=3, exactly-once producer for order service. Retention 24 h (hot) + 7 d cold.<br><b>Replay:</b> if the matching engine crashes, it consumes from the last committed offset to rebuild the order book."><rect x="20" y="330" width="240" height="54" rx="9" fill="var(--panel-2)" stroke="var(--warn)"></rect><text x="140" y="355" text-anchor="middle" fill="var(--warn)" font-size="13" font-weight="600">Kafka (event bus)</text><text x="140" y="372" text-anchor="middle" fill="var(--faint)" font-size="11">partition-key = symbol</text></g>
+
+          <g data-node style="cursor:pointer" data-title="Notification Service (async)" data-detail="<b>Role:</b> customer notifications on order events.<br><b>Events:</b> <code>notifyOrderFilled</code>, <code>notifyOrderPartialFill</code>, <code>notifyOrderRejected</code>, <code>notifyOrderCancelled</code>, <code>notifyTradeSettled</code>, price alerts, margin calls.<br><b>Consumer:</b> Kafka consumer group reading trades + order-updates; fans out to (a) push (FCM/APNs) (b) SMS (Twilio, margin-calls only) (c) email (SES).<br><b>Off critical path</b> — a 5 s late notification is fine; blocking a match on email is not."><rect x="20" y="405" width="240" height="54" rx="9" fill="var(--panel-2)" stroke="var(--survivor)"></rect><text x="140" y="430" text-anchor="middle" fill="var(--survivor)" font-size="13" font-weight="600">Notification Service</text><text x="140" y="447" text-anchor="middle" fill="var(--faint)" font-size="11">push · SMS · email · async</text></g>
+
+          <g data-node style="cursor:pointer" data-title="WebSocket Hub (500 K concurrent)" data-detail="<b>Role:</b> real-time push of ticks + order-updates to connected clients.<br><b>Topics:</b> per-symbol subscription; average user watches 20 symbols → ~10 M subscriptions total.<br><b>Batching:</b> 100 ms window per symbol → merges bursts into one message, drops duplicate LTPs. Tick-to-client p99 &lt; 50 ms.<br><b>Fan-out:</b> AWS API Gateway WebSocket + Lambda fan-out · GCP Cloud Run · Azure SignalR.<br><b>Backpressure:</b> slow client → drop oldest ticks (a stale tick is worse than a dropped one)."><rect x="20" y="480" width="240" height="54" rx="9" fill="var(--panel-2)" stroke="var(--eden)"></rect><text x="140" y="505" text-anchor="middle" fill="var(--eden)" font-size="13" font-weight="600">WebSocket Hub</text><text x="140" y="522" text-anchor="middle" fill="var(--faint)" font-size="11">fan-out · 100 ms batch</text></g>
+
+          <!-- Col 2 — services + engines -->
+          <g data-node style="cursor:pointer" data-title="Portfolio Service" data-detail="<b>Role:</b> compute + serve positions, holdings, P&amp;L.<br><b>Class:</b> <code>PortfolioService.updatePositionOnTrade(trade)</code> — updates buyer/seller position (qty, avg_cost) via injected <code>PnLStrategy</code> (FIFO for tax · AvgCost for display).<br><b>Reads:</b> DDB Positions Store · Redis LTP → mark-to-market for unrealized P&amp;L.<br><b>Writes:</b> DDB conditional update on trade event (idempotent by trade_id).<br><b>Query:</b> <code>GET /portfolio</code> returns holdings + unrealized + realized P&amp;L in one shot."><rect x="330" y="30" width="240" height="54" rx="9" fill="var(--panel-2)" stroke="var(--survivor)"></rect><text x="450" y="55" text-anchor="middle" fill="var(--survivor)" font-size="13" font-weight="600">Portfolio Service</text><text x="450" y="72" text-anchor="middle" fill="var(--faint)" font-size="11">positions · P&amp;L · FIFO</text></g>
+
+          <g data-node style="cursor:pointer" data-title="Account Service (balance · margin)" data-detail="<b>Role:</b> money movement — balance, blocked margin, deposits, withdrawals.<br><b>Class:</b> <code>AccountService.blockMargin(userId, amount)</code>, <code>releaseMargin</code>, <code>settleTradePayment</code>.<br><b>Invariant:</b> <code>balance + blocked_margin + used_margin = total_funds</code> (enforced at DB level).<br><b>DDB conditional write:</b> <code>UpdateItem ... IF available_margin >= :required</code> — no double-spend on concurrent orders.<br><b>Called by:</b> Order Service (block on ACCEPTED) · Trade Service (release excess) · Settlement Service (T+1 debit/credit)."><rect x="330" y="105" width="240" height="54" rx="9" fill="var(--panel-2)" stroke="var(--survivor)"></rect><text x="450" y="130" text-anchor="middle" fill="var(--survivor)" font-size="13" font-weight="600">Account Service</text><text x="450" y="147" text-anchor="middle" fill="var(--faint)" font-size="11">balance · margin · DDB CAS</text></g>
+
+          <g data-node style="cursor:pointer" data-title="Market Data Service" data-detail="<b>Role:</b> convert trades into public market data.<br><b>Class:</b> <code>MarketDataService.updateOnTrade(symbol, price, qty)</code> → updates LTP · high · low · volume · change%. <code>updateBidAsk(symbol, book)</code> → reads top-of-book from OrderBook.<br><b>Consumers:</b> reads <code>trades.{symbol}</code> from Kafka; writes to Redis (500 ms TTL) + Timestream (OHLCV batch every 1 s) + WebSocket Hub.<br><b>AP:</b> if Redis lags 500 ms, users see stale ticks briefly — but matching engine still uses the LIVE book, so no bad trades result."><rect x="330" y="180" width="240" height="54" rx="9" fill="var(--panel-2)" stroke="var(--survivor)"></rect><text x="450" y="205" text-anchor="middle" fill="var(--survivor)" font-size="13" font-weight="600">Market Data Service</text><text x="450" y="222" text-anchor="middle" fill="var(--faint)" font-size="11">LTP · OHLCV · fan-out</text></g>
+
+          <g data-node style="cursor:pointer" data-title="Matching Engine (the STAR · single-threaded per symbol)" data-detail="<b>The heart of the exchange.</b><br><b>Class:</b> <code>MatchingEngine.submitOrder(Order)</code> — routes to <code>OrderExecutionStrategy</code> (LimitOrderStrategy / MarketOrderStrategy) which reads the <code>OrderBook</code> for the symbol.<br><b>Algorithm:</b> <b>price-time priority</b> — best price wins; at same price, earliest order wins (FIFO). Partial fills sweep across price levels.<br><b>Concurrency:</b> ONE THREAD per symbol. Different symbols run on different cores. Zero locks. Deterministic — same input sequence → same output.<br><b>Latency:</b> in-memory match, no DB I/O on hot path. p99 &lt; 1 ms per match. LMAX Disruptor pattern.<br><b>Recovery:</b> on crash, replay orders.{symbol} from Kafka last-committed offset → same trades produced. Idempotent by order_id."><rect x="330" y="255" width="240" height="54" rx="9" fill="var(--panel-2)" stroke="var(--warn)" stroke-width="2"></rect><text x="450" y="280" text-anchor="middle" fill="var(--warn)" font-size="14" font-weight="700">Matching Engine</text><text x="450" y="297" text-anchor="middle" fill="var(--faint)" font-size="11">1 thread/symbol · price-time</text></g>
+
+          <g data-node style="cursor:pointer" data-title="Trade Service" data-detail="<b>Role:</b> persist trades + update order status + fan-out downstream.<br><b>Consumer:</b> reads <code>trades.{symbol}</code> from Kafka (consumer group per shard).<br><b>Writes:</b> <code>trades</code> table (Aurora PG) · <code>orders.status = FILLED/PARTIAL</code> · calls <code>PortfolioService.updatePositionOnTrade</code> · calls <code>AccountService</code> to release excess margin · S3 audit append.<br><b>Idempotency:</b> UNIQUE constraint on <code>trade_id</code> — replay after crash is a no-op.<br><b>Off critical path:</b> trade already happened in the engine + Kafka; this is just record-keeping."><rect x="330" y="330" width="240" height="54" rx="9" fill="var(--panel-2)" stroke="var(--survivor)"></rect><text x="450" y="355" text-anchor="middle" fill="var(--survivor)" font-size="13" font-weight="600">Trade Service</text><text x="450" y="372" text-anchor="middle" fill="var(--faint)" font-size="11">persist · fan-out · audit</text></g>
+
+          <g data-node style="cursor:pointer" data-title="Settlement Service (T+1 batch)" data-detail="<b>Role:</b> end-of-day netting — move real cash + real shares between clearing accounts.<br><b>Class:</b> <code>SettlementService.settleTradesForDay()</code>. Reads unsettled trades from repo, calls <code>AccountService.settleTradePayment(trade)</code> for each, marks trade SETTLED, notifies.<br><b>Netting:</b> if user buys 100 + sells 50 same day, only net 50 shares settle.<br><b>Timing:</b> T+1 in US (2023 change) · T+1 in India (2023 change) · runs at ~7 PM after market close.<br><b>Failure handling:</b> partial-settled → mark FAILED, escalate to ops; broker absorbs the risk (that's why margin is blocked)."><rect x="330" y="405" width="240" height="54" rx="9" fill="var(--panel-2)" stroke="var(--survivor)"></rect><text x="450" y="430" text-anchor="middle" fill="var(--survivor)" font-size="13" font-weight="600">Settlement Service · T+1</text><text x="450" y="447" text-anchor="middle" fill="var(--faint)" font-size="11">end-of-day netting batch</text></g>
+
+          <g data-node style="cursor:pointer" data-title="External Exchange / SIP feed" data-detail="<b>Context:</b> when the platform is a <b>broker</b> (Robinhood, Zerodha) not an exchange, orders are routed OUT to NASDAQ / NYSE / IEX via FIX 4.4. Fills come back via drop-copy.<br><b>SIP consolidation:</b> best bid/ask across exchanges (NBBO) — regulator requires trades executed at NBBO or better (Reg NMS).<br><b>In this canvas</b> we design as an <b>exchange</b> — the matching engine IS the exchange. If we were a broker, this node would be the primary path and the engine would be internal-only for dark-pool matches.<br><b>Feed:</b> multicast UDP (co-located) or Direct Connect TCP."><rect x="330" y="480" width="240" height="54" rx="9" fill="var(--panel-2)" stroke="var(--meta)"></rect><text x="450" y="505" text-anchor="middle" fill="var(--meta)" font-size="13" font-weight="600">External Exchange / SIP</text><text x="450" y="522" text-anchor="middle" fill="var(--faint)" font-size="11">FIX 4.4 · NBBO · Reg NMS</text></g>
+
+          <!-- Col 3 — data + external -->
+          <g data-node style="cursor:pointer" data-title="Orders DB (Aurora PostgreSQL · sharded)" data-detail="<b>Storage:</b> Aurora PostgreSQL — sharded by symbol range (RELIANCE on shard A, TCS on shard B, …).<br><b>Tables:</b> <code>orders</code> (order_id, user_id, symbol, side, type, price, qty, filled_qty, status, idempotency_key UNIQUE, placed_at TIMESTAMP(6))<br><b>Indexes:</b> (user_id, placed_at DESC) · (symbol, status) · (status, placed_at).<br><b>State machine:</b> PENDING_RISK → OPEN → PARTIAL/FILLED/CANCELLED/REJECTED.<br><b>Global DB:</b> RPO=0 cross-region replication for disaster recovery."><rect x="640" y="30" width="240" height="54" rx="9" fill="var(--panel-2)" stroke="var(--old)"></rect><text x="760" y="55" text-anchor="middle" fill="var(--old)" font-size="13" font-weight="600">Orders DB · Aurora PG</text><text x="760" y="72" text-anchor="middle" fill="var(--faint)" font-size="11">sharded by symbol · ACID</text></g>
+
+          <g data-node style="cursor:pointer" data-title="Positions Store (DynamoDB)" data-detail="<b>Storage:</b> DynamoDB — key = (user_id, symbol, product). Attrs: qty, avg_cost, invested_value, realized_pnl, blocked_margin, version.<br><b>Conditional writes:</b> <code>UpdateItem ... IF version = :old</code> — optimistic lock prevents lost updates on concurrent trade + margin block.<br><b>Access pattern:</b> read on risk check (get position + margin) · write on trade event (update qty + avg_cost).<br><b>Global Tables:</b> cross-region for DR + read latency.<br><b>Why DDB:</b> 22 K OPS on a single key-value pattern — Postgres row-locks fall over at 5 K QPS on hot user."><rect x="640" y="105" width="240" height="54" rx="9" fill="var(--panel-2)" stroke="var(--old)"></rect><text x="760" y="130" text-anchor="middle" fill="var(--old)" font-size="13" font-weight="600">Positions Store · DDB</text><text x="760" y="147" text-anchor="middle" fill="var(--faint)" font-size="11">key = (user, symbol) · CAS</text></g>
+
+          <g data-node style="cursor:pointer" data-title="Redis (LTP · risk cache · L2 book)" data-detail="<b>Storage:</b> ElastiCache Redis Cluster — hot data for the risk chain + display.<br><b>Keys:</b><br>• <code>md:{symbol}</code> — MarketData JSON (LTP, best bid/ask, volume, upper_circuit, lower_circuit). TTL 500 ms.<br>• <code>margin:{userId}</code> — available margin (write-through from DDB).<br>• <code>book:{symbol}:l2</code> — top 20 levels snapshot for display (updated 100 ms).<br>• <code>halt:{symbol}</code> — circuit-breaker halt flag.<br><b>AP:</b> stale cache OK for display; matching engine reads the LIVE book, not Redis. Redis lag ≠ bad trade."><rect x="640" y="180" width="240" height="54" rx="9" fill="var(--panel-2)" stroke="var(--old)"></rect><text x="760" y="205" text-anchor="middle" fill="var(--old)" font-size="13" font-weight="600">Redis · LTP + risk cache</text><text x="760" y="222" text-anchor="middle" fill="var(--faint)" font-size="11">md · margin · L2 snapshot</text></g>
+
+          <g data-node style="cursor:pointer" data-title="Order Book (in-memory · TreeMap)" data-detail="<b>Storage:</b> pure Java <code>OrderBook</code> in the matching-engine JVM — NEVER hits disk on the hot path.<br><b>Structure:</b><br>• <code>bids: TreeMap&lt;Double, PriceLevel&gt;</code> — <b>descending</b> by price (highest bid first).<br>• <code>asks: TreeMap&lt;Double, PriceLevel&gt;</code> — <b>ascending</b> by price (lowest ask first).<br>• Each <code>PriceLevel</code> = <code>LinkedList&lt;Order&gt;</code> FIFO queue (time priority).<br>• <code>orderIndex</code> map: order_id → (side, price) for O(log N) cancellation.<br><b>Size:</b> ~2 MB per liquid symbol · ~10 GB for all 5 K symbols — fits in RAM.<br><b>Recovery:</b> rebuild from Kafka <code>orders.{symbol}</code> replay + <code>trades.{symbol}</code> replay."><rect x="640" y="255" width="240" height="54" rx="9" fill="var(--panel-2)" stroke="var(--old)"></rect><text x="760" y="280" text-anchor="middle" fill="var(--old)" font-size="13" font-weight="600">Order Book · in-memory</text><text x="760" y="297" text-anchor="middle" fill="var(--faint)" font-size="11">TreeMap × 2 + FIFO queues</text></g>
+
+          <g data-node style="cursor:pointer" data-title="Trades DB (Aurora PG)" data-detail="<b>Storage:</b> Aurora PostgreSQL — <code>trades</code> table (trade_id PK, buy_order_id FK, sell_order_id FK, symbol, price, qty, traded_at TIMESTAMP(6), settlement_date, settlement_status).<br><b>Indexes:</b> (symbol, traded_at DESC) · (buyer_id, traded_at DESC) · (settlement_date, settlement_status).<br><b>Immutable:</b> once written, never updated (except settlement_status). Any correction = compensating trade.<br><b>Retention:</b> 7 years online (regulator) + ∞ in S3 Glacier."><rect x="640" y="330" width="240" height="54" rx="9" fill="var(--panel-2)" stroke="var(--old)"></rect><text x="760" y="355" text-anchor="middle" fill="var(--old)" font-size="13" font-weight="600">Trades DB · Aurora PG</text><text x="760" y="372" text-anchor="middle" fill="var(--faint)" font-size="11">immutable · 7-yr online</text></g>
+
+          <g data-node style="cursor:pointer" data-title="Timestream (OHLCV candles)" data-detail="<b>Storage:</b> Amazon Timestream · Azure Data Explorer · GCP BigQuery.<br><b>Tables:</b> ohlcv_1m, ohlcv_5m, ohlcv_15m, ohlcv_1h, ohlcv_1d — pre-aggregated candles.<br><b>Write:</b> Market Data Service emits candle every window boundary (batched).<br><b>Read:</b> charting UI fetches N candles in one range query. Memory store for last 24 h · magnetic store for history.<br><b>Alternative:</b> InfluxDB (self-hosted) or TimescaleDB (Postgres extension) for on-prem HFT."><rect x="640" y="405" width="240" height="54" rx="9" fill="var(--panel-2)" stroke="var(--old)"></rect><text x="760" y="430" text-anchor="middle" fill="var(--old)" font-size="13" font-weight="600">Timestream · candles</text><text x="760" y="447" text-anchor="middle" fill="var(--faint)" font-size="11">1m · 5m · 15m · 1h · 1D</text></g>
+
+          <g data-node style="cursor:pointer" data-title="S3 Audit Log (WORM · SEC Rule 613)" data-detail="<b>Storage:</b> S3 with Object Lock (WORM — Write Once Read Many). Every order state change + every trade appended as JSON line.<br><b>Retention:</b> 7 years (SEC Rule 613 CAT) · 5 years (SEBI) · immutable, tamper-evident.<br><b>Athena / BigQuery:</b> analysts can query the audit trail with SQL for surveillance / incident post-mortem.<br><b>Off hot path:</b> Trade Service writes async via Firehose; a delayed audit event never affects trading.<br><b>Encryption:</b> KMS + bucket-key + object-lock legal hold."><rect x="640" y="480" width="240" height="54" rx="9" fill="var(--panel-2)" stroke="var(--meta)"></rect><text x="760" y="505" text-anchor="middle" fill="var(--meta)" font-size="13" font-weight="600">S3 Audit Log · WORM</text><text x="760" y="522" text-anchor="middle" fill="var(--faint)" font-size="11">7-yr immutable · CAT</text></g>
+
+        </svg>
+      </div>
+      <div class="node-detail"><span class="nd-title">Click any component</span><div class="nd-body">Its role, storage, and consistency model appear here. Then use the buttons below to walk the <b>order</b> path (client → risk → Kafka → engine → trade) and the <b>market-data</b> path (engine → Redis → WebSocket → 500 K clients).</div></div>
+
+      <div class="flowctl" data-flowctl>
+        <button class="btn" data-flow="order">Place order — 10 steps (CP)</button>
+        <button class="btn" data-flow="marketdata">Market data — 6 steps (AP)</button>
+        <span style="flex:1"></span>
+        <button class="btn" data-flowstep="prev">◀ Prev</button>
+        <button class="btn" data-flowstep="next">Next ▶</button>
+      </div>
+      <div class="flowlabel" data-flowlabel>Pick <b>Place order</b> or <b>Market data</b>, then press "Next ▶" to walk the numbered flow one hop at a time.</div>
+
+      <div class="cloudmap">
+        <div class="kicker" style="margin-top:4px">Managed-service mapping — the same design on each cloud (real HFT often runs <b>on-prem or co-located</b>)</div>
+        <table class="cloudtable">
+          <thead><tr>
+            <th>Component</th>
+            <th><span class="hdrlogo"><span class="logochip"><img src="../assets/logos/aws.svg" alt="AWS"></span>AWS</span></th>
+            <th><span class="hdrlogo"><span class="logochip"><img src="../assets/logos/gcp.svg" alt="GCP"></span>GCP</span></th>
+            <th><span class="hdrlogo"><span class="logochip"><img src="../assets/logos/azure.svg" alt="Azure"></span>Azure</span></th>
+          </tr></thead>
+          <tbody>
+            <tr><td><b>API Gateway + WAF</b></td><td><img class="svcicon" src="../assets/logos/services/aws-apigw.svg" alt="">API Gateway + WAF + CloudFront</td><td><img class="svcicon" src="../assets/logos/services/gcp-apigw.svg" alt="">Cloud Endpoints + Apigee + Armor</td><td><img class="svcicon" src="../assets/logos/services/azure-apim.svg" alt="">API Management + Front Door</td></tr>
+            <tr><td>Order / Risk Service</td><td><img class="svcicon" src="../assets/logos/services/aws-ecs.svg" alt="">ECS Fargate (dedicated nodes)</td><td><img class="svcicon" src="../assets/logos/services/gcp-run.svg" alt="">GKE (node affinity)</td><td><img class="svcicon" src="../assets/logos/services/azure-aks.svg" alt="">AKS (dedicated pools)</td></tr>
+            <tr><td><b>Matching Engine</b></td><td>EC2 bare metal (i3en / c6i) · cluster placement · SR-IOV</td><td>Sole-tenant nodes · c3 · placement policy</td><td>Dedicated Host VMs · HPC SKUs</td></tr>
+            <tr><td>Orders / Trades DB</td><td><img class="svcicon" src="../assets/logos/services/aws-rds.svg" alt="">Aurora PostgreSQL Global</td><td><img class="svcicon" src="../assets/logos/services/gcp-cloudsql.svg" alt="">Cloud SQL / AlloyDB</td><td><img class="svcicon" src="../assets/logos/services/azure-sql.svg" alt="">Azure SQL</td></tr>
+            <tr><td>Positions store</td><td><img class="svcicon" src="../assets/logos/services/aws-dynamodb.svg" alt="">DynamoDB (conditional CAS)</td><td><img class="svcicon" src="../assets/logos/services/gcp-bigtable.svg" alt="">Bigtable / Firestore</td><td><img class="svcicon" src="../assets/logos/services/azure-cosmos.svg" alt="">Cosmos DB</td></tr>
+            <tr><td>Market data cache</td><td><img class="svcicon" src="../assets/logos/services/aws-elasticache.svg" alt="">ElastiCache Redis (cluster)</td><td><img class="svcicon" src="../assets/logos/services/gcp-memorystore.svg" alt="">Memorystore Redis</td><td><img class="svcicon" src="../assets/logos/services/azure-redis.svg" alt="">Azure Cache for Redis</td></tr>
+            <tr><td>Event bus (orders · trades)</td><td><img class="svcicon" src="../assets/logos/services/aws-msk.svg" alt="">MSK Kafka</td><td><img class="svcicon" src="../assets/logos/services/gcp-pubsub.svg" alt="">Pub/Sub</td><td><img class="svcicon" src="../assets/logos/services/azure-eventhubs.svg" alt="">Event Hubs (Kafka)</td></tr>
+            <tr><td>Time-series (OHLCV)</td><td><img class="svcicon" src="../assets/logos/services/aws-redshift.svg" alt="">Timestream / Redshift</td><td><img class="svcicon" src="../assets/logos/services/gcp-bigquery.svg" alt="">BigQuery + Bigtable</td><td><img class="svcicon" src="../assets/logos/services/azure-synapse.svg" alt="">Data Explorer (ADX)</td></tr>
+            <tr><td>WebSocket fan-out</td><td><img class="svcicon" src="../assets/logos/services/aws-apigw.svg" alt="">API Gateway WebSocket</td><td><img class="svcicon" src="../assets/logos/services/gcp-run.svg" alt="">Cloud Run / Firebase RTDB</td><td><img class="svcicon" src="../assets/logos/services/azure-notifhub.svg" alt="">SignalR Service</td></tr>
+            <tr><td>Audit log (WORM · 7 yr)</td><td><img class="svcicon" src="../assets/logos/services/aws-s3.svg" alt="">S3 + Object Lock + Athena</td><td><img class="svcicon" src="../assets/logos/services/gcp-cloudstorage.svg" alt="">Cloud Storage + BigQuery</td><td><img class="svcicon" src="../assets/logos/services/azure-blob.svg" alt="">Blob + Immutable Policy</td></tr>
+            <tr><td>Notifications</td><td><img class="svcicon" src="../assets/logos/services/aws-sns.svg" alt="">SNS + SES</td><td><img class="svcicon" src="../assets/logos/services/gcp-pubsub.svg" alt="">Pub/Sub + Cloud Functions</td><td><img class="svcicon" src="../assets/logos/services/azure-notifhub.svg" alt="">Notification Hubs</td></tr>
+          </tbody>
+        </table>
+        <p class="muted" style="margin-top:8px"><b>The co-location reality:</b> for tick-to-trade &lt; 50 μs (HFT / market-maker territory), you run <b>bare-metal servers in the exchange data-centre</b> with FPGA NICs, kernel-bypass (DPDK / Solarflare Onload), and Direct Connect / Interconnect to the matching gateway. The cloud table above is <b>the retail broker / small exchange stack</b> — Robinhood-scale, not Citadel Securities-scale. HFT firms use cloud only for research and post-trade.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- D · API -->
+  <section>
+    <div class="sec-h"><span class="n">D</span><h2>API design</h2><span class="tag">REST + WebSocket + FIX 4.4</span></div>
+    <table>
+      <thead><tr><th>Endpoint</th><th>Purpose</th><th>Response</th></tr></thead>
+      <tbody>
+        <tr><td><code>POST /orders</code></td><td><b>Place order.</b> Headers: <code>Authorization: Bearer</code>, <code>Idempotency-Key</code>. Body: <code>{symbol, side, type, price, trigger_price, quantity, validity, product}</code></td><td>201 + <code>{order_id, status: PENDING_RISK_CHECK, placed_at}</code> · 400 <code>INSUFFICIENT_MARGIN</code></td></tr>
+        <tr><td><code>DELETE /orders/{id}</code></td><td>Cancel a resting order (state-machine guarded)</td><td>200 <code>CANCEL_REQUESTED</code> · 409 <code>ORDER_ALREADY_FILLED</code></td></tr>
+        <tr><td><code>PUT /orders/{id}</code></td><td>Modify price/qty of resting limit order (= cancel + re-place, loses time priority)</td><td>200 + new order_id</td></tr>
+        <tr><td><code>GET /orders?status=&amp;symbol=&amp;from=</code></td><td>Order history for user</td><td>200 + <code>{orders[], total, page, page_size}</code></td></tr>
+        <tr><td><code>GET /portfolio</code></td><td>Positions + realized/unrealized P&amp;L</td><td>200 + <code>{holdings[], summary}</code></td></tr>
+        <tr><td><code>GET /market-data/{symbol}</code></td><td>Snapshot: LTP, OHLC, bid/ask, volume, circuit limits</td><td>200 + full market data</td></tr>
+        <tr><td><code>GET /market-data/{symbol}/depth</code></td><td>Order book depth — top 5/20 levels each side</td><td>200 + <code>{bids[], asks[], ltp, timestamp}</code></td></tr>
+        <tr><td><code>WS /ws/market-data</code></td><td>Stream ticks. Client subscribes with <code>{action: "subscribe", symbols: [...]}</code></td><td>Server pushes <code>{type: "tick", symbol, ltp, bid, ask, volume, timestamp}</code></td></tr>
+        <tr><td><code>WS /ws/orders</code></td><td>Stream order-update &amp; trade events for this user</td><td>Server pushes <code>{type: "order_update"/"trade", ...}</code></td></tr>
+        <tr><td><b>FIX 4.4</b></td><td>Institutional API — <code>NewOrderSingle (D)</code>, <code>OrderCancelRequest (F)</code>, <code>ExecutionReport (8)</code></td><td>Binary protocol · session persistent · sequence numbers</td></tr>
+      </tbody>
+    </table>
+    <p class="muted"><b>Idempotency contract:</b> every write accepts <code>Idempotency-Key</code>. Server stores <code>(key → response, order_id)</code> in Redis with 24 h TTL. A retry after network glitch returns the original response — never a second order.</p>
+  </section>
+
+  <!-- E · DATA MODEL -->
+  <section>
+    <div class="sec-h"><span class="n">E</span><h2>Data model — write path (CP) vs read path (AP)</h2><span class="tag">right store per access pattern</span></div>
+    <div class="grid g2">
+      <div class="card">
+        <div class="kicker">write path (Aurora PG · DynamoDB)</div>
+<pre class="code">Order                       <span class="cm">// Aurora PG, sharded by symbol</span>
+  order_id (PK)             <span class="cm">// "ORD-20260426-000001"</span>
+  user_id, account_id
+  symbol, side, order_type  <span class="cm">// enums</span>
+  price, trigger_price      <span class="cm">// nullable for MARKET</span>
+  quantity, filled_quantity
+  status                    <span class="cm">// state machine enum</span>
+  idempotency_key (UNIQUE)  <span class="cm">// dedup writes</span>
+  placed_at, accepted_at    <span class="cm">// TIMESTAMP(6) μs precision</span>
+  filled_at, cancelled_at
+
+Trade                       <span class="cm">// Aurora PG, immutable</span>
+  trade_id (PK)             <span class="cm">// "TRD-20260426-000001"</span>
+  buy_order_id, sell_order_id (FK)
+  symbol, price, quantity
+  traded_at                 <span class="cm">// TIMESTAMP(6)</span>
+  settlement_date           <span class="cm">// T+1</span>
+  settlement_status         <span class="cm">// PENDING/SETTLED/FAILED</span>
+
+Position                    <span class="cm">// DynamoDB</span>
+  (user_id, symbol, product) <span class="cm">// composite PK</span>
+  quantity, avg_cost
+  realized_pnl
+  version                   <span class="cm">// optimistic lock (CAS)</span>
+
+Account                     <span class="cm">// DynamoDB</span>
+  account_id (PK)
+  balance, blocked_margin
+  used_margin, version
+  <span class="cm">// invariant: balance + blocked + used = total</span></pre>
+      </div>
+      <div class="card">
+        <div class="kicker">read path (Redis · in-memory · Timestream)</div>
+<pre class="code">Redis md:{symbol}           <span class="cm">// JSON blob, 500 ms TTL</span>
+  ltp, open, high, low
+  best_bid, best_ask
+  volume, upper_circuit
+  updated_at
+
+Redis book:{symbol}:l2      <span class="cm">// top 20 levels each side</span>
+  bids: [{price, qty, orders}, ...]
+  asks: [{price, qty, orders}, ...]
+  <span class="cm">// refreshed every 100 ms from engine</span>
+
+OrderBook (JVM heap)        <span class="cm">// matching engine ONLY</span>
+  bids: TreeMap&lt;Double, PriceLevel&gt;
+        <span class="cm">// Comparator.reverseOrder()</span>
+  asks: TreeMap&lt;Double, PriceLevel&gt;
+        <span class="cm">// natural order (asc)</span>
+  PriceLevel: LinkedList&lt;Order&gt;
+        <span class="cm">// FIFO — time priority</span>
+  orderIndex: Map&lt;String, Loc&gt;
+        <span class="cm">// O(log N) cancel</span>
+
+Timestream ohlcv_1m         <span class="cm">// TS-series</span>
+  (symbol, ts) → o, h, l, c, v
+  <span class="cm">// 5 aggregations: 1m, 5m, 15m, 1h, 1D</span>
+
+S3 audit/                    <span class="cm">// WORM append-only</span>
+  yyyy/mm/dd/hh/orders.ndjson
+  yyyy/mm/dd/hh/trades.ndjson
+  <span class="cm">// 7-year retention (SEC Rule 613)</span></pre>
+      </div>
+    </div>
+    <div class="callout tip"><b>The golden rule:</b> <b>cache for display, read the live book for matching</b>. Redis <code>md:{symbol}</code> being 300 ms stale is fine for a watchlist tick — but the matching engine ALWAYS matches against its in-memory <code>OrderBook</code>, never against Redis. If Redis lags, users see a stale LTP briefly; nobody gets a bad fill because the engine's book is the source of truth.</div>
+  </section>
+
+  <!-- F · KEY CHOICES -->
+  <section>
+    <div class="sec-h"><span class="n">F</span><h2>Key design choices (deep-dived on canvas 3)</h2><span class="tag">defend these</span></div>
+    <div class="grid g3">
+      <div class="card"><div class="kicker">matching</div><h3>Single-threaded per symbol</h3><p class="muted">One thread per ticker. Zero locks, deterministic, replayable from Kafka. Different symbols parallelize across cores. LMAX Disruptor pattern. <span class="run">→ canvas 3 · matching architecture</span></p></div>
+      <div class="card"><div class="kicker">correctness</div><h3>Price-time priority (FIFO at price)</h3><p class="muted">Best price wins; at same price, earliest order fills first. TreeMap (bids desc / asks asc) + LinkedList queue per level. Universal rule at NASDAQ / NYSE. <span class="run">→ canvas 3 · correctness</span></p></div>
+      <div class="card"><div class="kicker">CAP split</div><h3>Orders CP · Market data AP</h3><p class="muted">Orders + trades = CP (single-writer, Kafka acks=all, Aurora sync repl). Market data = AP (Redis TTL 500 ms, dropped-tick OK). Boundary at the trader's screen. <span class="run">→ canvas 3 · CAP</span></p></div>
+      <div class="card"><div class="kicker">pre-trade</div><h3>Risk before the book</h3><p class="muted">Chain of responsibility: MarginCheck → PositionLimit → CircuitBreaker. Reads Redis (sub-ms). Fail-fast. NEVER let a rejectable order into the engine. <span class="run">→ canvas 3 · risk checks</span></p></div>
+      <div class="card"><div class="kicker">partitioning</div><h3>Kafka partition = symbol</h3><p class="muted">All RELIANCE orders → one Kafka partition → ONE engine thread. Ordered delivery per symbol. Add new engine node = give it a partition. Hot symbol on its own beefy box. <span class="run">→ canvas 3 · sharding</span></p></div>
+      <div class="card"><div class="kicker">recovery</div><h3>Kafka replay = the WAL</h3><p class="muted">Engine crashes → new leader replays <code>orders.{symbol}</code> from last committed offset → same trades. Same input, same output. In-memory book rebuilds in seconds. <span class="run">→ canvas 3 · leader-follower</span></p></div>
+    </div>
+  </section>
+
+  <!-- GLOSSARY -->
+  <section>
+    <div class="sec-h"><span class="n">§</span><h2>Glossary — one-liners</h2></div>
+    <div class="grid g2">
+      <div class="card"><table><tbody>
+        <tr><td><b>Order book</b></td><td>per-symbol pair of sorted collections: bids desc + asks asc, each price level = FIFO queue</td></tr>
+        <tr><td><b>Price-time priority</b></td><td>match best price first; at same price, earliest order fills first (universal exchange rule)</td></tr>
+        <tr><td><b>Spread</b></td><td>best ask − best bid; narrow = liquid, wide = illiquid</td></tr>
+        <tr><td><b>LTP</b></td><td>Last Traded Price — most recent execution price</td></tr>
+        <tr><td><b>NBBO</b></td><td>National Best Bid &amp; Offer — Reg NMS requires fills at NBBO or better across US venues</td></tr>
+        <tr><td><b>Circuit breaker</b></td><td>price band (typically ±20 %) — order rejected if outside; market-wide halt on index moves</td></tr>
+      </tbody></table></div>
+      <div class="card"><table><tbody>
+        <tr><td><b>Market vs limit order</b></td><td>MARKET = fill at any price · LIMIT = fill only at price-or-better; unfilled limits REST in book</td></tr>
+        <tr><td><b>Partial fill</b></td><td>only some of the quantity matched; remainder either rests (limit) or cancels (market)</td></tr>
+        <tr><td><b>T+1 settlement</b></td><td>trade today, cash + shares change hands next business day (US &amp; India 2023)</td></tr>
+        <tr><td><b>SIP</b></td><td>Securities Information Processor — consolidates quotes across all US venues into NBBO</td></tr>
+        <tr><td><b>FIX 4.4</b></td><td>Financial Information eXchange — the tag-value protocol used by institutional order routing</td></tr>
+        <tr><td><b>SEC Rule 613 (CAT)</b></td><td>Consolidated Audit Trail — every order &amp; state change must be reported for 7 years</td></tr>
+      </tbody></table></div>
+    </div>
+  </section>
+
+  <footer>
+    <p>Use case 16 · Stock Trading (NASDAQ · NYSE · Robinhood) — Canvas 1 of 3 (HLD). Grounded in <code>16-stock-trading/docs/hld/HIGH_LEVEL_DESIGN.md</code> and the real Java under <code>16-stock-trading/src/</code>.</p>
+    <p class="run">This use case: HLD · <a href="lld.html">Canvas 2 · LLD</a> · <a href="deepdive.html">Canvas 3 · Deep-dive &amp; Trade-offs</a> &nbsp;|&nbsp; <a href="../index.html">Hub</a></p>
+  </footer>
+
+</div>
+<script src="../assets/canvas.js"></script>
+</body>
+</html>

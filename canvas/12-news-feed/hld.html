@@ -154,10 +154,11 @@
 
           <!-- Engagement -> Kafka (side) -->
           <line class="arrow" x1="238" y1="220" x2="618" y2="200" stroke="var(--muted)" stroke-width="2" stroke-dasharray="4 3" marker-end="url(#ah)"></line>
-          <text x="360" y="212" fill="var(--faint)" font-size="9">engagement events → Kafka → counter increments + affinity update</text>
+          <text class="edge-label" x="250" y="207">engagement events</text>
+          <text class="edge-label" x="570" y="196" text-anchor="middle">count · affinity</text>
 
           <!-- Static labels -->
-          <text x="785" y="46" fill="var(--faint)" font-size="9">"3 new posts" banner</text>
+          <text class="edge-label" x="810" y="28" text-anchor="middle">"N new posts" banner</text>
 
           <!-- ============ NODES ============ -->
           <g data-node style="cursor:pointer" data-title="Clients (Web / Mobile / API)" data-detail="<b>Role:</b> browser, iOS/Android app, or 3rd-party API client. Publishes posts, requests feed, opens WebSocket for real-time updates. Renders new-posts banner and infinite-scroll pagination.<br><b>Payload:</b> ~50 KB per feed page (20 posts hydrated with author + top comments)."><rect x="12" y="36" width="88" height="48" rx="9" fill="var(--panel-2)" stroke="var(--eden)"></rect><text x="56" y="60" text-anchor="middle" fill="var(--eden)" font-size="12" font-weight="600">Clients</text><text x="56" y="75" text-anchor="middle" fill="var(--faint)" font-size="10">web · mobile</text></g>

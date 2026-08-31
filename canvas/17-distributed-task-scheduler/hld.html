@@ -1,0 +1,526 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>17 · Distributed Task Scheduler — HLD</title>
+<link rel="stylesheet" href="../assets/canvas.css">
+</head>
+<body>
+
+<div class="wrap">
+
+  <header class="hero">
+    <h1>Distributed Task Scheduler (Airflow / Celery / Temporal) — High-Level Design</h1>
+    <div class="sub">Use case 17 · Canvas 1 of 3. One <b>leader-elected scheduler</b> owns a priority queue and dispatches tasks to a pool of ~1 000 workers; a <b>DAG resolver</b> (Kahn's algorithm) unblocks tasks whose upstreams have completed; a <b>retry engine</b> (exponential backoff + jitter) handles transient failures; a <b>failover service</b> reassigns tasks from dead workers. Correctness is defended by idempotency keys, terminal-state guards, and fencing tokens — at-least-once delivery + idempotent handler = <b>effective exactly-once</b>. Click a component, then step the <i>submit</i> and <i>execute + retry</i> flows.</div>
+    <div class="badges">
+      <span class="badge lvl">Use case 17 · HLD</span>
+      <span class="badge">Canvas 1 of 3</span>
+      <span class="badge">interactive</span>
+      <span class="badge">Bully election · Kahn's algorithm</span>
+      <span class="badge">10 M tasks/day · 5.8 K TPS burst</span>
+    </div>
+    <div class="legend">
+      <span><i class="dot" style="background:var(--eden)"></i> client / entry</span>
+      <span><i class="dot" style="background:var(--survivor)"></i> control-plane workers</span>
+      <span><i class="dot" style="background:var(--fig)"></i> engine · strategies</span>
+      <span><i class="dot" style="background:var(--old)"></i> data stores</span>
+      <span><i class="dot" style="background:var(--warn)"></i> STAR · retry · async</span>
+      <span><i class="dot" style="background:var(--stack)"></i> metrics · dashboard</span>
+      <span><i class="dot" style="background:var(--meta)"></i> alerts · dead-letter</span>
+    </div>
+  </header>
+
+  <!-- A · PROBLEM & REQUIREMENTS -->
+  <section>
+    <div class="sec-h"><span class="n">A</span><h2>Problem &amp; requirements</h2><span class="tag">background jobs at scale — Airflow / Celery / Temporal</span></div>
+    <div class="grid g2">
+      <div class="card">
+        <div class="kicker">functional</div>
+        <ul class="tight">
+          <li><b>Submit tasks</b> — one-time, delayed, cron (5-field), or DAG-dependent; fields: <code>name, priority, payload, maxRetries, timeoutMillis, dependsOn[]</code>.</li>
+          <li><b>Priority scheduling</b> — <code>CRITICAL &gt; HIGH &gt; MEDIUM &gt; LOW</code>; FIFO tie-break by <code>createdAt</code>.</li>
+          <li><b>DAG dependencies</b> — Kahn's topological sort; DFS three-colour cycle detection at submission time.</li>
+          <li><b>Worker pool management</b> — register / deregister; 5 s heartbeat; load + capacity tracking; tag affinity ("gpu", "high-memory").</li>
+          <li><b>Assignment strategies</b> — Round-Robin (homogeneous) or Least-Loaded (heterogeneous), pluggable via Strategy pattern.</li>
+          <li><b>Retry with backoff</b> — <code>min(1 s · 2^(n-1), 30 s) × jitter(0.9–1.1)</code>; after <code>maxRetries</code> → Dead-Letter Queue.</li>
+          <li><b>Cron + delayed scheduling</b> — cron expression fires on <code>tick()</code>; delayed tasks wait for <code>scheduledAt</code>.</li>
+          <li><b>Leader election</b> — Bully algorithm for scheduler coordinator (interview); Raft/etcd in production.</li>
+          <li><b>Worker failover</b> — heartbeat &gt; 30 s stale → mark DEAD → reset RUNNING tasks → reassign to healthy worker.</li>
+          <li><b>Task cancellation</b> — allowed only in <code>PENDING / QUEUED / ASSIGNED</code> (not <code>RUNNING</code> or terminal).</li>
+          <li><b>Monitoring dashboard</b> — task counts by status, worker utilisation, throughput, failure/retry rate, queue depth.</li>
+        </ul>
+      </div>
+      <div class="card">
+        <div class="kicker">non-functional</div>
+        <ul class="tight">
+          <li><b>Task durability</b> — zero data loss: persist to Task Repo <i>before</i> ACK to client.</li>
+          <li><b>Exactly-once effect</b> — idempotency key + terminal-state guard + fencing token (at-least-once + idempotent handler).</li>
+          <li><b>Availability</b> 99.99 % — infrastructure service; downstream systems depend on it.</li>
+          <li><b>Throughput</b> — 10 M tasks/day, ~116 TPS avg, ~1 160 TPS peak, ~5 800 TPS burst.</li>
+          <li><b>Scheduling latency</b> p99 &lt; 100 ms (queued → assigned).</li>
+          <li><b>Submit latency</b> p99 &lt; 50 ms (API to ACK).</li>
+          <li><b>Leader failover</b> p99 &lt; 5 s · <b>worker failover</b> p99 &lt; 30 s (heartbeat timeout).</li>
+          <li><b>Retry correctness</b> — exp backoff + jitter to break synchronised retry storms.</li>
+          <li><b>Horizontal scale</b> — add workers with no restart; HPA on queue depth.</li>
+          <li><b>Retention</b> — 30 days execution history (audit + debugging).</li>
+          <li><b>CAP</b> — <b>CP</b> for task state / assignment / leader (correctness); <b>AP</b> for monitoring / logs (always visible).</li>
+        </ul>
+      </div>
+    </div>
+    <div class="callout tip"><b>Why this problem is hard:</b> every large system needs background jobs (emails, ETL, ML training, payments). A single-machine <code>cron</code> has no priority, no dependencies, no retries, no observability, and dies with the box. A distributed scheduler must pick <b>exactly one coordinator</b> (else duplicate dispatch), preserve <b>task ordering under priority</b> (else starvation), handle <b>DAG dependencies</b> (else deadlocks), and never double-execute (else double-charge a customer). These are the exact staff-engineer distributed-systems primitives interviewers probe.</div>
+  </section>
+
+  <!-- B · ESTIMATION -->
+  <section>
+    <div class="sec-h"><span class="n">B</span><h2>Capacity estimation</h2><span class="tag">10 K clients · 10 M tasks/day · 1 000 workers</span></div>
+    <div class="chips">
+      <div class="chip"><span class="k">Registered clients</span><span class="v">10 000</span></div>
+      <div class="chip"><span class="k">Daily task submissions</span><span class="v">10 M</span></div>
+      <div class="chip"><span class="k">TPS (avg)</span><span class="v">10 M / 86 400 ≈ 116/s</span></div>
+      <div class="chip"><span class="k">TPS (peak · 10×)</span><span class="v">~1 160/s</span></div>
+      <div class="chip"><span class="k">TPS (burst · 50×)</span><span class="v">~5 800/s</span></div>
+      <div class="chip"><span class="k">Worker fleet</span><span class="v">1 000 · ~4 slots each</span></div>
+      <div class="chip"><span class="k">Concurrent executions</span><span class="v">1 000 × 4 = 4 000</span></div>
+      <div class="chip"><span class="k">Avg exec time</span><span class="v">30 s (max 1 h)</span></div>
+      <div class="chip"><span class="k">Queue depth (steady)</span><span class="v">116 × 30 ≈ 3 480 tasks</span></div>
+      <div class="chip"><span class="k">Queue depth (burst)</span><span class="v">5 800 × 30 ≈ 174 K (~174 MB)</span></div>
+      <div class="chip"><span class="k">DAG depth · width</span><span class="v">50 levels · 500 parallel</span></div>
+      <div class="chip"><span class="k">Cron tasks</span><span class="v">100 000 recurring</span></div>
+      <div class="chip"><span class="k">Scheduler nodes</span><span class="v">3–5 (leader + followers)</span></div>
+      <div class="chip"><span class="k">Storage — tasks</span><span class="v">10 M × 1 KB = 10 GB/day</span></div>
+      <div class="chip"><span class="k">Storage — executions</span><span class="v">12 M × 500 B = 6 GB/day</span></div>
+      <div class="chip"><span class="k">Total storage</span><span class="v">~16 GB/day · ~480 GB/month</span></div>
+      <div class="chip"><span class="k">Retention</span><span class="v">30 days (audit)</span></div>
+      <div class="chip"><span class="k">Network total</span><span class="v">&lt; 5 MB/s (dispatch + hb + metrics)</span></div>
+    </div>
+    <div class="callout tip"><b>Why the numbers seem small but aren't:</b> 116 TPS in isolation is trivial — but each task involves a <b>persist (durable) → enqueue (priority) → dispatch (assignment) → execute (heartbeat) → record (audit)</b> pipeline where <b>every step must be exactly-once-effective</b>. A double-executed payment task is a double-charge; a lost email task is an SLA breach. The scale of coordination is what makes it a staff-level problem, not raw QPS.</div>
+    <div class="callout warn"><b>Peak vs burst is the interview trap:</b> peak 1 160 TPS is a normal daily maximum; burst 5 800 TPS happens when a batch job submits 100 K tasks at once. The queue must absorb the burst (174 K entries = 174 MB — fits in RAM), the worker pool must NOT be provisioned for burst (that would be 8 700 workers idle 99 % of the time), and the retry engine must NOT synchronise (else the downstream service dies of a thundering herd on top of the burst).</div>
+  </section>
+
+  <!-- C · INTERACTIVE ARCHITECTURE -->
+  <section data-flowscope>
+    <div class="sec-h"><span class="n">C</span><h2>Architecture — click components, then step both flows</h2><span class="tag">Bully-elected leader · priority queue · DAG · retry · failover</span></div>
+    <div>
+      <div class="arch">
+        <svg viewBox="0 0 900 560" width="100%" style="max-width:900px" role="img" aria-label="Distributed task scheduler architecture">
+          <defs>
+            <marker id="ah17" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" fill="var(--muted)"></path></marker>
+            <marker id="ah17w" markerWidth="10" markerHeight="10" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" fill="var(--warn)"></path></marker>
+          </defs>
+          <!-- Grid: 3 cols (x=20, x=330, x=640 · w=240 each), 6 rows (y=30, 110, 190, 270, 350, 430 · h=54).
+               Gutters at x=260-330 (70 px) and x=570-640 (70 px). Row-gaps 26 px.
+               Bottom margin y=484-560 (76 px) used for long L-paths from Failover Service. -->
+
+          <!-- ═══════ SUBMIT flow (7 numbered arrows) ═══════ -->
+          <!-- S1 — Clients → API Gateway (vertical, col 1 row-gap 1-2) -->
+          <line class="arrow" x1="140" y1="84" x2="140" y2="110" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah17)"
+                data-flow="submit" data-submit="1"
+                data-desc-submit="Client (SDK / CLI / partner API) sends POST /api/v1/tasks with an Idempotency-Key header and the task payload (priority, payload, maxRetries, dependsOn[]). Deduplicated by key for 24 h."></line>
+
+          <!-- S2 — API Gateway → Scheduler Leader (vertical, col 1 row-gap 2-3) -->
+          <line class="arrow" x1="140" y1="164" x2="140" y2="190" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah17)"
+                data-flow="submit" data-submit="2"
+                data-desc-submit="Gateway validates JWT, applies rate limit (100 tasks/s per client), checks the idempotency store, then forwards to the current Scheduler Leader. Followers redirect if hit directly."></line>
+
+          <!-- S3 — Scheduler Leader → Task Repo (L via gutter1 x=295, row3 → row5) -->
+          <path class="arrow" d="M 260,220 L 295,220 L 295,377 L 330,377" fill="none" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah17)"
+                data-flow="submit" data-submit="3"
+                data-desc-submit="Leader persists the task to Postgres with status=PENDING and returns 201 to the client. Durability rule: NEVER ACK before the row is committed — a crash after ACK but before persist would silently lose the task."></path>
+
+          <!-- S4 — Scheduler Leader → Task Queue (L via gutter1 x=310, row3 → row1) -->
+          <path class="arrow" d="M 260,214 L 310,214 L 310,57 L 330,57" fill="none" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah17)"
+                data-flow="submit" data-submit="4"
+                data-desc-submit="Leader enqueues the task into the in-memory PriorityQueue and transitions status → QUEUED. Comparator: priority DESC, then createdAt ASC. Dequeue is O(log n)."></path>
+
+          <!-- S5 — DAG Resolver → Task Queue (short vertical, col 2 row-gap 1-2, upward) -->
+          <line class="arrow" x1="450" y1="110" x2="450" y2="84" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah17)"
+                data-flow="submit" data-submit="5"
+                data-desc-submit="Every scheduler tick (1–5 s), the DAG resolver calls getReadyTasks(completedSet): any task whose upstream IDs are all in COMPLETED is promoted from waitingOnDeps into the priority queue."></line>
+
+          <!-- S6 — Assignment Strategy → Worker Pool (L via gutter2 x=605, row3 → row2) -->
+          <path class="arrow" d="M 570,213 L 605,213 L 605,137 L 640,137" fill="none" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah17)"
+                data-flow="submit" data-submit="6"
+                data-desc-submit="Assignment strategy picks the worker: Round-Robin uses counter.getAndIncrement() % workers.size() (O(1)); Least-Loaded returns min(currentLoad) breaking ties by registeredAt (O(n))."></path>
+
+          <!-- ★ S7 — Scheduler Leader → Worker Pool (STAR — stepped via top margin y=15) -->
+          <path class="arrow" d="M 265,205 L 265,15 L 760,15 L 760,110" fill="none" stroke="var(--warn)" stroke-width="2.5" marker-end="url(#ah17w)"
+                data-flow="submit" data-submit="7"
+                data-desc-submit="Leader dispatches the task to the chosen worker: increments the worker's load, transitions the task ASSIGNED → RUNNING on ACK, and stamps a fencing token that later writes must match."></path>
+          <text class="edge-label" x="700" y="10" text-anchor="middle">dispatch (★ fencing token)</text>
+
+          <!-- ═══════ EXECUTE + RETRY flow (7 numbered arrows) ═══════ -->
+          <!-- E1 — Worker Pool → Execution Repo (L via gutter2 x=605, row2 → row6) -->
+          <path class="arrow" d="M 640,150 L 605,150 L 605,457 L 570,457" fill="none" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah17)"
+                data-flow="execute" data-execute="1"
+                data-desc-execute="Worker creates a TaskExecution row (attempt #N) in Postgres — UNIQUE(task_id, attempt_number) prevents two workers from claiming the same attempt. Row includes worker_id, start_time, and the fencing token."></path>
+
+          <!-- E2 — Worker Pool → Task Repo (L via gutter2 x=625, row2 → row5) -->
+          <path class="arrow" d="M 640,140 L 625,140 L 625,377 L 570,377" fill="none" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah17)"
+                data-flow="execute" data-execute="2"
+                data-desc-execute="On terminal outcome the worker updates the Task row: RUNNING → COMPLETED (with result) or RUNNING → FAILED (with error). Optimistic-lock on version prevents a stale writer from overwriting a fresh state."></path>
+
+          <!-- E3 — Worker Pool → Retry Engine (L via gutter2 x=635, row2 → row4) -->
+          <path class="arrow" d="M 640,130 L 635,130 L 635,297 L 570,297" fill="none" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah17)"
+                data-flow="execute" data-execute="3"
+                data-desc-execute="On FAILURE the worker calls retryStrategy.shouldRetry(task, attempt, error). If attempt ≤ maxRetries the task moves RUNNING → RETRYING and the engine computes the next delay."></path>
+
+          <!-- E4 — Retry Engine → Task Queue (L via gutter1 x=280, row4 → row1) -->
+          <path class="arrow" d="M 330,297 L 280,297 L 280,57 L 330,57" fill="none" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah17)"
+                data-flow="execute" data-execute="4"
+                data-desc-execute="After the computed delay expires, the task is re-enqueued at its original priority. Formula: delay = min(1 s · 2^(attempt-1), 30 s) × jitter(0.9–1.1). Jitter is the difference between a thundering herd and a healthy recovery."></path>
+
+          <!-- E5 — Retry Engine → Dead-Letter Queue (L via gutter2 x=610, row4 → row3) -->
+          <path class="arrow" d="M 570,285 L 610,285 L 610,215 L 640,215" fill="none" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah17)"
+                data-flow="execute" data-execute="5"
+                data-desc-execute="If shouldRetry returns false (attempt &gt; maxRetries or non-retryable error) the task moves to FAILED and lands in the DLQ. Ops team is paged; admin can replay, skip, or escalate."></path>
+
+          <!-- E6 — Failover Service → Worker Pool (stepped via bottom margin, row6 → row2) -->
+          <path class="arrow" d="M 260,455 L 260,530 L 595,530 L 595,140 L 640,140" fill="none" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah17)"
+                data-flow="execute" data-execute="6"
+                data-desc-execute="Every 10 s the failover service scans workers for stale heartbeats. If now − lastHeartbeat &gt; 30 s the worker is marked DEAD; its current load and reservations are cleared."></path>
+
+          <!-- E7 — Failover Service → Task Queue (stepped via bottom margin + gutter1, row6 → row1) -->
+          <path class="arrow" d="M 260,465 L 260,540 L 300,540 L 300,60 L 330,60" fill="none" stroke="var(--muted)" stroke-width="2" marker-end="url(#ah17)"
+                data-flow="execute" data-execute="7"
+                data-desc-execute="For every RUNNING TaskExecution on the dead worker: reset task status to QUEUED, re-enqueue, and let the assignment strategy pick a fresh healthy worker on the next tick. Fencing token bumped so any late write from the dead worker is rejected."></path>
+
+          <!-- ═══════ non-flow connectivity edges (dashed) ═══════ -->
+          <!-- C1 — Scheduler Leader → Scheduler Followers (state replication, vertical row-gap 3-4) -->
+          <line class="arrow" x1="140" y1="244" x2="140" y2="270" stroke="var(--muted)" stroke-width="1.2" stroke-dasharray="4 3" marker-end="url(#ah17)"></line>
+          <text class="edge-label" x="200" y="260" text-anchor="start">state replicate</text>
+
+          <!-- C2 — Cron Scheduler → Task Queue (dashed, row 5 → row 1 via gutter1 x=285) -->
+          <path class="arrow" d="M 260,377 L 285,377 L 285,45 L 330,45" fill="none" stroke="var(--muted)" stroke-width="1.2" stroke-dasharray="4 3" marker-end="url(#ah17)"></path>
+          <text class="edge-label" x="285" y="200" text-anchor="middle" transform="rotate(-90 285 200)">cron fires</text>
+
+          <!-- C3 — API Gateway → Idempotency Store (dashed, row 2 → row 1 via row-gap y=97) -->
+          <path class="arrow" d="M 200,110 L 200,97 L 730,97 L 730,84" fill="none" stroke="var(--muted)" stroke-width="1.2" stroke-dasharray="4 3" marker-end="url(#ah17)"></path>
+          <text class="edge-label" x="460" y="93" text-anchor="middle">idempotency check</text>
+
+          <!-- C4 — Worker Pool → Metrics (dashed, vertical row 2 → row 4 via gutter2 x=655) -->
+          <path class="arrow" d="M 760,164 L 760,180 L 655,180 L 655,297 L 640,297" fill="none" stroke="var(--muted)" stroke-width="1.2" stroke-dasharray="4 3" marker-end="url(#ah17)"></path>
+
+          <!-- C5 — Metrics → Dashboard (dashed, vertical row-gap 4-5) -->
+          <line class="arrow" x1="760" y1="324" x2="760" y2="350" stroke="var(--muted)" stroke-width="1.2" stroke-dasharray="4 3" marker-end="url(#ah17)"></line>
+
+          <!-- C6 — Dashboard → Alerting (dashed, vertical row-gap 5-6) -->
+          <line class="arrow" x1="760" y1="404" x2="760" y2="430" stroke="var(--muted)" stroke-width="1.2" stroke-dasharray="4 3" marker-end="url(#ah17)"></line>
+
+          <!-- ═══════ NODES ═══════ -->
+
+          <!-- Col 1 — control plane (ingress + scheduler + failover) -->
+          <g data-node style="cursor:pointer" data-title="Clients (SDK · CLI · Partner API)" data-detail="<b>Entry point.</b> Java/Python SDK, CLI tool (<code>tsched submit …</code>), and partner REST clients.<br><b>Payload:</b> ~1 KB per task (name, priority, payload map, retry policy, timeout, optional cron / dependsOn[]).<br><b>Retry policy:</b> exponential backoff on 5xx; deduped by the <code>Idempotency-Key</code> header so a client-side retry is safe.<br><b>Rate:</b> up to 100 tasks/s per client (10 K clients × 100 = 1 M/s theoretical ceiling; enforced at gateway).">
+            <rect x="20" y="30" width="240" height="54" rx="9" fill="var(--panel-2)" stroke="var(--eden)"></rect>
+            <text x="140" y="55" text-anchor="middle" fill="var(--eden)" font-size="13" font-weight="600">Clients</text>
+            <text x="140" y="72" text-anchor="middle" fill="var(--faint)" font-size="11">SDK · CLI · API</text>
+          </g>
+
+          <g data-node style="cursor:pointer" data-title="API Gateway" data-detail="<b>Role:</b> single ingress. JWT auth, per-client rate limit (100 tasks/s), request validation, TLS termination, WAF.<br><b>Tech:</b> AWS API Gateway / Apigee / Azure APIM.<br><b>Idempotency:</b> extracts <code>Idempotency-Key</code>, checks the Redis idempotency store — duplicate keys within 24 h short-circuit to the stored response (409 Conflict + existing task_id).<br><b>HA:</b> multi-AZ active-active; 4× over-provisioned for the 50× burst.">
+            <rect x="20" y="110" width="240" height="54" rx="9" fill="var(--panel-2)" stroke="var(--border)"></rect>
+            <text x="140" y="135" text-anchor="middle" fill="var(--text)" font-size="13" font-weight="600">API Gateway</text>
+            <text x="140" y="152" text-anchor="middle" fill="var(--faint)" font-size="11">auth · rate-limit · idem</text>
+          </g>
+
+          <g data-node style="cursor:pointer" data-title="Scheduler Leader (★ the coordinator)" data-detail="<b>The one writer.</b> Runs the priority-queue drain, DAG resolution, cron tick, and dispatch loop. Only ONE leader per cluster — enforced by Bully election.<br><b>Why leader-elected?</b> Two active schedulers would race for the same task and dispatch it to two workers → duplicate execution → double-charged payment.<br><b>Election:</b> highest-priority node wins. On leader crash, followers detect stale heartbeat (~30 s), re-elect in ~5 s, and resume from persisted state.<br><b>Prod alternative:</b> Raft via etcd/Consul — partition-safe (majority quorum) where Bully is not.">
+            <rect x="20" y="190" width="240" height="54" rx="9" fill="var(--panel-2)" stroke="var(--warn)" stroke-width="2"></rect>
+            <text x="140" y="215" text-anchor="middle" fill="var(--warn)" font-size="14" font-weight="700">Scheduler Leader ★</text>
+            <text x="140" y="232" text-anchor="middle" fill="var(--faint)" font-size="11">Bully election</text>
+          </g>
+
+          <g data-node style="cursor:pointer" data-title="Scheduler Followers" data-detail="<b>Hot standby.</b> 2–4 follower nodes receive replicated state from the leader (task queue snapshot, cron schedules, in-flight executions).<br><b>On leader failure:</b> the highest-priority follower wins the next Bully round and takes over dispatch within ~5 s. Downtime is bounded by the heartbeat interval.<br><b>No horizontal scaling of schedulers:</b> a single leader can dispatch at &gt; 10 K TPS. Scale by partitioning queues (one leader per partition) if you outgrow it.<br><b>Deploy across AZs:</b> at least one follower must be in a different AZ from the leader.">
+            <rect x="20" y="270" width="240" height="54" rx="9" fill="var(--panel-2)" stroke="var(--survivor)"></rect>
+            <text x="140" y="295" text-anchor="middle" fill="var(--survivor)" font-size="13" font-weight="600">Scheduler Followers</text>
+            <text x="140" y="312" text-anchor="middle" fill="var(--faint)" font-size="11">2–4 replicas</text>
+          </g>
+
+          <g data-node style="cursor:pointer" data-title="Cron Scheduler" data-detail="<b>Role:</b> parses 5-field cron expressions (<code>minute hour dayOfMonth month dayOfWeek</code>) and fires recurring tasks.<br><b>Loop:</b> on every scheduler tick (1–5 s), for each cron task compute <code>getNextFireTime(schedule, lastFired)</code>. If <code>nextFire ≤ now</code>, re-enqueue and stamp <code>lastFired = now</code>.<br><b>Only leader evaluates cron</b> — else double-fire (two nodes both re-enqueue the same job).<br><b>Scale:</b> 100 K recurring tasks; O(K) per tick — cheap.<br><b>Prod alt:</b> Quartz Scheduler or DB-backed <code>SELECT … FOR UPDATE SKIP LOCKED</code>.">
+            <rect x="20" y="350" width="240" height="54" rx="9" fill="var(--panel-2)" stroke="var(--survivor)"></rect>
+            <text x="140" y="375" text-anchor="middle" fill="var(--survivor)" font-size="13" font-weight="600">Cron Scheduler</text>
+            <text x="140" y="392" text-anchor="middle" fill="var(--faint)" font-size="11">tick · fire time</text>
+          </g>
+
+          <g data-node style="cursor:pointer" data-title="Failover Service" data-detail="<b>Role:</b> the liveness watchdog. Runs every 10 s.<br><b>Detection:</b> scan the worker registry. If <code>now − lastHeartbeat &gt; 30 s</code>, mark the worker DEAD.<br><b>Reassignment:</b> for each RUNNING TaskExecution on a dead worker → reset task status to QUEUED, re-enqueue, let the assignment strategy pick a fresh worker (attempt = attempt + 1). Fencing token is bumped so the dead worker's late write (if it recovers) is rejected.<br><b>Prod enhancement:</b> replace heartbeat-to-coordinator with a SWIM/Serf gossip protocol — O(log N) detection, no single point of detection.">
+            <rect x="20" y="430" width="240" height="54" rx="9" fill="var(--panel-2)" stroke="var(--survivor)"></rect>
+            <text x="140" y="455" text-anchor="middle" fill="var(--survivor)" font-size="13" font-weight="600">Failover Service</text>
+            <text x="140" y="472" text-anchor="middle" fill="var(--faint)" font-size="11">heartbeat · reassign</text>
+          </g>
+
+          <!-- Col 2 — engine + strategies + persistence -->
+          <g data-node style="cursor:pointer" data-title="Task Queue (in-memory PriorityQueue)" data-detail="<b>Data structure:</b> Java <code>PriorityQueue&lt;Task&gt;</code> (binary heap, array-backed).<br><b>Comparator:</b> <code>comparingInt(Task::getPriorityValue).reversed().thenComparing(Task::getCreatedAt)</code> — CRITICAL(3) before LOW(0), FIFO within same lane.<br><b>Complexity:</b> O(log n) enqueue / dequeue.<br><b>Capacity:</b> holds ~174 K entries at burst (174 MB — fits in RAM).<br><b>Persistence:</b> in-memory only on the leader; on failover the new leader rebuilds from the Task Repo where <code>status IN (QUEUED, RETRYING)</code>.<br><b>Prod alt:</b> Redis <code>ZADD/ZPOPMIN</code> with score = <code>(priority · 10^18) + createdAt_nanos</code> — distributed and persistent.">
+            <rect x="330" y="30" width="240" height="54" rx="9" fill="var(--panel-2)" stroke="var(--fig)"></rect>
+            <text x="450" y="55" text-anchor="middle" fill="var(--fig)" font-size="13" font-weight="600">Task Queue</text>
+            <text x="450" y="72" text-anchor="middle" fill="var(--faint)" font-size="11">PriorityQueue · 4 lanes</text>
+          </g>
+
+          <g data-node style="cursor:pointer" data-title="DAG Resolver (Kahn's algorithm)" data-detail="<b>Role:</b> resolves task dependencies.<br><b>At submission:</b> <code>hasCycle()</code> — DFS three-colouring (WHITE / GRAY / BLACK). A GRAY → GRAY back edge means a cycle → throw <code>DependencyCycleException</code> and reject the submit.<br><b>At runtime:</b> <code>getReadyTasks(completedSet)</code> — for every task in <code>waitingOnDeps</code>, if all its upstream IDs are in the COMPLETED set, promote it into the priority queue.<br><b>Complexity:</b> O(V + E) per tick.<br><b>Scale:</b> DAG depth up to 50, width up to 500 — trivial for Kahn.<br><b>Cascade behaviour:</b> configurable — FAIL_FAST, WAIT, or SKIP on upstream failure.">
+            <rect x="330" y="110" width="240" height="54" rx="9" fill="var(--panel-2)" stroke="var(--fig)"></rect>
+            <text x="450" y="135" text-anchor="middle" fill="var(--fig)" font-size="13" font-weight="600">DAG Resolver</text>
+            <text x="450" y="152" text-anchor="middle" fill="var(--faint)" font-size="11">Kahn topo · cycle det</text>
+          </g>
+
+          <g data-node style="cursor:pointer" data-title="Assignment Strategy (Strategy pattern)" data-detail="<b>Role:</b> picks the worker for a ready task.<br><b>Round-Robin:</b> <code>counter.getAndIncrement() % workers.size()</code>. O(1). Even distribution over time. Best when workers are identical.<br><b>Least-Loaded:</b> <code>workers.stream().filter(isAvailable).min(comparingInt(getCurrentLoad).thenComparing(getRegisteredAt))</code>. O(n). Respects heterogeneous capacity.<br><b>Extensions:</b> ConsistentHash (task-type affinity), TagAffinity (route <code>gpu</code>-tagged tasks to <code>gpu</code>-tagged workers).<br><b>Swappable at runtime:</b> AppConfig setter reconfigures all services without a restart.">
+            <rect x="330" y="190" width="240" height="54" rx="9" fill="var(--panel-2)" stroke="var(--fig)"></rect>
+            <text x="450" y="215" text-anchor="middle" fill="var(--fig)" font-size="13" font-weight="600">Assignment Strategy</text>
+            <text x="450" y="232" text-anchor="middle" fill="var(--faint)" font-size="11">RR / LeastLoaded</text>
+          </g>
+
+          <g data-node style="cursor:pointer" data-title="Retry Engine (exponential backoff + jitter)" data-detail="<b>Formula:</b> <code>delay = min(initialDelay · multiplier^(attempt − 1), maxDelay) × jitterFactor</code>.<br><b>Defaults:</b> initialDelay = 1 000 ms, multiplier = 2.0, maxDelay = 30 000 ms, jitter = 0.9 + rand(0, 0.2) → ±10 %.<br><b>Schedule (5 attempts):</b> 1 s → 2 s → 4 s → 8 s → 16 s (total ~31 s wait).<br><b>Why jitter?</b> Without it, 1 000 tasks that fail together retry synchronously at exactly 1 s, 2 s, 4 s → thundering herd → cascading failure.<br><b>After maxRetries:</b> push to DLQ; page ops; admin can replay / skip / escalate.<br><b>Strategy pattern:</b> ExponentialBackoff, FixedInterval, or custom per error class.">
+            <rect x="330" y="270" width="240" height="54" rx="9" fill="var(--panel-2)" stroke="var(--warn)"></rect>
+            <text x="450" y="295" text-anchor="middle" fill="var(--warn)" font-size="13" font-weight="600">Retry Engine</text>
+            <text x="450" y="312" text-anchor="middle" fill="var(--faint)" font-size="11">exp backoff + jitter</text>
+          </g>
+
+          <g data-node style="cursor:pointer" data-title="Task Repository (Postgres)" data-detail="<b>Source of truth for task definitions and status.</b> PostgreSQL — ACID transitions prevent lost updates when leader + failover write concurrently.<br><b>Row:</b> id, name, task_type, priority, status, payload (JSONB), cron_expression, delay_millis, max_retries, timeout_millis, group_id, created_at, updated_at, scheduled_at, version.<br><b>Indexes:</b> (status), (priority DESC, created_at ASC), (group_id), UNIQUE(payload-&gt;&gt;'idempotency_key').<br><b>Partitioning:</b> monthly by created_at; hot partition on SSD, cold partitions archived to S3.<br><b>Concurrency:</b> optimistic lock on version column (or <code>SELECT … FOR UPDATE SKIP LOCKED</code> if pulling from DB queue).">
+            <rect x="330" y="350" width="240" height="54" rx="9" fill="var(--panel-2)" stroke="var(--old)"></rect>
+            <text x="450" y="375" text-anchor="middle" fill="var(--old)" font-size="13" font-weight="600">Task Repository</text>
+            <text x="450" y="392" text-anchor="middle" fill="var(--faint)" font-size="11">Postgres · task + status</text>
+          </g>
+
+          <g data-node style="cursor:pointer" data-title="Execution Repository (per-attempt audit)" data-detail="<b>Audit log for every attempt.</b> One row per <i>attempt</i>, not per task.<br><b>Row:</b> id, task_id, worker_id, attempt_number, status, start_time, end_time, result_output, error_message, duration_ms, fencing_token.<br><b>Constraints:</b> UNIQUE(task_id, attempt_number) — DB-level guard against two workers running the same attempt simultaneously.<br><b>Volume:</b> ~12 M/day (10 M unique + retries), ~500 B each, 6 GB/day, 180 GB/month.<br><b>Retention:</b> 30 days hot; older archived to S3 + Athena for ad-hoc queries.<br><b>Use:</b> debugging (\"why did task X fail?\"), SLA reporting, retry-rate metrics.">
+            <rect x="330" y="430" width="240" height="54" rx="9" fill="var(--panel-2)" stroke="var(--old)"></rect>
+            <text x="450" y="455" text-anchor="middle" fill="var(--old)" font-size="13" font-weight="600">Execution Repository</text>
+            <text x="450" y="472" text-anchor="middle" fill="var(--faint)" font-size="11">per-attempt audit</text>
+          </g>
+
+          <!-- Col 3 — idempotency + workers + observability -->
+          <g data-node style="cursor:pointer" data-title="Idempotency Store (Redis)" data-detail="<b>Role:</b> client-side deduplication.<br><b>Key:</b> <code>idem:{key}</code> = <code>{task_id, response_json}</code>. TTL 24 h.<br><b>Semantics:</b> <code>SET key … NX EX 86400</code> — first writer wins; a repeat request within 24 h reads the stored response and returns 200/409 with the original task_id (never re-execute).<br><b>Why 24 h?</b> Matches Stripe / SQS / Kafka producer defaults — a client's network-glitch retry window.<br><b>Scale:</b> 10 M keys/day × 200 B = 2 GB peak; fits in a single Redis primary with 6× replicas.<br><b>Cluster:</b> hash-slot sharded across primaries for &gt; 10 K writes/s.">
+            <rect x="640" y="30" width="240" height="54" rx="9" fill="var(--panel-2)" stroke="var(--old)"></rect>
+            <text x="760" y="55" text-anchor="middle" fill="var(--old)" font-size="13" font-weight="600">Idempotency Store</text>
+            <text x="760" y="72" text-anchor="middle" fill="var(--faint)" font-size="11">Redis · 24h dedup</text>
+          </g>
+
+          <g data-node style="cursor:pointer" data-title="Worker Pool (heterogeneous executors)" data-detail="<b>Role:</b> executes task payloads.<br><b>Fleet:</b> ~1 000 workers, avg 4 concurrent slots each = 4 000 concurrent executions.<br><b>Registration:</b> <code>POST /api/v1/workers</code> with capacity, hostname, tags. Registry updated in Redis + Postgres.<br><b>Heartbeat:</b> every 5 s → <code>PUT /workers/{id}/heartbeat</code> with current_load, cpu %, memory %.<br><b>Liveness:</b> stale heartbeat &gt; 30 s → Failover Service marks DEAD and reassigns RUNNING tasks.<br><b>Auto-scale:</b> Kubernetes HPA on <code>scheduler_queue_depth</code> — target 50 tasks/worker. Min 10, max 100 pods per deployment.<br><b>Tag affinity:</b> workers advertise capabilities (<code>gpu, high-memory, cpu</code>); assignment strategy filters by tag.">
+            <rect x="640" y="110" width="240" height="54" rx="9" fill="var(--panel-2)" stroke="var(--survivor)"></rect>
+            <text x="760" y="135" text-anchor="middle" fill="var(--survivor)" font-size="13" font-weight="600">Worker Pool</text>
+            <text x="760" y="152" text-anchor="middle" fill="var(--faint)" font-size="11">1000 · heartbeat 5s</text>
+          </g>
+
+          <g data-node style="cursor:pointer" data-title="Dead-Letter Queue (permanent failures)" data-detail="<b>Role:</b> permanently failed tasks land here.<br><b>Trigger:</b> retryStrategy.shouldRetry() returns false — either attempt &gt; maxRetries, or the error class is non-retryable (validation error, poison pill).<br><b>Storage:</b> Kafka topic <code>tasks.dead-letter</code> with 7-day retention (or SQS DLQ + SNS alerts).<br><b>Alerting:</b> every DLQ entry pages ops via PagerDuty; a DLQ depth &gt; 100 triggers P1.<br><b>Workflow:</b> admin reviews, decides — replay (fix bug + re-submit), skip (mark task CANCELLED), or escalate (manual intervention).<br><b>Cascade:</b> dependent tasks handled per policy — FAIL_FAST, WAIT, or SKIP.">
+            <rect x="640" y="190" width="240" height="54" rx="9" fill="var(--panel-2)" stroke="var(--meta)"></rect>
+            <text x="760" y="215" text-anchor="middle" fill="var(--meta)" font-size="13" font-weight="600">Dead-Letter Queue</text>
+            <text x="760" y="232" text-anchor="middle" fill="var(--faint)" font-size="11">max-retries hit</text>
+          </g>
+
+          <g data-node style="cursor:pointer" data-title="Metrics (Prometheus)" data-detail="<b>Role:</b> pull-based time-series metrics.<br><b>Exposed:</b> <code>task_count{status}</code>, <code>worker_utilisation{worker_id}</code>, <code>queue_depth</code>, <code>scheduling_latency_seconds</code>, <code>retry_rate</code>, <code>failure_rate</code>, <code>leader_election_count</code>.<br><b>Scrape:</b> Prometheus scrapes /metrics from every scheduler + worker every 15 s.<br><b>Retention:</b> 15 days at 15 s resolution; downsampled to 5 min for 90 days.<br><b>Why pull over push?</b> Simpler failure model (Prometheus knows if it can't reach a target); no metric agent to manage on every host.">
+            <rect x="640" y="270" width="240" height="54" rx="9" fill="var(--panel-2)" stroke="var(--stack)"></rect>
+            <text x="760" y="295" text-anchor="middle" fill="var(--stack)" font-size="13" font-weight="600">Metrics</text>
+            <text x="760" y="312" text-anchor="middle" fill="var(--faint)" font-size="11">Prometheus</text>
+          </g>
+
+          <g data-node style="cursor:pointer" data-title="Dashboard (Grafana)" data-detail="<b>Role:</b> the ops-team pane of glass.<br><b>Panels:</b> task-status stacked area (COMPLETED / FAILED / QUEUED / RUNNING / RETRYING over time), worker-utilisation heat map, queue-depth line, throughput bar, top-N slowest tasks, cron next-fire schedule.<br><b>Refresh:</b> p99 &lt; 500 ms — pulled from Prometheus at 15 s cadence.<br><b>Golden signals:</b> traffic (submits/s), errors (failure rate), latency (p50/p99 exec time), saturation (queue depth &amp; worker util).<br><b>CAP:</b> AP — a stale dashboard for 30 s is fine; unavailable dashboard is not.">
+            <rect x="640" y="350" width="240" height="54" rx="9" fill="var(--panel-2)" stroke="var(--stack)"></rect>
+            <text x="760" y="375" text-anchor="middle" fill="var(--stack)" font-size="13" font-weight="600">Dashboard</text>
+            <text x="760" y="392" text-anchor="middle" fill="var(--faint)" font-size="11">Grafana · counts</text>
+          </g>
+
+          <g data-node style="cursor:pointer" data-title="Alerting (PagerDuty)" data-detail="<b>Role:</b> paging humans when things break.<br><b>P1 (page on-call immediately):</b> dead worker count &gt; 0, leader election flapping (&gt; 3/hr), queue depth &gt; 10 000 for &gt; 5 min, DLQ growth &gt; 100/min.<br><b>P2 (Slack + ticket):</b> failure rate &gt; 5 %, retry rate &gt; 20 %, avg execution time &gt; 2× baseline, scheduling latency &gt; 1 s.<br><b>SLA breach:</b> task-status = QUEUED for &gt; SLA target (per-task) → auto-escalate.<br><b>Runbook:</b> every alert links to a runbook page (\"What to do when queue depth alerts fire\").<br><b>Post-incident:</b> alerts feed a blameless post-mortem template.">
+            <rect x="640" y="430" width="240" height="54" rx="9" fill="var(--panel-2)" stroke="var(--meta)"></rect>
+            <text x="760" y="455" text-anchor="middle" fill="var(--meta)" font-size="13" font-weight="600">Alerting</text>
+            <text x="760" y="472" text-anchor="middle" fill="var(--faint)" font-size="11">PagerDuty · SLA breach</text>
+          </g>
+
+        </svg>
+      </div>
+      <div class="node-detail"><span class="nd-title">Click any component</span><div class="nd-body">Its role, storage, and consistency model appear here. Then use the buttons below to walk the <b>submit</b> path (persist → enqueue → dispatch) and the <b>execute + retry</b> path (run → on-failure retry-or-DLQ → on-dead-worker failover).</div></div>
+
+      <div class="flowctl" data-flowctl>
+        <button class="btn" data-flow="submit">Submit — persist &amp; dispatch (7 steps)</button>
+        <button class="btn" data-flow="execute">Execute + retry (7 steps)</button>
+        <span style="flex:1"></span>
+        <button class="btn" data-flowstep="prev">◀ Prev</button>
+        <button class="btn" data-flowstep="next">Next ▶</button>
+      </div>
+      <div class="flowlabel" data-flowlabel>Pick <b>Submit</b> or <b>Execute + retry</b>, then press "Next ▶" to walk the numbered flow one hop at a time.</div>
+
+      <div class="cloudmap">
+        <div class="kicker" style="margin-top:4px">Managed-service mapping — the same design on each cloud</div>
+        <table class="cloudtable">
+          <thead><tr>
+            <th>Component</th>
+            <th><span class="hdrlogo"><span class="logochip"><img src="../assets/logos/aws.svg" alt="AWS"></span>AWS</span></th>
+            <th><span class="hdrlogo"><span class="logochip"><img src="../assets/logos/gcp.svg" alt="GCP"></span>GCP</span></th>
+            <th><span class="hdrlogo"><span class="logochip"><img src="../assets/logos/azure.svg" alt="Azure"></span>Azure</span></th>
+          </tr></thead>
+          <tbody>
+            <tr><td><b>API Gateway</b></td><td><img class="svcicon" src="../assets/logos/services/aws-apigw.svg" alt="">API Gateway + Lambda authorizer</td><td><img class="svcicon" src="../assets/logos/services/gcp-apigw.svg" alt="">API Gateway / Apigee</td><td><img class="svcicon" src="../assets/logos/services/azure-apim.svg" alt="">API Management</td></tr>
+            <tr><td>Scheduler + Workers (compute)</td><td><img class="svcicon" src="../assets/logos/services/aws-ecs.svg" alt="">ECS Fargate / EKS (HPA)</td><td><img class="svcicon" src="../assets/logos/services/gcp-run.svg" alt="">Cloud Run / GKE</td><td><img class="svcicon" src="../assets/logos/services/azure-aks.svg" alt="">AKS / Container Apps</td></tr>
+            <tr><td><b>Task Queue</b></td><td><img class="svcicon" src="../assets/logos/services/aws-sqs.svg" alt="">SQS (standard + FIFO)</td><td><img class="svcicon" src="../assets/logos/services/gcp-pubsub.svg" alt="">Cloud Tasks / Pub/Sub</td><td><img class="svcicon" src="../assets/logos/services/azure-servicebus.svg" alt="">Service Bus (queues + topics)</td></tr>
+            <tr><td>Priority queue / registry / idem</td><td><img class="svcicon" src="../assets/logos/services/aws-elasticache.svg" alt="">ElastiCache Redis (ZSET, hash, NX)</td><td><img class="svcicon" src="../assets/logos/services/gcp-memorystore.svg" alt="">Memorystore Redis</td><td><img class="svcicon" src="../assets/logos/services/azure-redis.svg" alt="">Azure Cache for Redis</td></tr>
+            <tr><td>Task + Execution Repository</td><td><img class="svcicon" src="../assets/logos/services/aws-rds.svg" alt="">Aurora PostgreSQL (multi-AZ)</td><td><img class="svcicon" src="../assets/logos/services/gcp-cloudsql.svg" alt="">Cloud SQL PostgreSQL / AlloyDB</td><td><img class="svcicon" src="../assets/logos/services/azure-sql.svg" alt="">Azure Database for PostgreSQL</td></tr>
+            <tr><td>Event log (task events)</td><td><img class="svcicon" src="../assets/logos/services/aws-msk.svg" alt="">MSK (Managed Kafka)</td><td><img class="svcicon" src="../assets/logos/services/gcp-pubsub.svg" alt="">Pub/Sub</td><td><img class="svcicon" src="../assets/logos/services/azure-eventhubs.svg" alt="">Event Hubs (Kafka-compatible)</td></tr>
+            <tr><td>Cron scheduling</td><td>EventBridge Scheduler</td><td>Cloud Scheduler</td><td>Logic Apps (timer trigger)</td></tr>
+            <tr><td>Dead-letter queue</td><td><img class="svcicon" src="../assets/logos/services/aws-sqs.svg" alt="">SQS DLQ + <img class="svcicon" src="../assets/logos/services/aws-sns.svg" alt="">SNS alert</td><td><img class="svcicon" src="../assets/logos/services/gcp-pubsub.svg" alt="">Pub/Sub dead-letter topic</td><td><img class="svcicon" src="../assets/logos/services/azure-servicebus.svg" alt="">Service Bus DLQ</td></tr>
+            <tr><td>Search over execution logs</td><td><img class="svcicon" src="../assets/logos/services/aws-opensearch.svg" alt="">OpenSearch</td><td>Elastic Cloud on GCP</td><td><img class="svcicon" src="../assets/logos/services/azure-search.svg" alt="">Azure AI Search</td></tr>
+            <tr><td>Task archive (cold storage)</td><td><img class="svcicon" src="../assets/logos/services/aws-s3.svg" alt="">S3 + Athena</td><td><img class="svcicon" src="../assets/logos/services/gcp-cloudstorage.svg" alt="">Cloud Storage + BigQuery</td><td><img class="svcicon" src="../assets/logos/services/azure-blob.svg" alt="">Blob Storage + Synapse</td></tr>
+            <tr><td>Metrics · dashboard · alerts</td><td>CloudWatch + Grafana + PagerDuty</td><td>Cloud Monitoring + Grafana</td><td>Azure Monitor + Grafana</td></tr>
+            <tr><td><b>Managed alternative</b></td><td>Step Functions (state machine)</td><td>Cloud Workflows (YAML/JSON DSL)</td><td>Durable Functions (fan-out/in)</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+
+  <!-- D · API -->
+  <section>
+    <div class="sec-h"><span class="n">D</span><h2>API design</h2><span class="tag">idempotent writes · JWT auth · rate-limited</span></div>
+    <table>
+      <thead><tr><th>Endpoint</th><th>Purpose</th><th>Response</th></tr></thead>
+      <tbody>
+        <tr><td><code>POST /api/v1/tasks</code></td><td>Submit a one-time, delayed, or cron task. Header: <code>Idempotency-Key</code>. Body: <code>{name, priority, payload, maxRetries, timeoutMillis, delayMillis, cronExpression?}</code>.</td><td>201 + <code>{task_id, status: PENDING}</code> · 409 on duplicate key</td></tr>
+        <tr><td><code>POST /api/v1/tasks/with-deps</code></td><td>Submit a task with upstream dependencies (DAG). Server runs DFS cycle detection; 400 if a cycle would be introduced.</td><td>201 + <code>{task_id, dependencies: {total, completed, pending}}</code></td></tr>
+        <tr><td><code>DELETE /api/v1/tasks/{id}</code></td><td>Cancel a task in <code>PENDING</code>, <code>QUEUED</code>, or <code>ASSIGNED</code>. RUNNING / terminal tasks return 409.</td><td>200 + <code>{status: CANCELLED}</code></td></tr>
+        <tr><td><code>GET /api/v1/tasks/{id}/status</code></td><td>Fetch task state — id, name, priority, status, attempt_count, assigned_worker, last_error.</td><td>200 + status JSON</td></tr>
+        <tr><td><code>POST /api/v1/workers</code></td><td>Register a new worker in the pool. Body: <code>{hostname, port, capacity, tags[]}</code>. Auth: service token.</td><td>201 + <code>{worker_id, status: ACTIVE, current_load: 0}</code></td></tr>
+        <tr><td><code>PUT /api/v1/workers/{id}/heartbeat</code></td><td>Worker liveness signal — every 5 s. Body: <code>{current_load, cpu_usage_pct, memory_usage_pct}</code>.</td><td>200 + <code>{heartbeat_recorded_at}</code></td></tr>
+        <tr><td><code>POST /api/v1/scheduler/dispatch</code></td><td>Manually trigger a scheduling cycle (test/ops override). Production runs on a fixed 1–5 s tick.</td><td>200 + <code>{dispatched_count}</code></td></tr>
+        <tr><td><code>POST /api/v1/task-groups</code></td><td>Create a task group (<code>parallel = true / false</code>) then <code>PUT /task-groups/{id}/tasks</code> to add members.</td><td>201 + <code>{group_id}</code></td></tr>
+        <tr><td><code>GET /api/v1/monitoring/dashboard</code></td><td>Aggregate: task_status_counts, worker_utilisation, execution_metrics, queue_depth.</td><td>200 + dashboard JSON</td></tr>
+      </tbody>
+    </table>
+    <p class="muted"><b>Idempotency contract:</b> every write endpoint accepts <code>Idempotency-Key</code>. Duplicate keys within 24 h return the original response body (never re-execute). For tasks, the natural key is also enforced at the DB layer: <code>UNIQUE INDEX (payload-&gt;&gt;'idempotency_key') WHERE payload-&gt;&gt;'idempotency_key' IS NOT NULL</code> — belt-and-braces so even a Redis outage can't cause a duplicate task.</p>
+  </section>
+
+  <!-- E · DATA MODEL -->
+  <section>
+    <div class="sec-h"><span class="n">E</span><h2>Data model — writes (CP) vs reads (AP)</h2><span class="tag">right store per access pattern</span></div>
+    <div class="grid g2">
+      <div class="card">
+        <div class="kicker">write path (Postgres · CP)</div>
+<pre class="code">Task                             <span class="cm">// Postgres (Aurora, partitioned monthly)</span>
+  id (UUID, PK)
+  name, description
+  task_type                      <span class="cm">// ONE_TIME/RECURRING/CRON/DELAYED</span>
+  priority                       <span class="cm">// LOW(0) → CRITICAL(3)</span>
+  status                         <span class="cm">// PENDING/QUEUED/ASSIGNED/RUNNING/</span>
+                                 <span class="cm">// COMPLETED/FAILED/RETRYING/</span>
+                                 <span class="cm">// CANCELLED/TIMED_OUT</span>
+  payload (JSONB)                <span class="cm">// task-specific data</span>
+  cron_expression, delay_millis
+  max_retries, timeout_millis
+  group_id (FK, nullable)
+  version                        <span class="cm">// optimistic lock</span>
+  created_at, updated_at
+
+<span class="cm">// Indexes:</span>
+<span class="cm">//   (status)                                    - dispatch scans</span>
+<span class="cm">//   (priority DESC, created_at ASC)             - queue rebuild</span>
+<span class="cm">//   UNIQUE(payload-&gt;&gt;'idempotency_key')           - dedup</span>
+
+TaskExecution                    <span class="cm">// Postgres — per attempt audit</span>
+  id (UUID, PK)
+  task_id (FK), worker_id (FK)
+  attempt_number (1-based)
+  status, start_time, end_time
+  result_output, error_message
+  duration_ms
+  fencing_token                  <span class="cm">// monotonic ↑ per attempt</span>
+
+<span class="cm">//   UNIQUE(task_id, attempt_number)</span>
+
+TaskDependency
+  task_id, depends_on            <span class="cm">// PK(task_id, depends_on)</span>
+
+CronSchedule
+  task_id (PK, FK), expression
+  minute, hour, day_of_month
+  month, day_of_week
+  last_fired, next_fire_time
+
+SchedulerNode
+  node_id (PK), hostname
+  priority                       <span class="cm">// Bully election</span>
+  is_leader (bool)
+  last_heartbeat, started_at</pre>
+      </div>
+      <div class="card">
+        <div class="kicker">read path + cache (Redis · Kafka · S3 · AP)</div>
+<pre class="code">Redis idem:{key}                 <span class="cm">// SET NX EX 86400</span>
+  → {task_id, response_json}
+  TTL 24 h                       <span class="cm">// client dedup window</span>
+
+Redis queue:priority             <span class="cm">// sorted set (prod alt)</span>
+  ZADD score member              <span class="cm">// score = (pri·10^18)+ts</span>
+  ZPOPMIN                        <span class="cm">// O(log n)</span>
+
+Redis workers:registry           <span class="cm">// hash + TTL</span>
+  worker_id → {load, cap, hb}
+  EXPIRE 60                      <span class="cm">// auto-death on missing hb</span>
+
+Kafka tasks.dead-letter          <span class="cm">// permanent failures</span>
+  retention 7 d
+  → PagerDuty on non-empty
+
+Kafka task.events                <span class="cm">// audit / replay</span>
+  partition by task_id
+  ordered per task
+  acks=all, min.isr=2
+
+Prometheus metrics               <span class="cm">// pull, 15 s scrape</span>
+  task_count{status}
+  worker_utilisation
+  queue_depth
+  scheduling_latency_seconds
+  retry_rate, failure_rate
+  leader_election_count
+
+S3 + Athena                      <span class="cm">// cold archive &gt; 30 d</span>
+  partitioned by day
+  compressed parquet
+  ad-hoc queries via SQL
+
+Grafana (from Prometheus)        <span class="cm">// dashboard</span>
+  15 s refresh
+  ops pane-of-glass</pre>
+      </div>
+    </div>
+    <div class="callout tip"><b>The golden rule:</b> <b>task state is CP — durable, ACID, single writer</b>. A lost or double-executed task is a correctness bug that costs money (double-charge) or breaks pipelines (missed SLA). <b>Metrics and logs are AP — always available, eventually consistent</b>. A stale dashboard is fine; an unavailable dashboard during an incident is not.</div>
+  </section>
+
+  <!-- F · KEY CHOICES -->
+  <section>
+    <div class="sec-h"><span class="n">F</span><h2>Key design choices (deep-dived on canvas 3)</h2><span class="tag">defend these in the interview</span></div>
+    <div class="grid g3">
+      <div class="card"><div class="kicker">coordination</div><h3>Bully vs Raft</h3><p class="muted">Bully wins on simplicity — highest-priority alive node becomes leader in ~5 s. NOT partition-safe (split-brain risk). For production: Raft via etcd/Consul — majority-quorum prevents split-brain at the cost of more messages. <span class="run">→ canvas 3 · leader election</span></p></div>
+      <div class="card"><div class="kicker">queue</div><h3>PriorityQueue over FIFO</h3><p class="muted">CRITICAL tasks (payments) MUST preempt LOW (batch reports). FIFO would let a batch flood block critical writes. Comparator: <code>priority DESC, createdAt ASC</code>. O(log n) enqueue/dequeue. Starvation mitigated by aging (age &gt; threshold → priority bump). <span class="run">→ canvas 3 · priority queue</span></p></div>
+      <div class="card"><div class="kicker">retry</div><h3>Exp backoff + jitter</h3><p class="muted"><code>delay = min(1 s · 2^(n-1), 30 s) × jitter(0.9–1.1)</code>. Without jitter, 1 000 simultaneous failures retry synchronously → thundering herd → cascading failure. With ±10 % jitter, retries spread over a 200 ms window → downstream recovers gradually. <span class="run">→ canvas 3 · retry storms</span></p></div>
+      <div class="card"><div class="kicker">correctness</div><h3>Effective exactly-once</h3><p class="muted">True exactly-once is impossible (Two Generals + FLP). We layer three defences: (1) client idempotency key, (2) server terminal-state guard, (3) fencing token bumped on reassign. At-least-once + idempotent handler = user perceives exactly-once. <span class="run">→ canvas 3 · exactly-once</span></p></div>
+      <div class="card"><div class="kicker">DAG</div><h3>Kahn's algorithm</h3><p class="muted">Topological sort in O(V + E). At submit-time, DFS three-colouring rejects cycles (GRAY → GRAY = back edge = <code>DependencyCycleException</code>). At runtime, <code>getReadyTasks(completedSet)</code> promotes any task whose upstreams are all COMPLETED. Fail-fast beats deadlock. <span class="run">→ canvas 3 · DAG resolution</span></p></div>
+      <div class="card"><div class="kicker">failover</div><h3>Heartbeat + reassignment</h3><p class="muted">Workers send heartbeats every 5 s; failover scans every 10 s; stale &gt; 30 s → DEAD → reassign RUNNING tasks. Total disruption ~30 s (bounded by heartbeat interval). Prod enhancement: SWIM/Serf gossip → O(log N) detection, no single point of detection. <span class="run">→ canvas 3 · worker failover</span></p></div>
+    </div>
+  </section>
+
+  <!-- GLOSSARY -->
+  <section>
+    <div class="sec-h"><span class="n">§</span><h2>Glossary — one-liners</h2></div>
+    <div class="grid g2">
+      <div class="card"><table><tbody>
+        <tr><td><b>Priority queue</b></td><td>binary-heap ordering CRITICAL &gt; HIGH &gt; MEDIUM &gt; LOW; FIFO within lane; O(log n) enqueue/dequeue</td></tr>
+        <tr><td><b>Kahn's algorithm</b></td><td>BFS topological sort — peel zero-in-degree nodes, decrement neighbours, repeat; O(V + E)</td></tr>
+        <tr><td><b>DFS three-colouring</b></td><td>cycle detection — WHITE/GRAY/BLACK; a GRAY → GRAY back edge means a cycle exists</td></tr>
+        <tr><td><b>Bully algorithm</b></td><td>leader election — highest-priority alive node wins; simple, O(n²) messages, not partition-safe</td></tr>
+        <tr><td><b>Raft consensus</b></td><td>production alternative to Bully — majority-quorum + log replication; partition-safe</td></tr>
+        <tr><td><b>Fencing token</b></td><td>monotonically increasing epoch per assignment; stale writes with lower token are rejected</td></tr>
+        <tr><td><b>Idempotency key</b></td><td>client UUID; server stores response for 24 h; duplicate requests return the original</td></tr>
+      </tbody></table></div>
+      <div class="card"><table><tbody>
+        <tr><td><b>Effective exactly-once</b></td><td>at-least-once delivery + idempotent handler = user perceives exactly-once</td></tr>
+        <tr><td><b>Exponential backoff + jitter</b></td><td><code>min(initial · mult^(n-1), max) × rand(0.9, 1.1)</code> — spreads retry storms</td></tr>
+        <tr><td><b>Dead-letter queue</b></td><td>terminal-failure bucket after <code>maxRetries</code>; pages ops for manual review</td></tr>
+        <tr><td><b>Round-Robin assignment</b></td><td>counter % workers.size() — even distribution over time, O(1)</td></tr>
+        <tr><td><b>Least-Loaded assignment</b></td><td>min(currentLoad), tie-break by registeredAt — capacity-aware, O(n)</td></tr>
+        <tr><td><b>SWIM / gossip protocol</b></td><td>failure detection via random peer probes; O(log N) propagation; no single detector</td></tr>
+        <tr><td><b>State machine</b></td><td>PENDING → QUEUED → ASSIGNED → RUNNING → COMPLETED / FAILED / TIMED_OUT / CANCELLED; guarded transitions</td></tr>
+      </tbody></table></div>
+    </div>
+  </section>
+
+  <footer>
+    <p>Use case 17 · Distributed Task Scheduler (Airflow / Celery / Temporal) — Canvas 1 of 3 (HLD). Grounded in <code>17-distributed-task-scheduler/docs/hld/HIGH_LEVEL_DESIGN.md</code>.</p>
+    <p class="run">This use case: HLD (you are here) · <a href="lld.html">Canvas 2 · LLD</a> · <a href="deepdive.html">Canvas 3 · Deep-dive &amp; Trade-offs</a> &nbsp;|&nbsp; <a href="../index.html">Hub</a></p>
+  </footer>
+
+</div>
+<script src="../assets/canvas.js"></script>
+</body>
+</html>

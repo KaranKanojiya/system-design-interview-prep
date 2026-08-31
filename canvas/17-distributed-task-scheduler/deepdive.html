@@ -1,0 +1,903 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>17 · Distributed Task Scheduler — Deep-dive &amp; Trade-offs</title>
+<link rel="stylesheet" href="../assets/canvas.css">
+</head>
+<body>
+
+<div class="wrap">
+
+  <header class="hero">
+    <h1>Distributed Task Scheduler — Deep-dive &amp; Trade-offs</h1>
+    <div class="sub">Canvas 3 of 3. Staff-engineer defensible answers for a full interview. Leader election (Bully vs Raft vs ZooKeeper vs single-master) · exactly-once via idempotency key + fencing token + terminal-state guard · CAP split (task state CP · heartbeats AP) · Kahn's topological sort for DAGs · exponential backoff with jitter and DLQ · 8 bottlenecks with mitigations · 12-row trade-off table · 35-minute interview walkthrough.</div>
+    <div class="badges">
+      <span class="badge lvl">Use case 17 · Deep-dive</span>
+      <span class="badge">Canvas 3 of 3</span>
+      <span class="badge">interview-defensible</span>
+      <span class="badge">Airflow · Celery · Temporal · Prefect</span>
+    </div>
+    <div class="legend">
+      <span><i class="dot" style="background:var(--eden)"></i> preferred / winner</span>
+      <span><i class="dot" style="background:var(--survivor)"></i> conditional / hybrid</span>
+      <span><i class="dot" style="background:var(--warn)"></i> avoid / red flag</span>
+      <span><i class="dot" style="background:var(--fig)"></i> deep-dive detail</span>
+    </div>
+  </header>
+
+  <!-- A · LEADER ELECTION -->
+  <section>
+    <div class="sec-h"><span class="n">A</span><h2>Leader election — Bully vs Raft vs ZooKeeper vs single</h2><span class="tag">who fires the cron?</span></div>
+    <div data-tabscope>
+      <div class="tabs">
+        <div class="tab active" data-tab="bully">Bully</div>
+        <div class="tab" data-tab="raft">Raft</div>
+        <div class="tab" data-tab="zk">ZooKeeper</div>
+        <div class="tab" data-tab="single">Single-master</div>
+      </div>
+
+      <div class="tabpanel active" data-panel="bully">
+        <p><b>Bully algorithm</b> — every scheduler node has a numeric priority. The highest-priority ALIVE node becomes the leader. It's what <code>LeaderElectionService.java</code> implements.</p>
+        <pre class="code"><span class="cm">// From LeaderElectionService.electLeader()</span>
+List&lt;SchedulerNode&gt; alive = allNodes.stream()
+    .filter(n -&gt; n.isAlive(ALIVE_TIMEOUT))
+    .toList();
+
+SchedulerNode leader = alive.stream()
+    .max(Comparator.comparingInt(SchedulerNode::getPriority)
+                   .thenComparing(SchedulerNode::getNodeId))
+    .orElseThrow();
+
+<span class="cm">// Each node self-checks: am I the highest? If yes, claim leadership.</span>
+<span class="cm">// If a higher-priority node comes back, it "bullies" the current leader out.</span></pre>
+        <ul class="tight">
+          <li><b>Election time:</b> O(N) messages. ~seconds on 10 nodes.</li>
+          <li><b>Split-brain risk:</b> <span style="color:var(--warn)">HIGH</span> on partition — both sides may elect their own leader. Requires <b>fencing tokens</b> (see § B) to be safe.</li>
+          <li><b>Complexity:</b> LOW. ~150 lines of code. Easy to test.</li>
+          <li><b>Ops burden:</b> LOW. No external cluster. Uses existing DB (DynamoDB) for heartbeats.</li>
+        </ul>
+        <div class="callout tip"><b>When Bully wins:</b> small clusters (3–7 schedulers) where you already trust the DB for coordination and want zero external dependencies. Airflow's HA scheduler uses a similar pattern with a Postgres row lock.</div>
+      </div>
+
+      <div class="tabpanel" data-panel="raft">
+        <p><b>Raft consensus</b> — a majority quorum protocol. Nodes vote for a leader in numbered terms; a candidate wins only if it collects votes from more than N/2 nodes.</p>
+        <pre class="code"><span class="cm">// Simplified Raft leader-election state machine</span>
+FOLLOWER  ──(election timeout)──►  CANDIDATE
+CANDIDATE ──(RequestVote to all)──► collects votes
+CANDIDATE ──(majority YES)──►     LEADER  (term = term + 1)
+CANDIDATE ──(higher-term seen)──► FOLLOWER
+LEADER    ──(heartbeat every 50 ms)──► followers
+LEADER    ──(quorum unreachable)──►   step down
+
+<span class="cm">// Log replication:</span>
+<span class="cm">//   Every leader command is appended to a log entry.</span>
+<span class="cm">//   Leader replicates entries to a majority BEFORE applying.</span>
+<span class="cm">//   A follower can only vote for a candidate whose log is at least as up-to-date.</span></pre>
+        <ul class="tight">
+          <li><b>Election time:</b> 150–500 ms typical (randomised election timeout avoids duel-vote).</li>
+          <li><b>Split-brain risk:</b> <span style="color:var(--eden)">NONE</span> — a leader without quorum immediately steps down. Only ONE side of a partition can have a leader.</li>
+          <li><b>Complexity:</b> HIGH. Log replication, snapshotting, membership changes are non-trivial. Use a proven library — <code>hashicorp/raft</code>, <code>etcd-io/raft</code>, <code>MicroRaft</code>.</li>
+          <li><b>Ops burden:</b> MEDIUM. Need an odd number of nodes (3 or 5). Rolling restarts must respect quorum.</li>
+        </ul>
+        <div class="callout tip"><b>When Raft wins:</b> when you need <b>correct-by-construction</b> single-leader guarantees and can afford 3 or 5 dedicated coordinator nodes. It's what powers etcd, Consul, CockroachDB, and Temporal's history service.</div>
+      </div>
+
+      <div class="tabpanel" data-panel="zk">
+        <p><b>ZooKeeper</b> is an external CP coordination store (itself built on the ZAB protocol, close cousin of Paxos/Raft). Leader election is a well-known recipe using <b>ephemeral sequential znodes</b>.</p>
+        <pre class="code"><span class="cm">// ZooKeeper leader-election recipe</span>
+1. Every candidate creates an EPHEMERAL_SEQUENTIAL child under /scheduler/leader/
+     e.g. /scheduler/leader/n_0000000012
+2. Candidate lists all children, sorted by sequence number.
+3. If MY znode is the lowest sequence, I am the leader.
+4. Otherwise: watch the znode immediately below mine.
+     When it disappears (session death), re-check step 3.
+
+<span class="cm">// Ephemeral = auto-deleted when the client's session dies.</span>
+<span class="cm">// Sequential = ZK assigns strictly-increasing monotonic sequences.</span>
+<span class="cm">// Watching only the predecessor avoids the "herd effect" on failover.</span></pre>
+        <ul class="tight">
+          <li><b>Election time:</b> ~100–300 ms after session death (tick-based detection).</li>
+          <li><b>Split-brain risk:</b> <span style="color:var(--eden)">NONE</span> on ZK's side — a partitioned ZK follower will refuse writes.</li>
+          <li><b>Complexity:</b> MEDIUM. The client recipe is small; but you inherit ZooKeeper's operational surface (ensembles, JVM tuning, log compaction).</li>
+          <li><b>Ops burden:</b> HIGH. You now run a stateful CP cluster (3 or 5 ZK nodes) in addition to your scheduler.</li>
+        </ul>
+        <div class="callout tip"><b>When ZooKeeper wins:</b> when you already have a ZK ensemble (Kafka, Hadoop, HBase shops) and want a battle-tested recipe. Modern alternatives — <b>etcd</b> and <b>Consul</b> — offer the same primitives with a smaller footprint.</div>
+      </div>
+
+      <div class="tabpanel" data-panel="single">
+        <p><b>Single-master</b> = one scheduler node, no HA. Simpler than any consensus protocol; ships in a day.</p>
+        <pre class="code"><span class="cm">// One process. No election. If it crashes, an operator restarts it.</span>
+public class Scheduler {
+  public static void main(String[] args) {
+    while (true) {
+      List&lt;Task&gt; ready = engine.tick();
+      dispatch(ready);
+      sleep(1000);
+    }
+  }
+}</pre>
+        <ul class="tight">
+          <li><b>Election time:</b> N/A — no election. Recovery = human intervention + process restart (~minutes).</li>
+          <li><b>Split-brain risk:</b> <span style="color:var(--eden)">NONE</span> by construction — there is only ever one.</li>
+          <li><b>Complexity:</b> TRIVIAL. Zero coordination code.</li>
+          <li><b>Ops burden:</b> LOW day-to-day, HIGH on incident. No automatic failover means SLA lives and dies with one node.</li>
+        </ul>
+        <div class="callout warn"><b>Only viable when:</b> workload is small (&lt; 100 tasks/min), 30-minute recovery is tolerable, and you can run a standby manually. This is what <b>Celery Beat</b> ships out of the box — a single point of failure for cron scheduling.</div>
+      </div>
+    </div>
+
+    <table style="margin-top:14px">
+      <thead><tr><th>Aspect</th><th>Bully</th><th>Raft <span style="color:var(--eden)">← strongest</span></th><th>ZooKeeper</th><th>Single</th></tr></thead>
+      <tbody>
+        <tr><td>Election time</td><td>seconds</td><td>150–500 ms</td><td>100–300 ms</td><td>minutes (manual)</td></tr>
+        <tr><td>Split-brain risk</td><td>HIGH (needs fencing)</td><td>NONE (quorum)</td><td>NONE (external CP)</td><td>NONE (only one)</td></tr>
+        <tr><td>Complexity</td><td>LOW</td><td>HIGH</td><td>MEDIUM</td><td>TRIVIAL</td></tr>
+        <tr><td>Ops burden</td><td>LOW</td><td>MEDIUM</td><td>HIGH (extra cluster)</td><td>LOW day-to-day / HIGH on incident</td></tr>
+        <tr><td>Cost</td><td>zero infra</td><td>3–5 nodes</td><td>3–5 ZK nodes + your scheduler</td><td>zero infra</td></tr>
+        <tr><td>Best for</td><td>small clusters w/ shared DB</td><td>strict correctness</td><td>existing ZK shops</td><td>hobby / MVP</td></tr>
+      </tbody>
+    </table>
+    <div class="callout tip"><b>Our pick:</b> <b>Bully + fencing tokens</b> for the reference implementation — cheapest and safe when paired with a monotonic epoch counter in DynamoDB. For a production-grade rewrite at 10× scale, migrate to <b>Raft</b> (or delegate to <b>etcd</b>). ZooKeeper only if it's already there.</div>
+
+    <div class="grid g2" style="margin-top:14px">
+      <div class="card">
+        <div class="kicker">Lease-based leadership — the 30 s number, defended</div>
+        <pre class="code"><span class="cm">// Lease duration = 30 s · Heartbeat = 10 s · Grace = 20 s</span>
+T=0    scheduler-1 acquires lease (leaseTTL = T + 30 s)
+T=10   scheduler-1 renews (leaseTTL = T + 40 s)
+T=20   scheduler-1 renews (leaseTTL = T + 50 s)
+T=25   scheduler-1 CRASHES
+T=50   lease expires (leaseTTL &lt; now)
+T=51   scheduler-2 acquires lease, epoch += 1</pre>
+        <table>
+          <thead><tr><th>Lease</th><th>Pro</th><th>Con</th></tr></thead>
+          <tbody>
+            <tr><td>5 s</td><td>fast failover</td><td>false positives on GC pauses; 6× more DDB writes</td></tr>
+            <tr><td><b>30 s</b> <span style="color:var(--eden)">← ours</span></td><td>tolerates GC + network hiccups</td><td>30 s failover delay — acceptable for a task scheduler</td></tr>
+            <tr><td>5 min</td><td>near-zero renewal cost</td><td>5 min of stuck cron on leader crash — too long</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="card">
+        <div class="kicker">Split-brain scenario — with vs without fencing</div>
+        <pre class="code">T=0    scheduler-1 leader (epoch=5)
+T=10   scheduler-1 enqueues task-X (msg carries epoch=5)
+T=11   partition isolates scheduler-1
+T=42   scheduler-2 elected (epoch=6)
+T=45   scheduler-1's msg (epoch=5) arrives at SQS
+
+WITHOUT fencing → worker executes task-X twice
+WITH fencing → worker reads current epoch = 6 from DDB
+              sees msg epoch (5) &lt; 6 → drop message
+              → correct: task-X executes only under epoch 6</pre>
+      </div>
+    </div>
+  </section>
+
+  <!-- B · EXACTLY-ONCE -->
+  <section>
+    <div class="sec-h"><span class="n">B</span><h2>Exactly-once semantics — the 4 mechanisms that add up</h2><span class="tag">no double-execution, ever</span></div>
+    <div class="callout warn"><b>Foundational fact:</b> true exactly-once <b>delivery</b> is impossible in a distributed system. If the sender times out mid-write, it cannot distinguish "delivered but ACK lost" from "not delivered." What we build instead is <b>at-least-once delivery + idempotent processing</b> — the <i>observed</i> effect is exactly-once.</div>
+    <div data-tabscope>
+      <div class="tabs">
+        <div class="tab active" data-tab="idem-key">Idempotency key</div>
+        <div class="tab" data-tab="fencing">Fencing token</div>
+        <div class="tab" data-tab="terminal-guard">Terminal-state guard</div>
+        <div class="tab" data-tab="at-least-once">At-least-once + idempotent</div>
+      </div>
+
+      <div class="tabpanel active" data-panel="idem-key">
+        <p><b>Idempotency key</b> — a client-generated UUID (or a stable natural key like <code>{taskId}-{dagRunId}-attempt-{n}</code>) that flows end-to-end through every hop.</p>
+        <pre class="code"><span class="cm">// 1) Client / scheduler creates the key</span>
+String key = task.getId() + "-" + dagRunId + "-attempt-" + attemptNumber;
+
+<span class="cm">// 2) Enqueue to SQS FIFO with the key as MessageDeduplicationId</span>
+sqs.sendMessage(SendMessageRequest.builder()
+    .queueUrl(queueUrl)
+    .messageBody(payload)
+    .messageDeduplicationId(key)     <span class="cm">// SQS dedup window = 5 min</span>
+    .messageGroupId(dagRunId)
+    .build());
+
+<span class="cm">// 3) DB stores UNIQUE(idempotency_key)</span>
+INSERT INTO task_executions (idempotency_key, task_id, status, ...)
+  VALUES (?, ?, 'RUNNING', ...)
+  ON CONFLICT (idempotency_key) DO NOTHING
+  RETURNING *;
+<span class="cm">// If 0 rows returned → duplicate; short-circuit and reuse the prior execution.</span></pre>
+        <ul class="tight">
+          <li><b>Retry-safe:</b> retries reuse the same key → same execution row → no duplicate side effects.</li>
+          <li><b>Attempt suffix matters:</b> if the key were just <code>taskId-dagRunId</code>, SQS FIFO's 5-minute dedup would reject legitimate retries. Include <code>attempt-{n}</code>.</li>
+          <li><b>Downstream:</b> the same key flows into external services (Stripe, PagerDuty) as their <code>Idempotency-Key</code> header — belt-and-braces across the whole call chain.</li>
+        </ul>
+      </div>
+
+      <div class="tabpanel" data-panel="fencing">
+        <p><b>Fencing token</b> — a monotonic epoch counter that increments on every leader election. Every dispatched command carries the epoch under which it was issued. Workers reject any command whose epoch is older than what they've already seen.</p>
+        <pre class="code"><span class="cm">// Leader claim — DynamoDB atomic counter</span>
+UpdateItem:
+  PK = "LEADER#scheduler",  SK = "LOCK"
+  UpdateExpression: SET epoch = epoch + 1, nodeId = :me, leaseTTL = :now + 30s
+  ConditionExpression: "attribute_not_exists(PK) OR leaseTTL &lt; :now"
+Returns: { epoch: 6, nodeId: "scheduler-2" }
+
+<span class="cm">// Every message emitted by the leader carries the epoch</span>
+{ "taskId": "T-42", "dagRunId": "R-9", "epoch": 6, ... }
+
+<span class="cm">// Worker validates before executing</span>
+long myEpoch = getKnownMaxEpoch();  <span class="cm">// cached, refreshed periodically</span>
+if (msg.epoch &lt; myEpoch) {
+  log.warn("stale leader command, epoch {} &lt; {}, dropping", msg.epoch, myEpoch);
+  sqs.deleteMessage(msg);   <span class="cm">// don't execute — just drain the stale msg</span>
+  return;
+}</pre>
+        <div class="callout tip"><b>Why this is essential:</b> the Bully algorithm can produce a brief split-brain during a partition. Without fencing, both leaders enqueue the same cron trigger → double-execution. With fencing, the older leader's messages are dropped harmlessly at the worker.</div>
+      </div>
+
+      <div class="tabpanel" data-panel="terminal-guard">
+        <p><b>Terminal-state guard</b> — <code>COMPLETED</code>, <code>FAILED</code>, <code>CANCELLED</code>, and <code>TIMED_OUT</code> are absorbing states. Once a task is in one of them, no further transition is allowed. This is enforced by the state-machine transition table, not by "hope."</p>
+        <pre class="code"><span class="cm">// TaskStatus.java</span>
+public boolean isTerminal() {
+  return this == COMPLETED || this == FAILED
+      || this == CANCELLED || this == TIMED_OUT;
+}
+
+<span class="cm">// TaskService.updateStatus() — reject any transition from a terminal state</span>
+public void updateStatus(Task task, TaskStatus target) {
+  if (task.getStatus().isTerminal()) {
+    throw new IllegalStateTransition(
+      "cannot transition " + task.getStatus() + " → " + target);
+  }
+  <span class="cm">// Same enforcement at the DB layer:</span>
+  <span class="cm">// UPDATE tasks SET status = ? WHERE id = ? AND status NOT IN ('COMPLETED','FAILED',…)</span>
+  <span class="cm">// If 0 rows updated, the task is already terminal — swallow the update.</span>
+}</pre>
+        <ul class="tight">
+          <li><b>Guards against replay:</b> a delayed message that would re-run a COMPLETED task is rejected at both the app and DB layers.</li>
+          <li><b>Guards against crash-recovery:</b> a worker that crashed AFTER writing COMPLETED but BEFORE deleting the SQS message → SQS redelivers → next worker sees COMPLETED → no-op.</li>
+          <li><b>Cancellation is not always available:</b> we explicitly refuse <code>cancel()</code> once the task is already COMPLETED.</li>
+        </ul>
+      </div>
+
+      <div class="tabpanel" data-panel="at-least-once">
+        <p><b>The formula:</b></p>
+        <pre class="code">EXACTLY-ONCE EFFECT = AT-LEAST-ONCE DELIVERY + IDEMPOTENT PROCESSING</pre>
+        <p>Each layer catches what the others miss. The customer observes each task running once, even though messages may be delivered multiple times.</p>
+        <table>
+          <thead><tr><th>Layer</th><th>Guarantee</th><th>Failure it catches</th></tr></thead>
+          <tbody>
+            <tr><td>SQS FIFO delivery</td><td>at-least-once (never lost)</td><td>Worker crash mid-execution → message re-appears after VisibilityTimeout.</td></tr>
+            <tr><td>SQS <code>MessageDeduplicationId</code></td><td>5-minute dedup</td><td>Scheduler retries the same enqueue within 5 min.</td></tr>
+            <tr><td>DynamoDB conditional write (CAS)</td><td>only one worker claims</td><td>Two workers both receive the same message → only one wins <code>status = QUEUED → RUNNING</code>.</td></tr>
+            <tr><td>Terminal-state guard</td><td>no re-run once done</td><td>Late replay after COMPLETED → rejected silently.</td></tr>
+            <tr><td>Application-level idempotency</td><td>side effects safe</td><td>Downstream service (charge, email) uses <code>Idempotency-Key</code> to dedupe.</td></tr>
+          </tbody>
+        </table>
+        <div class="callout tip"><b>Interview mic-drop:</b> "True exactly-once delivery is impossible over an unreliable network — you can prove it by the FLP result. What we build is at-least-once delivery + an idempotent processor. Every retry-safe hop — SQS dedup, DynamoDB CAS, terminal-state guard, downstream idempotency-key — is a layer in that stack. Any one layer can fail and the others still preserve correctness."</div>
+      </div>
+    </div>
+
+    <div class="grid g2" style="margin-top:14px">
+      <div class="card">
+        <div class="kicker">Numbered call chain — exactly-once lifecycle</div>
+        <pre class="code">1. Scheduler enqueues task "transform" to SQS FIFO
+     { taskId: "T", dagRunId: "R", idempotencyKey: "T-R-attempt-1", epoch: 6 }
+2. DynamoDB row set to status = QUEUED before enqueue (write-then-publish)
+3. SQS delivers to Worker-A (long-polling ReceiveMessage)
+4. SQS also delivers to Worker-B (redelivery — at-least-once)
+5. Worker-A: DDB UpdateItem SET status = RUNNING WHERE status = QUEUED  → OK
+6. Worker-B: same UpdateItem → ConditionalCheckFailedException
+7. Worker-B: log "already claimed", DeleteMessage, move on
+8. Worker-A: execute the transform (HTTP call with same idempotencyKey)
+9. Worker-A: DDB UpdateItem SET status = COMPLETED, result = { … }
+10. Worker-A: DeleteMessage from SQS
+11. Worker-A: publish TaskCompleted event → EventBridge
+12. Scheduler: consumes event, decrements successors' indegree, unblocks Load</pre>
+      </div>
+
+      <div class="card">
+        <div class="kicker">The 4 crash scenarios &amp; where each is caught</div>
+        <table>
+          <thead><tr><th>Scenario</th><th>Where caught</th></tr></thead>
+          <tbody>
+            <tr><td>Worker-A crashes AFTER SQS receive but BEFORE claim</td><td>SQS re-delivers after VisibilityTimeout; another worker claims cleanly.</td></tr>
+            <tr><td>Worker-A crashes AFTER claim but BEFORE downstream HTTP call</td><td>FailoverService detects stale heartbeat &gt; 30 s → status flipped back to QUEUED → re-enqueue with attempt+1.</td></tr>
+            <tr><td>Worker-A crashes AFTER HTTP call but BEFORE writing COMPLETED</td><td>Same failover path; retry uses same <code>Idempotency-Key</code> → downstream service returns cached response, no double effect.</td></tr>
+            <tr><td>Worker-A crashes AFTER COMPLETED write but BEFORE DeleteMessage</td><td>SQS re-delivers; second worker sees status = COMPLETED (terminal-state guard) → no-op → DeleteMessage.</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+
+  <!-- C · CAP SPLIT -->
+  <section>
+    <div class="sec-h"><span class="n">C</span><h2>CAP split — different subsystems, different guarantees</h2><span class="tag">the key interview insight</span></div>
+    <p>A distributed task scheduler is <b>not one CAP problem</b>. Task correctness is CP; observability is AP. Knowing which is which is what separates a passing answer from a staff-level answer.</p>
+    <table>
+      <thead><tr><th>Subsystem</th><th>Choice</th><th>PACELC</th><th>Why</th></tr></thead>
+      <tbody>
+        <tr><td><b>Scheduler leader / task queue</b></td><td><b>CP</b></td><td>PC / EC</td><td>Single-writer via leader election. Two leaders = duplicate cron fires. Refuse to enqueue rather than double-fire.</td></tr>
+        <tr><td><b>Task repository</b> (state machine)</td><td><b>CP</b></td><td>PC / EC</td><td>Postgres primary (or DynamoDB conditional write). <code>QUEUED → RUNNING</code> must be a CAS. Isolation via the DB, not via hope.</td></tr>
+        <tr><td><b>DAG dependency state</b></td><td><b>CP</b></td><td>PC / EC</td><td>Transform must NOT start until Extract is truly COMPLETED. A stale read = premature execution = garbage data.</td></tr>
+        <tr><td><b>Task priority queue</b></td><td><b>CP</b></td><td>PC / EC</td><td>HIGH-priority task must overtake LOW. Ordering is an invariant, not a hint.</td></tr>
+        <tr><td><b>Worker heartbeat</b></td><td>AP</td><td>PA / EL</td><td>Gossip-style updates every 10 s; 30 s ALIVE_TIMEOUT tolerates 2–3 missed beats. Delayed failure detection is an acceptable cost of eventual consistency.</td></tr>
+        <tr><td><b>Execution audit log</b></td><td>AP</td><td>PA / EL</td><td>Append-only, idempotent. Missing the last 5 s of logs is acceptable — recover from workers on reconnect.</td></tr>
+        <tr><td><b>Metrics / dashboard</b></td><td>AP</td><td>PA / EL</td><td>Redis cache with 5 s TTL. Best-effort. 100 dashboard clients polling for strong reads would waste RCU for zero operational benefit.</td></tr>
+        <tr><td><b>Auto-scaler input (queue depth)</b></td><td>AP</td><td>PA / EL</td><td>60-second CloudWatch metric is fine — scaling decisions are not urgent.</td></tr>
+      </tbody>
+    </table>
+    <div class="callout tip"><b>The boundary matters:</b> CP path (task state, leader lease, DAG deps) uses DynamoDB conditional writes and strongly-consistent reads. AP path (heartbeats, metrics, logs) reads from Redis or eventually-consistent DDB. Never cross the paths — do NOT use the AP cache to drive a CP decision.</div>
+
+    <div class="grid g2" style="margin-top:14px">
+      <div class="card">
+        <div class="kicker">Graceful degradation — what stops, what continues</div>
+        <table>
+          <thead><tr><th>Failure</th><th>STOP</th><th>CONTINUE</th></tr></thead>
+          <tbody>
+            <tr><td>DynamoDB throttled</td><td>—</td><td>everything, with retries (5 ms → 50 ms)</td></tr>
+            <tr><td>DynamoDB down</td><td>new claims, new state transitions</td><td>already-running tasks; dashboard on Redis cache</td></tr>
+            <tr><td>SQS down</td><td>enqueue + dispatch</td><td>scheduler DAG resolution (buffered)</td></tr>
+            <tr><td>Leader lost</td><td>cron triggers, dep resolution</td><td>workers draining SQS backlog</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="card">
+        <div class="kicker">Design principle — <b>fail narrow, not wide</b></div>
+        <ul class="tight">
+          <li>DDB throttling should not stop SQS processing.</li>
+          <li>Scheduler down should not stop already-dispatched tasks.</li>
+          <li>Worker crash should not stop the leader from scheduling other work.</li>
+          <li>DLQ pile-up on one task type should not delay unrelated task types.</li>
+          <li>Every failure mode has an explicit "what continues" answer — <b>if you can't answer it, the design is wide-brittle.</b></li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <!-- D · DAG RESOLUTION -->
+  <section>
+    <div class="sec-h"><span class="n">D</span><h2>DAG resolution — Kahn's topological sort + cycle detection</h2><span class="tag">O(V + E), safe and standard</span></div>
+    <p>Every task can declare upstream dependencies. Before any task can be dispatched, we must (1) verify the DAG has no cycles and (2) produce a valid execution order. Kahn's algorithm does both in one pass.</p>
+
+    <div class="grid g2">
+      <div class="card">
+        <div class="kicker">Example DAG</div>
+        <p>ETL pipeline: <code>Extract</code> feeds <code>Transform</code> and <code>Validate</code>; both feed <code>Load</code>; <code>Load</code> triggers <code>Notify</code>. Note the diamond in the middle.</p>
+        <svg viewBox="0 0 420 200" style="width:100%;height:auto;background:var(--panel);border:1px solid var(--border);border-radius:8px">
+          <defs>
+            <marker id="dag-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+              <path d="M 0 0 L 10 5 L 0 10 z" fill="var(--muted)"/>
+            </marker>
+          </defs>
+          <rect x="20"  y="80"  width="80" height="42" rx="8" fill="var(--panel-2)" stroke="var(--eden)" stroke-width="2"/>
+          <text x="60"  y="100" text-anchor="middle" fill="var(--text)" font-size="12" font-weight="600">Extract</text>
+          <text x="60"  y="114" text-anchor="middle" fill="var(--muted)" font-size="10">indeg = 0</text>
+
+          <rect x="150" y="30"  width="80" height="42" rx="8" fill="var(--panel-2)" stroke="var(--stack)" stroke-width="2"/>
+          <text x="190" y="50"  text-anchor="middle" fill="var(--text)" font-size="12" font-weight="600">Transform</text>
+          <text x="190" y="64"  text-anchor="middle" fill="var(--muted)" font-size="10">indeg = 1</text>
+
+          <rect x="150" y="130" width="80" height="42" rx="8" fill="var(--panel-2)" stroke="var(--stack)" stroke-width="2"/>
+          <text x="190" y="150" text-anchor="middle" fill="var(--text)" font-size="12" font-weight="600">Validate</text>
+          <text x="190" y="164" text-anchor="middle" fill="var(--muted)" font-size="10">indeg = 1</text>
+
+          <rect x="280" y="80"  width="60" height="42" rx="8" fill="var(--panel-2)" stroke="var(--survivor)" stroke-width="2"/>
+          <text x="310" y="100" text-anchor="middle" fill="var(--text)" font-size="12" font-weight="600">Load</text>
+          <text x="310" y="114" text-anchor="middle" fill="var(--muted)" font-size="10">indeg = 2</text>
+
+          <rect x="360" y="80"  width="50" height="42" rx="8" fill="var(--panel-2)" stroke="var(--meta)" stroke-width="2"/>
+          <text x="385" y="100" text-anchor="middle" fill="var(--text)" font-size="12" font-weight="600">Notify</text>
+          <text x="385" y="114" text-anchor="middle" fill="var(--muted)" font-size="10">indeg = 1</text>
+
+          <line x1="100" y1="94"  x2="150" y2="55"  stroke="var(--muted)" stroke-width="1.4" marker-end="url(#dag-arr)"/>
+          <line x1="100" y1="108" x2="150" y2="150" stroke="var(--muted)" stroke-width="1.4" marker-end="url(#dag-arr)"/>
+          <line x1="230" y1="55"  x2="280" y2="94"  stroke="var(--muted)" stroke-width="1.4" marker-end="url(#dag-arr)"/>
+          <line x1="230" y1="150" x2="280" y2="108" stroke="var(--muted)" stroke-width="1.4" marker-end="url(#dag-arr)"/>
+          <line x1="340" y1="101" x2="360" y2="101" stroke="var(--muted)" stroke-width="1.4" marker-end="url(#dag-arr)"/>
+        </svg>
+      </div>
+
+      <div class="card">
+        <div class="kicker">Kahn's algorithm — step by step</div>
+        <pre class="code"><span class="cm">// Step 1: build indegree map</span>
+indeg = { Extract:0, Transform:1, Validate:1, Load:2, Notify:1 }
+
+<span class="cm">// Step 2: enqueue all indeg == 0 nodes (roots)</span>
+queue = [ Extract ]
+output = [ ]
+
+<span class="cm">// Step 3: drain the queue</span>
+while queue not empty:
+  n = queue.pop()
+  output.append(n)
+  for m in successors(n):
+    indeg[m] -= 1
+    if indeg[m] == 0:
+      queue.push(m)
+
+<span class="cm">// Step 4: check termination</span>
+if len(output) &lt; total_nodes:
+  raise CycleDetected      <span class="cm">// leftover indeg &gt; 0</span>
+return output</pre>
+        <p><b>Trace on our DAG:</b></p>
+        <ol class="tight">
+          <li>Pop <code>Extract</code>. Decrement <code>Transform → 0</code>, <code>Validate → 0</code>. Queue: <code>[Transform, Validate]</code>.</li>
+          <li>Pop <code>Transform</code>. Decrement <code>Load → 1</code>. Queue: <code>[Validate]</code>.</li>
+          <li>Pop <code>Validate</code>. Decrement <code>Load → 0</code>. Queue: <code>[Load]</code>.</li>
+          <li>Pop <code>Load</code>. Decrement <code>Notify → 0</code>. Queue: <code>[Notify]</code>.</li>
+          <li>Pop <code>Notify</code>. Queue empty. Output = <code>[Extract, Transform, Validate, Load, Notify]</code> — length 5 == node count. No cycle.</li>
+        </ol>
+      </div>
+    </div>
+
+    <div class="grid g2" style="margin-top:14px">
+      <div class="card">
+        <div class="kicker">Cycle detection — DFS with 3-colour marks</div>
+        <p>Kahn's algorithm detects cycles by <i>termination check</i> (unprocessed nodes = a cycle). An alternative is <b>DFS with WHITE / GRAY / BLACK</b> — better when you want to point at the offending edge for a user error message.</p>
+        <pre class="code"><span class="cm">// WHITE = unvisited, GRAY = on current DFS stack, BLACK = fully explored</span>
+color = { every node: WHITE }
+def dfs(n):
+  color[n] = GRAY
+  for m in successors(n):
+    if color[m] == GRAY:
+      raise CycleDetected(back_edge = n → m)   <span class="cm">// back-edge into stack</span>
+    if color[m] == WHITE:
+      dfs(m)
+  color[n] = BLACK
+
+for n in all_nodes:
+  if color[n] == WHITE:
+    dfs(n)</pre>
+        <p><b>Key rule:</b> encountering a <code>GRAY</code> node during traversal ⇒ a back-edge ⇒ a cycle. The path from that GRAY node back down the recursion stack is the actual cycle to report.</p>
+      </div>
+      <div class="card">
+        <div class="kicker">Complexity + practical notes</div>
+        <ul class="tight">
+          <li><b>Time:</b> O(V + E) — every node and every edge is visited once.</li>
+          <li><b>Space:</b> O(V) for the indegree map + queue.</li>
+          <li><b>Caching:</b> for CRON DAGs that run daily, cache the topological order and re-validate only when the DAG definition changes. This is what Airflow does with DAG-parse caching.</li>
+          <li><b>Dynamic dependencies:</b> if tasks can add dependencies at runtime (rare), re-run Kahn's each tick. O(V + E) is cheap.</li>
+          <li><b>Multiple valid orders:</b> Kahn's produces <i>one</i> topological order out of many valid ones. If the queue is a min-heap by priority, you get "prioritised topological order" — useful.</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <!-- E · RETRY & BACKOFF -->
+  <section>
+    <div class="sec-h"><span class="n">E</span><h2>Retry &amp; backoff — the formula walkthrough</h2><span class="tag">exponential + jitter + cap + DLQ</span></div>
+
+    <div class="grid g2">
+      <div class="card">
+        <div class="kicker">Pure exponential backoff</div>
+        <pre class="code"><span class="cm">// From ExponentialBackoffRetryStrategy.java</span>
+delay = base * 2^attempt
+
+attempt = 1 → 1000 ms
+attempt = 2 → 2000 ms
+attempt = 3 → 4000 ms
+attempt = 4 → 8000 ms
+attempt = 5 → 16000 ms
+...
+<span class="cm">// grows unboundedly — will exceed the SLA on attempt ~10</span></pre>
+        <p><b>Problem:</b> unbounded growth, plus <b>synchronised retries</b> — if a downstream outage fails 10 K tasks at the same instant, they all retry at exactly T+1s, T+3s, T+7s, … a <i>thundering herd</i> that keeps the downstream service on its knees.</p>
+      </div>
+
+      <div class="card">
+        <div class="kicker">Full-jitter recipe (AWS builder's library)</div>
+        <pre class="code"><span class="cm">// Full jitter: pick uniformly from [0, base * 2^attempt]</span>
+delay = random(0, base * 2^attempt)
+
+attempt = 1 → uniform(0, 1000)
+attempt = 2 → uniform(0, 2000)
+attempt = 3 → uniform(0, 4000)
+attempt = 4 → uniform(0, 8000)
+...
+<span class="cm">// Spreads retries evenly. Downstream sees ~constant load.</span></pre>
+        <p>Our implementation uses <b>±10 % jitter</b> around the exponential base — a milder variant that keeps some ordering guarantee. Full-jitter is stronger but sacrifices predictability. Both are correct answers; know both.</p>
+      </div>
+    </div>
+
+    <div class="grid g2" style="margin-top:14px">
+      <div class="card">
+        <div class="kicker">Cap on max delay</div>
+        <pre class="code"><span class="cm">// Without a cap, delay grows unboundedly</span>
+delay = min(base * 2^attempt, maxDelayMs)
+
+maxDelayMs = 30_000        <span class="cm">// 30 seconds</span>
+attempt = 10 → min(1024 s, 30 s) = 30 s   <span class="cm">// capped</span></pre>
+        <ul class="tight">
+          <li>Prevents pathological cases where a task waits an hour between retries.</li>
+          <li>Cap should be smaller than your SLA (5 min for a task = 30 s max delay).</li>
+          <li>Combine with a max-attempts count — otherwise a broken task retries forever at the cap.</li>
+        </ul>
+      </div>
+
+      <div class="card">
+        <div class="kicker">Dead-letter queue after N attempts</div>
+        <pre class="code"><span class="cm">// SQS redrive policy</span>
+{
+  "deadLetterTargetArn": "arn:aws:sqs:...:tasks-dlq",
+  "maxReceiveCount": 3      <span class="cm">// after 3 failed receives → DLQ</span>
+}
+
+<span class="cm">// Application-level</span>
+if (attemptNumber &gt; task.getMaxRetries()) {
+  task.updateStatus(FAILED);        <span class="cm">// terminal</span>
+  dlq.publish(task, lastError);     <span class="cm">// alarm on DLQ depth &gt; 0</span>
+  pageOnCall(task, lastError);      <span class="cm">// human eyes</span>
+}</pre>
+        <p>DLQ is where <b>poison pills</b> end up — messages that will fail no matter how many times you retry them. Always alarm on DLQ depth &gt; 0 for &gt; 5 min.</p>
+      </div>
+    </div>
+
+    <div class="grid g2" style="margin-top:14px">
+      <div class="card">
+        <div class="kicker">Delay table — 1 s base, 30 s cap, full-jitter</div>
+        <table>
+          <thead><tr><th>Attempt</th><th>Ceiling (base·2^n)</th><th>Sampled delay range</th></tr></thead>
+          <tbody>
+            <tr><td>1</td><td>1 000 ms</td><td>0 – 1 000 ms</td></tr>
+            <tr><td>2</td><td>2 000 ms</td><td>0 – 2 000 ms</td></tr>
+            <tr><td>3</td><td>4 000 ms</td><td>0 – 4 000 ms</td></tr>
+            <tr><td>4</td><td>8 000 ms</td><td>0 – 8 000 ms</td></tr>
+            <tr><td>5</td><td>16 000 ms</td><td>0 – 16 000 ms</td></tr>
+            <tr><td>6</td><td>32 000 ms → capped 30 000</td><td>0 – 30 000 ms</td></tr>
+            <tr><td>7+</td><td>capped 30 000</td><td>0 – 30 000 ms</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="card">
+        <div class="kicker">When to give up — the DLQ contract</div>
+        <ul class="tight">
+          <li><b>Retry budget per task:</b> <code>maxRetries = 3</code> by default; override per task type.</li>
+          <li><b>Retry budget per queue:</b> SQS <code>maxReceiveCount = 3</code> — after 3 failed receives, message → DLQ.</li>
+          <li><b>Alarm on:</b> <code>DLQ.depth &gt; 0 for &gt; 5 min</code>; page on-call.</li>
+          <li><b>Runbook:</b> inspect DLQ payload → categorise (bug · bad input · downstream outage) → fix or drop.</li>
+          <li><b>Never:</b> auto-replay DLQ back into the main queue without human triage — that's how poison pills flood you a second time.</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="callout tip" style="margin-top:14px"><b>Thundering-herd mitigation, in one line:</b> <code>delay = min(random(0, base × 2^attempt), maxDelay)</code>. Randomises the retry moment (spreads herd), grows with attempts (backs off from persistent failures), caps at a bounded worst-case (respects the SLA), and combined with <code>maxRetries</code> + DLQ keeps the queue from growing forever.</div>
+  </section>
+
+  <!-- F · BOTTLENECKS -->
+  <section>
+    <div class="sec-h"><span class="n">F</span><h2>Bottlenecks &amp; mitigations</h2><span class="tag">the 8 things that will kill you</span></div>
+
+    <div class="card collapsible open">
+      <div class="c-head">1 · Single leader = throughput ceiling</div>
+      <div class="c-body">
+        <p><b>Symptom:</b> as tasks/sec grows, the single leader can't parse cron entries, resolve dependencies, and dispatch fast enough. Airflow hits this ceiling around 1 000 tasks/min.</p>
+        <p><b>Mitigation:</b> <b>shard by task-group</b>. Partition the DAG namespace across N leaders (each owning a hash of <code>groupId</code>). Leader election still runs — but each of the N leaders is authoritative only for its slice. Combine with consistent hashing so re-balancing on failover is minimal.</p>
+      </div>
+    </div>
+
+    <div class="card collapsible">
+      <div class="c-head">2 · Task queue depth grows unboundedly under burst</div>
+      <div class="c-body">
+        <p><b>Symptom:</b> a burst of 500 K DAG submissions floods SQS in 30 seconds. Workers can only drain at 3 000/sec cluster-wide. Queue depth explodes; client polling starves.</p>
+        <p><b>Mitigation:</b> <b>burst absorption + back-pressure</b>. SQS holds the burst (14-day retention). Auto-scale workers on queue-depth signal. If depth &gt; threshold for &gt; 5 min, return <code>429 Too Many Requests</code> to submission API — clients back off. Priority topics ensure critical tasks still flow.</p>
+      </div>
+    </div>
+
+    <div class="card collapsible">
+      <div class="c-head">3 · DAG topological sort cost on every tick</div>
+      <div class="c-body">
+        <p><b>Symptom:</b> a DAG with 10 000 tasks is re-topo-sorted on every scheduler tick (1 s). O(V + E) is cheap once, expensive at 1 Hz × 10 K nodes.</p>
+        <p><b>Mitigation:</b> <b>cache the indegree map</b>. Store the initial topological order on DAG-submit. On completion, decrement successors' indegree in O(fan-out). Only recompute if the DAG definition itself changes (rare). This turns the tick from O(V+E) into O(fan-out per completion).</p>
+      </div>
+    </div>
+
+    <div class="card collapsible">
+      <div class="c-head">4 · Worker heartbeat storm</div>
+      <div class="c-body">
+        <p><b>Symptom:</b> 10 000 workers all heartbeat at T=0, T=10, T=20, … → DynamoDB write spike every 10 s → throttling. Same on failover — every worker registers within a 1-second window.</p>
+        <p><b>Mitigation:</b> <b>randomised heartbeat intervals</b>. Instead of exactly 10 s, use <code>10 s ± random(0, 3 s)</code>. Spreads writes uniformly over 13 s. Same jitter applied on worker startup smooths the registration burst.</p>
+      </div>
+    </div>
+
+    <div class="card collapsible">
+      <div class="c-head">5 · Retry storm on downstream outage</div>
+      <div class="c-body">
+        <p><b>Symptom:</b> a downstream microservice (say, the transform HTTP API) goes down. Every task calling it fails. All retries pile up on the same broken endpoint. When it comes back, it's crushed by the retry backlog.</p>
+        <p><b>Mitigation:</b> <b>circuit breaker + backoff</b>. Track error-rate per downstream. If &gt; 50 % for a rolling window, open the circuit — fail-fast without calling. Half-open probes gradually restore. Combined with exponential backoff, the retry rate stays bounded.</p>
+      </div>
+    </div>
+
+    <div class="card collapsible">
+      <div class="c-head">6 · Cron fire-time contention</div>
+      <div class="c-body">
+        <p><b>Symptom:</b> 10 000 DAGs all fire at <code>0 0 * * *</code> (midnight UTC). At T=0 the scheduler tries to enqueue 10 K root tasks in the same second → DynamoDB partition hot → throttling.</p>
+        <p><b>Mitigation:</b> <b>jittered fire times</b>. When a DAG is defined with <code>0 0 * * *</code>, internally add a random offset in <code>[0, 60 s]</code> per DAG (stored once, stable across runs). Same UX ("fires around midnight"), but the actual fire is spread over a minute.</p>
+      </div>
+    </div>
+
+    <div class="card collapsible">
+      <div class="c-head">7 · Failover split-brain</div>
+      <div class="c-body">
+        <p><b>Symptom:</b> a network partition isolates the current leader. The other side re-elects. Both leaders think they're in charge → duplicate cron fires + double execution.</p>
+        <p><b>Mitigation:</b> <b>fencing tokens + lease renewal</b>. Every leader claim increments a monotonic epoch. Workers reject messages from stale epochs. Even if two leaders briefly coexist, only one produces effective work.</p>
+      </div>
+    </div>
+
+    <div class="card collapsible">
+      <div class="c-head">8 · Execution history growth</div>
+      <div class="c-body">
+        <p><b>Symptom:</b> every task run records ~1 KB of history. At 1 M runs/day = 1 GB/day = ~365 GB/year in DynamoDB. Cost balloons; query performance degrades.</p>
+        <p><b>Mitigation:</b> <b>30-day hot retention + S3 archive</b>. DynamoDB TTL removes rows after 30 days. A CDC stream to Kinesis Firehose lands full history in S3 as Parquet, partitioned by day. Historical queries hit Athena (cheap). Hot dashboard hits DDB (fast). Best of both.</p>
+      </div>
+    </div>
+
+    <div class="callout tip" style="margin-top:14px"><b>Rule of thumb — measure before you mitigate:</b> every mitigation above adds complexity. In an interview, spell out the metric that would trigger each mitigation (e.g. "shard when a single leader exceeds 800 dispatch/s p95 for 5 min"). Otherwise you're premature-optimising and the interviewer will call it out.</div>
+  </section>
+
+  <!-- G · CLOUD MAPPING -->
+  <section>
+    <div class="sec-h"><span class="n">G</span><h2>Cloud service mapping</h2><span class="tag">the same design on each cloud</span></div>
+    <table class="cloudtable">
+      <thead><tr>
+        <th>Component</th>
+        <th><span class="hdrlogo"><span class="logochip"><img src="../assets/logos/aws.svg" alt="AWS"></span>AWS</span></th>
+        <th><span class="hdrlogo"><span class="logochip"><img src="../assets/logos/gcp.svg" alt="GCP"></span>GCP</span></th>
+        <th><span class="hdrlogo"><span class="logochip"><img src="../assets/logos/azure.svg" alt="Azure"></span>Azure</span></th>
+      </tr></thead>
+      <tbody>
+        <tr>
+          <td>Workflow orchestration</td>
+          <td>Step Functions</td>
+          <td>Workflows</td>
+          <td>Logic Apps · Durable Functions</td>
+        </tr>
+        <tr>
+          <td>Task queue</td>
+          <td><img class="svcicon" src="../assets/logos/services/aws-sqs.svg" alt="">SQS FIFO</td>
+          <td><img class="svcicon" src="../assets/logos/services/gcp-pubsub.svg" alt="">Cloud Tasks / Pub/Sub</td>
+          <td><img class="svcicon" src="../assets/logos/services/azure-servicebus.svg" alt="">Service Bus (sessions)</td>
+        </tr>
+        <tr>
+          <td>Cron / scheduled triggers</td>
+          <td>EventBridge Scheduler</td>
+          <td>Cloud Scheduler</td>
+          <td>Timer Triggers (Functions)</td>
+        </tr>
+        <tr>
+          <td>Worker compute</td>
+          <td><img class="svcicon" src="../assets/logos/services/aws-ecs.svg" alt="">Lambda · ECS Fargate</td>
+          <td><img class="svcicon" src="../assets/logos/services/gcp-run.svg" alt="">Cloud Run · Cloud Functions</td>
+          <td><img class="svcicon" src="../assets/logos/services/azure-aks.svg" alt="">Container Apps · AKS</td>
+        </tr>
+        <tr>
+          <td>Task state store (CAS)</td>
+          <td><img class="svcicon" src="../assets/logos/services/aws-dynamodb.svg" alt="">DynamoDB (conditional writes)</td>
+          <td><img class="svcicon" src="../assets/logos/services/gcp-bigtable.svg" alt="">Firestore · Bigtable</td>
+          <td><img class="svcicon" src="../assets/logos/services/azure-cosmos.svg" alt="">Cosmos DB (ETag)</td>
+        </tr>
+        <tr>
+          <td>Leader coordination store</td>
+          <td><img class="svcicon" src="../assets/logos/services/aws-dynamodb.svg" alt="">DynamoDB lease + fencing</td>
+          <td><img class="svcicon" src="../assets/logos/services/gcp-bigtable.svg" alt="">Firestore transactions</td>
+          <td><img class="svcicon" src="../assets/logos/services/azure-cosmos.svg" alt="">Cosmos DB (leases pattern)</td>
+        </tr>
+        <tr>
+          <td>Metrics / heartbeat cache</td>
+          <td><img class="svcicon" src="../assets/logos/services/aws-elasticache.svg" alt="">ElastiCache Redis</td>
+          <td><img class="svcicon" src="../assets/logos/services/gcp-memorystore.svg" alt="">Memorystore Redis</td>
+          <td><img class="svcicon" src="../assets/logos/services/azure-redis.svg" alt="">Azure Cache for Redis</td>
+        </tr>
+        <tr>
+          <td>Execution history / audit</td>
+          <td><img class="svcicon" src="../assets/logos/services/aws-s3.svg" alt="">S3 (Parquet, Athena)</td>
+          <td><img class="svcicon" src="../assets/logos/services/gcp-cloudstorage.svg" alt="">Cloud Storage · BigQuery</td>
+          <td><img class="svcicon" src="../assets/logos/services/azure-blob.svg" alt="">Blob Storage · Synapse</td>
+        </tr>
+        <tr>
+          <td>Event bus (completion fan-out)</td>
+          <td><img class="svcicon" src="../assets/logos/services/aws-sns.svg" alt="">EventBridge · SNS</td>
+          <td><img class="svcicon" src="../assets/logos/services/gcp-pubsub.svg" alt="">Pub/Sub</td>
+          <td><img class="svcicon" src="../assets/logos/services/azure-eventhubs.svg" alt="">Event Grid · Event Hubs</td>
+        </tr>
+      </tbody>
+    </table>
+    <div class="callout tip"><b>Managed alternative:</b> on AWS, <b>Step Functions</b> is the closest managed cousin of our design — it gives you exactly-once workflow execution, visual DAG, and built-in retry/backoff. Use it if you don't need to own the execution engine. Roll your own only when you need custom scheduling policies, multi-tenant isolation, or on-prem deployment.</div>
+  </section>
+
+  <!-- H · TRADE-OFFS -->
+  <section>
+    <div class="sec-h"><span class="n">H</span><h2>Trade-offs — 12 decisions you defend at the whiteboard</h2><span class="tag">picks + why</span></div>
+    <table>
+      <thead><tr><th>Decision</th><th>Choice</th><th>Alternative rejected</th><th>Why</th></tr></thead>
+      <tbody>
+        <tr>
+          <td>Queue ordering</td>
+          <td><b>Priority queue</b> (min-heap by TaskPriority)</td>
+          <td>FIFO</td>
+          <td>HIGH tasks must overtake LOW even if enqueued later. FIFO buries urgent work behind bulk backfills.</td>
+        </tr>
+        <tr>
+          <td>Leader election</td>
+          <td><b>Bully + fencing tokens</b></td>
+          <td>Raft · ZooKeeper</td>
+          <td>Bully is cheapest for small clusters; fencing tokens close the split-brain gap. Raft is correct-by-construction but adds a coordinator layer. Migrate at 10× scale.</td>
+        </tr>
+        <tr>
+          <td>Delivery guarantee</td>
+          <td><b>At-least-once + idempotent</b> = effective exactly-once</td>
+          <td>true exactly-once</td>
+          <td>True exactly-once delivery is impossible in a distributed system (FLP). At-least-once + idempotent processor is the standard workaround.</td>
+        </tr>
+        <tr>
+          <td>Queue durability</td>
+          <td><b>Durable (SQS · Service Bus)</b></td>
+          <td>in-memory queue</td>
+          <td>In-memory loses tasks on crash. Durable queue is the boundary between "trust the scheduler" and "trust the platform".</td>
+        </tr>
+        <tr>
+          <td>Worker assignment</td>
+          <td><b>LeastLoaded</b></td>
+          <td>RoundRobin</td>
+          <td>RoundRobin ignores heterogeneous worker capacity — a slow worker gets the same load as a fast one, becomes the bottleneck. LeastLoaded balances by current load.</td>
+        </tr>
+        <tr>
+          <td>Retry backoff</td>
+          <td><b>Exponential + jitter</b></td>
+          <td>fixed interval</td>
+          <td>Fixed interval creates thundering herd on shared downstream outages. Exponential + jitter spreads retries.</td>
+        </tr>
+        <tr>
+          <td>Retry execution</td>
+          <td><b>Async re-enqueue</b></td>
+          <td>synchronous retry in worker</td>
+          <td>Sync retry ties up a worker slot for minutes. Async re-enqueue frees the slot immediately; another worker (or same, later) picks it up.</td>
+        </tr>
+        <tr>
+          <td>External coordination</td>
+          <td><b>DynamoDB atomic counter</b></td>
+          <td>ZooKeeper · etcd · Consul</td>
+          <td>Already using DDB for task state; no need for a second stateful cluster. ZK / etcd / Consul only if you already have them.</td>
+        </tr>
+        <tr>
+          <td>State persistence model</td>
+          <td><b>Snapshot state (mutable rows)</b></td>
+          <td>event sourcing</td>
+          <td>Event sourcing gives perfect replay (Temporal's model) but adds complexity. Snapshot state + audit log is simpler and covers the interview bar.</td>
+        </tr>
+        <tr>
+          <td>DAG lifecycle</td>
+          <td><b>Static definition + dynamic runs</b></td>
+          <td>fully dynamic dependencies</td>
+          <td>Static DAG lets us pre-validate cycles at submit time and cache topo order. Dynamic-only is powerful but rarely needed.</td>
+        </tr>
+        <tr>
+          <td>Worker dispatch model</td>
+          <td><b>Worker pull</b> (poll SQS)</td>
+          <td>scheduler push (RPC)</td>
+          <td>Pull scales trivially — add a worker, it starts polling. Push requires the scheduler to track every worker's address and load.</td>
+        </tr>
+        <tr>
+          <td>Tenancy</td>
+          <td><b>Multi-tenant with per-tenant quotas</b></td>
+          <td>single-tenant per cluster</td>
+          <td>Single-tenant burns fleet capacity. Multi-tenant + quotas per tenant (max queue depth, max concurrent workers) gives isolation without over-provisioning.</td>
+        </tr>
+      </tbody>
+    </table>
+  </section>
+
+  <!-- I · INTERVIEW WALKTHROUGH -->
+  <section>
+    <div class="sec-h"><span class="n">I</span><h2>35-minute interview walkthrough</h2><span class="tag">the answer, timed</span></div>
+    <div class="grid g2">
+      <div class="card">
+        <div class="kicker">0 – 5 min · clarify scope &amp; priorities</div>
+        <ul class="tight">
+          <li>"Airflow-style DAGs, Celery-style task queue, or Temporal-style workflows? I'll assume Airflow-like: DAGs of tasks with dependencies, cron + one-time triggers, retries."</li>
+          <li>"How big — small team (1 K tasks/day) or platform-scale (1 M tasks/day)? I'll design for 1 M tasks/day = ~12 tasks/sec peak."</li>
+          <li>"Exactly-once required? Yes → I'll add idempotency keys and fencing tokens."</li>
+          <li>"Multi-tenant?" Assume yes → per-tenant quotas and priority.</li>
+        </ul>
+      </div>
+
+      <div class="card">
+        <div class="kicker">5 – 10 min · capacity + core APIs</div>
+        <ul class="tight">
+          <li><b>Numbers:</b> 1 M tasks/day / 86 400 s ≈ 12/s avg, 5× burst ≈ 60/s. 10 KB task payload + 1 KB history = ~11 MB/s ingest = trivial.</li>
+          <li><b>API surface:</b> <code>submitDAG</code>, <code>submitTask</code>, <code>cancelTask</code>, <code>getStatus</code>, <code>listRuns</code>, <code>describeDAG</code>.</li>
+          <li><b>SLA:</b> submit → dispatched &lt; 2 s p99; task-completed → dependents unblocked &lt; 1 s p99.</li>
+          <li><b>Storage:</b> DDB for task state (hot), S3 for history (cold, 30 d TTL DDB → S3).</li>
+        </ul>
+      </div>
+
+      <div class="card">
+        <div class="kicker">10 – 20 min · draw architecture · submit + execute flows</div>
+        <ul class="tight">
+          <li>Client → API Gateway → SchedulerService (composition-root of TaskService, WorkerService, ExecutionService, SchedulerEngine).</li>
+          <li>Scheduler is HA via <b>Bully leader election</b> — one leader owns cron parsing + dependency resolution.</li>
+          <li>Leader pushes to <b>SQS FIFO</b> (idempotencyKey = MessageDeduplicationId). Workers pull.</li>
+          <li>Workers claim via <b>DynamoDB conditional write</b> (QUEUED → RUNNING). Execute. Write COMPLETED. Publish <code>TaskCompleted</code> event → scheduler unblocks dependents.</li>
+        </ul>
+      </div>
+
+      <div class="card">
+        <div class="kicker">20 – 25 min · exactly-once &amp; retry deep dive</div>
+        <ul class="tight">
+          <li>Exactly-once = at-least-once (SQS) + idempotent processor (DDB CAS + terminal-state guard + downstream Idempotency-Key).</li>
+          <li>Fencing tokens close the split-brain gap.</li>
+          <li>Retry = exponential backoff with ±10 % jitter, capped at 30 s, DLQ after 3 attempts.</li>
+          <li>Poison pills alert on-call — do not retry forever.</li>
+        </ul>
+      </div>
+
+      <div class="card">
+        <div class="kicker">25 – 30 min · DAG resolution &amp; leader election</div>
+        <ul class="tight">
+          <li>DAG validation on submit: Kahn's topological sort — O(V+E). Reject cycles synchronously with the offending back-edge.</li>
+          <li>On task completion, decrement indegree of successors — O(fan-out). No full re-sort each tick.</li>
+          <li>Leader election: Bully by priority + tie-break by nodeId. Fencing tokens for split-brain.</li>
+          <li>Lease-based leadership: 30 s TTL, renewed every 10 s. 20 s grace covers GC pauses.</li>
+        </ul>
+      </div>
+
+      <div class="card">
+        <div class="kicker">30 – 35 min · bottlenecks &amp; Q&amp;A</div>
+        <ul class="tight">
+          <li>Bottlenecks + fixes: (1) leader ceiling → shard by group. (2) queue depth → back-pressure + auto-scale. (3) heartbeat storm → jittered intervals. (4) cron thundering herd → jittered fire times. (5) retry storm → circuit breaker. (6) history growth → 30 d + S3.</li>
+          <li>"What would you do at 10× scale?" → migrate leader election to Raft (or delegate to etcd); event-source the state (Temporal-style).</li>
+          <li>"Where's the single point of failure?" → the elected leader for ~30 s during failover. New enqueues pause; running work continues.</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="phase-strip" style="margin-top:16px">
+      <div class="phase"><b>0–5</b><br>clarify</div>
+      <div class="phase"><b>5–10</b><br>capacity + API</div>
+      <div class="phase"><b>10–20</b><br>architecture</div>
+      <div class="phase"><b>20–25</b><br>exactly-once</div>
+      <div class="phase"><b>25–30</b><br>DAG + leader</div>
+      <div class="phase"><b>30–35</b><br>bottlenecks + Q&amp;A</div>
+    </div>
+
+    <div class="callout tip"><b>30-second pitch:</b> "A leader-elected scheduler (Bully + fencing) parses cron and resolves DAG dependencies (Kahn's O(V+E)). Ready tasks are enqueued to SQS FIFO with an idempotency key. Workers pull, claim via DynamoDB conditional write (CAS on <code>QUEUED → RUNNING</code>), execute, and mark COMPLETED. Retries use exponential backoff with jitter, capped, and a DLQ after 3 attempts. Task state is <b>CP</b> (correctness); heartbeats and metrics are <b>AP</b> (best-effort). Exactly-once effect = at-least-once delivery + idempotent processing at every layer."</div>
+    <div class="callout warn"><b>Interview red flags to avoid:</b><br>• "I'll guarantee exactly-once delivery." (impossible — say "exactly-once effect via idempotency")<br>• "The scheduler is a single node." (no failover story)<br>• "Retry indefinitely." (poison pill risk — always DLQ after N)<br>• "Use in-memory queue." (loses tasks on crash)<br>• "Poll DynamoDB every second for completed tasks." (event-driven scales; polling doesn't)</div>
+  </section>
+
+  <!-- GLOSSARY -->
+  <section>
+    <div class="sec-h"><span class="n">§</span><h2>Glossary — one-liners</h2></div>
+    <table>
+      <tbody>
+        <tr><td><b>Bully algorithm</b></td><td>Leader election where the highest-priority alive node self-elects.</td></tr>
+        <tr><td><b>Raft</b></td><td>Consensus protocol; a majority quorum elects a leader per term and replicates a log.</td></tr>
+        <tr><td><b>Fencing token</b></td><td>Monotonic epoch counter incremented on every election; workers reject stale-epoch commands.</td></tr>
+        <tr><td><b>Idempotency key</b></td><td>Stable identifier that lets a receiver detect and deduplicate retries end-to-end.</td></tr>
+        <tr><td><b>Terminal state</b></td><td>An absorbing state in the task lifecycle (COMPLETED, FAILED, CANCELLED, TIMED_OUT) — no further transitions.</td></tr>
+        <tr><td><b>At-least-once delivery</b></td><td>Every message is delivered at least once; duplicates are possible and the consumer must handle them.</td></tr>
+        <tr><td><b>Exactly-once effect</b></td><td>Observed outcome = one execution, achieved by at-least-once delivery + idempotent processing.</td></tr>
+        <tr><td><b>Kahn's algorithm</b></td><td>Topological sort in O(V+E) using an indegree map and a queue of zero-indegree nodes.</td></tr>
+        <tr><td><b>Back-edge</b></td><td>A DFS edge from a GRAY node back into the current stack — proof of a cycle.</td></tr>
+        <tr><td><b>Full jitter</b></td><td>Retry-delay formula that picks uniformly from <code>[0, base × 2^attempt]</code>; kills thundering herd.</td></tr>
+        <tr><td><b>DLQ</b></td><td>Dead-letter queue — where messages go after N failed processing attempts; alarms on depth &gt; 0.</td></tr>
+        <tr><td><b>CAS (Compare-And-Swap)</b></td><td>Atomic conditional write; DynamoDB's <code>ConditionExpression</code> gives us CAS across regions.</td></tr>
+        <tr><td><b>Lease</b></td><td>A time-bounded lock that auto-expires without a renewal — safe under crashes.</td></tr>
+        <tr><td><b>ALIVE_TIMEOUT</b></td><td>Threshold beyond which a stale heartbeat means the node is presumed dead (30 s in our design).</td></tr>
+        <tr><td><b>PACELC</b></td><td>Extension of CAP: <i>if</i> partition → C or A; <i>else</i> → Latency or Consistency.</td></tr>
+        <tr><td><b>Split-brain</b></td><td>Two nodes each believing they are the leader; produces duplicate work; prevented by quorum or fencing.</td></tr>
+        <tr><td><b>Poison pill</b></td><td>A message that will never be processable no matter how many times you retry — sends to DLQ.</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <footer>
+    <p>Use case 17 · Distributed Task Scheduler — Canvas 3 of 3 (Deep-dive &amp; Trade-offs). Grounded in <code>17-distributed-task-scheduler/docs/</code> and the real Java under <code>17-distributed-task-scheduler/src/</code>.</p>
+    <p class="run"><a href="hld.html">← Canvas 1 · HLD</a> · <a href="lld.html">Canvas 2 · LLD</a> · Canvas 3 · Deep-dive &amp; Trade-offs (you are here) &nbsp;|&nbsp; <a href="../index.html">Hub</a></p>
+  </footer>
+
+</div>
+<script src="../assets/canvas.js"></script>
+</body>
+</html>

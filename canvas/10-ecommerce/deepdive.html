@@ -1,0 +1,418 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>10 · E-Commerce — Deep-dive &amp; Trade-offs</title>
+<link rel="stylesheet" href="../assets/canvas.css">
+</head>
+<body>
+
+<div class="wrap">
+
+  <header class="hero">
+    <h1>E-Commerce — Deep-dive &amp; Trade-offs</h1>
+    <div class="sub">Canvas 3 of 3. Staff-engineer defensible answers for a full interview. Saga (orchestration) vs 2PC vs choreography · exactly-once via idempotency + Stripe · CAP split (browse AP vs checkout CP) · flash-sale Redis <code>DECR</code> · queue-based checkout under 35 K QPS · 8 bottlenecks with mitigations · 11-row trade-off table · 35-minute interview walkthrough.</div>
+    <div class="badges">
+      <span class="badge lvl">Use case 10 · Deep-dive</span>
+      <span class="badge">Canvas 3 of 3</span>
+      <span class="badge">interview-defensible</span>
+      <span class="badge">Amazon · Shopify · Flipkart · Meesho</span>
+    </div>
+    <div class="legend">
+      <span><i class="dot" style="background:var(--eden)"></i> preferred / winner</span>
+      <span><i class="dot" style="background:var(--survivor)"></i> conditional / hybrid</span>
+      <span><i class="dot" style="background:var(--warn)"></i> avoid / red flag</span>
+      <span><i class="dot" style="background:var(--fig)"></i> deep-dive detail</span>
+    </div>
+  </header>
+
+  <!-- A · SAGA vs 2PC vs CHOREOGRAPHY -->
+  <section>
+    <div class="sec-h"><span class="n">A</span><h2>Saga vs 2PC vs choreography — pick your poison</h2><span class="tag">the checkout question</span></div>
+    <div data-tabscope>
+      <div class="tabs">
+        <div class="tab active" data-tab="s-side">side by side</div>
+        <div class="tab" data-tab="s-2pc">2PC — why we don't</div>
+        <div class="tab" data-tab="s-orch">Saga (orchestration) — what we do</div>
+        <div class="tab" data-tab="s-chor">Saga (choreography) — the alt</div>
+        <div class="tab" data-tab="s-decide">decision tree</div>
+      </div>
+      <div class="tabpanel active" data-panel="s-side">
+        <table>
+          <thead><tr><th>Aspect</th><th>2PC (XA)</th><th>Saga orchestration <span style="color:var(--eden)">← ours</span></th><th>Saga choreography</th></tr></thead>
+          <tbody>
+            <tr><td>Coordinator</td><td>global TM</td><td>central orchestrator (<code>OrderSagaOrchestrator</code> / Step Functions)</td><td>none — event chain</td></tr>
+            <tr><td>Consistency</td><td>strong (immediate)</td><td>eventual (once saga finishes)</td><td>eventual (harder to reason)</td></tr>
+            <tr><td>Locks</td><td>held across all DBs until commit</td><td>none — local commits per step</td><td>none — local commits</td></tr>
+            <tr><td>Failure recovery</td><td>coordinator recovery, tricky in-doubt</td><td>compensate reverse order</td><td>each service reacts to <code>*.failed</code> event</td></tr>
+            <tr><td>Visibility</td><td>invisible mid-transaction</td><td>central saga log — one place to debug</td><td>need correlationId + service map</td></tr>
+            <tr><td>Scalability</td><td>poor at 35 K QPS — lock contention</td><td>excellent — no distributed lock</td><td>excellent</td></tr>
+            <tr><td>Add a step</td><td>modify TM config</td><td>modify orchestrator (1 file)</td><td>write a new consumer + event schema</td></tr>
+            <tr><td>Blast radius on bug</td><td>global (TM meltdown)</td><td>one saga (one order)</td><td>events keep flying — hard to stop</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="tabpanel" data-panel="s-2pc">
+        <p><b>2PC (Two-Phase Commit)</b> is the "obvious" answer if you learned distributed transactions from a database textbook. It works like this:</p>
+        <pre class="code">Phase 1 — PREPARE:
+  TM asks each participant: "Can you commit?" Each writes to durable log, replies YES/NO.
+  Participants hold LOCKS on their data during this wait.
+
+Phase 2 — COMMIT:
+  If ALL said YES → TM sends COMMIT. Everyone commits, releases locks.
+  If ANY said NO → TM sends ROLLBACK.
+  If TM CRASHES between phases → participants stuck holding locks (the "in-doubt" state).</pre>
+        <p><b>Why we don't:</b></p>
+        <ul class="tight">
+          <li><b>Lock hold-time.</b> Payment gateway takes 500–1 500 ms. During that time, the inventory row is <b>locked</b> — nobody else can buy that SKU. 35 K orders/sec × 1 sec = 35 K locks. This is the death of throughput.</li>
+          <li><b>Cross-vendor.</b> Stripe doesn't support XA. Neither does Kafka. Neither does DynamoDB. Modern infrastructure is federated — 2PC assumes a homogeneous world we don't live in.</li>
+          <li><b>In-doubt state.</b> If the TM crashes after PREPARE but before COMMIT, participants can't unilaterally proceed. Manual DBA intervention. Not compatible with SRE culture.</li>
+        </ul>
+        <div class="callout warn"><b>Interview red flag:</b> "I'd use a distributed transaction across all four services." Correct answer: 2PC doesn't scale and doesn't work with 3rd-party gateways. Use Saga.</div>
+      </div>
+      <div class="tabpanel" data-panel="s-orch">
+        <p><b>Saga (orchestration)</b> is what our code implements — see <code>OrderSagaOrchestrator.execute()</code>.</p>
+        <ul class="tight">
+          <li><b>Local transactions.</b> Each step is a normal ACID transaction on its own DB (inventory reserve = DDB conditional write; payment = Stripe API + Postgres row).</li>
+          <li><b>Central coordinator.</b> One orchestrator drives the sequence and knows what to do on failure. In prod: AWS Step Functions or Temporal — same shape, durable state machine, resumes on crash.</li>
+          <li><b>Compensation is code.</b> Written explicitly per step (release inventory / refund payment / cancel shipment). Not "the DB rolls back for you."</li>
+          <li><b>Requires idempotency.</b> If the orchestrator crashes mid-saga, restart replays steps — each must be safe to call twice.</li>
+        </ul>
+        <p><b>Real orchestrators in prod:</b></p>
+        <table>
+          <thead><tr><th>Tech</th><th>Cloud</th><th>Best for</th></tr></thead>
+          <tbody>
+            <tr><td>AWS Step Functions</td><td>AWS</td><td>declarative JSON DSL · built-in retry/backoff/catch · visible in console · pay per state-transition</td></tr>
+            <tr><td>Temporal</td><td>self-hosted / Temporal Cloud</td><td>code-native workflows (Java/Go) · millisecond signals · long-running workflows</td></tr>
+            <tr><td>Camunda / Zeebe</td><td>self-hosted</td><td>BPMN visual · enterprise-friendly · slower</td></tr>
+            <tr><td>Home-grown</td><td>anywhere</td><td>simple sagas · full control · you own recovery + monitoring · like our Java demo</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="tabpanel" data-panel="s-chor">
+        <p><b>Saga (choreography)</b> replaces the orchestrator with an event chain — each service publishes on completion, the next reacts.</p>
+        <pre class="code">OrderService  ─► order.created         → Kafka
+InventoryService reacts:
+  reserve stock. On success ─► inventory.reserved → Kafka
+                On failure ─► order.failed
+PaymentService reacts to inventory.reserved:
+  charge. On success ─► payment.completed → Kafka
+         On failure ─► order.failed
+             → InventoryService reacts (release stock)
+ShippingService reacts to payment.completed:
+  create shipment. On success ─► order.shipped
+                   On failure ─► order.failed
+             → PaymentService reacts (refund)
+             → InventoryService reacts (release)</pre>
+        <p><b>Pros:</b> no central bottleneck, services truly independent, easy to add a new consumer for analytics.</p>
+        <p><b>Cons:</b> nobody knows the whole flow at debug time. A stuck order = grep across N services. Timeout logic scattered. Cyclic-dependency risk on compensations. Blast radius: a poison-pill event keeps triggering handlers forever.</p>
+        <div class="callout tip"><b>When choreography wins:</b> for POST-order fan-out — notifications, analytics, search indexing. Those consumers are truly independent and their failure doesn't affect the customer. We use it for that in the HLD (Kafka → Notification / Analytics / SearchIndexer).</div>
+      </div>
+      <div class="tabpanel" data-panel="s-decide">
+        <p><b>The decision tree:</b></p>
+        <pre class="code">Is this a distributed transaction (≥ 2 services or DBs need atomic outcome)?
+├─ NO → single-DB ACID. You're done.
+└─ YES ─► Are ALL participants under your control (same DB engine, XA-capable)?
+          ├─ YES → maybe 2PC — but only if throughput is low and lock hold-time is small.
+          └─ NO ─► Is there a single "workflow owner" (like an order)?
+                   ├─ YES → <span style="color:var(--eden)">Saga orchestration</span>. Central log, easy debug. ← <b>checkout</b>
+                   └─ NO  → Saga choreography. Events + correlationId. ← post-order fan-out</pre>
+      </div>
+    </div>
+  </section>
+
+  <!-- B · IDEMPOTENCY -->
+  <section>
+    <div class="sec-h"><span class="n">B</span><h2>Idempotency — the exactly-once effect</h2><span class="tag">never double-charge, ever</span></div>
+    <div data-tabscope>
+      <div class="tabs">
+        <div class="tab active" data-tab="i-why">why "exactly-once" is a myth</div>
+        <div class="tab" data-tab="i-stack">the 3-layer stack we use</div>
+        <div class="tab" data-tab="i-code">code walk</div>
+        <div class="tab" data-tab="i-fails">failure scenarios</div>
+      </div>
+      <div class="tabpanel active" data-panel="i-why">
+        <p><b>Exactly-once delivery is impossible over a network.</b> If the sender times out mid-write, it can't tell: did the receiver get it and the ACK got lost, or did the message get lost? Both cases look identical.</p>
+        <p><b>What we build instead:</b> at-least-once delivery + idempotent handler = <b>exactly-once effect</b> (as observed by the customer). Retry as many times as you want; only the first call has effect.</p>
+        <div class="callout warn"><b>Cost of getting this wrong:</b> a duplicate <code>POST /charge</code> that both succeed = customer charged twice for one order. Chargeback + support ticket + trust damage. This is the single most important guarantee in an e-commerce system.</div>
+      </div>
+      <div class="tabpanel" data-panel="i-stack">
+        <p>Three cooperating layers, each catching what the other misses:</p>
+        <table>
+          <thead><tr><th>Layer</th><th>What it does</th><th>Where</th></tr></thead>
+          <tbody>
+            <tr><td><b>Client</b></td><td>Generates a <b>UUID Idempotency-Key</b> per checkout attempt. Retries reuse the same key. Persist locally so a page-refresh reuses too.</td><td>Mobile / web app</td></tr>
+            <tr><td><b>API Gateway / OrderService</b></td><td>Stores <code>(idempotency_key → response)</code> in Redis (24 h TTL). Duplicate key = return stored response, don't execute.</td><td>Redis + Postgres UNIQUE(idempotency_key)</td></tr>
+            <tr><td><b>PaymentService</b></td><td>Before calling gateway, <code>paymentRepository.findByOrderId(orderId)</code> — if COMPLETED, return existing.</td><td>Postgres UNIQUE(order_id) on Payment</td></tr>
+            <tr><td><b>Gateway (Stripe/UPI)</b></td><td>Stores response for 24 h keyed by <code>Idempotency-Key</code> header. A retry within 24 h returns identical response.</td><td>Stripe infrastructure</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="tabpanel" data-panel="i-code">
+        <pre class="code"><span class="cm">// 1) Client sends</span>
+POST /checkout
+Idempotency-Key: 8f2b1a-...   <span class="cm">// UUID v4, persist locally</span>
+
+<span class="cm">// 2) Gateway checks Redis</span>
+if (redis.exists("idem:" + key)) return redis.get("idem:" + key); <span class="cm">// short-circuit</span>
+
+<span class="cm">// 3) OrderService creates order with UNIQUE constraint</span>
+INSERT INTO orders (idempotency_key, ...)
+ON CONFLICT (idempotency_key) DO NOTHING
+RETURNING *;
+<span class="cm">// If 0 rows returned → duplicate; fetch the existing order.</span>
+
+<span class="cm">// 4) PaymentService — Java (verbatim from PaymentService.java)</span>
+Optional&lt;Payment&gt; existing = paymentRepository.findByOrderId(order.getOrderId());
+if (existing.isPresent() &amp;&amp; existing.get().getStatus() == COMPLETED) {
+  return existing.get();     <span class="cm">// never re-charge — even if step 3 above missed it</span>
+}
+
+<span class="cm">// 5) Stripe HTTPS call</span>
+POST https://api.stripe.com/v1/charges
+Idempotency-Key: order-{orderId}   <span class="cm">// stable natural key</span>
+<span class="cm">// Stripe: if we already returned a response for this key in the last 24h, return the same one.</span></pre>
+      </div>
+      <div class="tabpanel" data-panel="i-fails">
+        <p><b>The 4 network failure scenarios and where each layer catches them:</b></p>
+        <table>
+          <thead><tr><th>Scenario</th><th>What happened</th><th>Caught by</th></tr></thead>
+          <tbody>
+            <tr><td>Client retries on <b>ACK-lost</b></td><td>Order created but ACK never reached client</td><td><b>Layer 1</b> — Redis returns stored response</td></tr>
+            <tr><td>Redis unavailable, client retries</td><td>Layer 1 misses</td><td><b>Layer 2</b> — Postgres UNIQUE on <code>idempotency_key</code> throws</td></tr>
+            <tr><td>Both Redis + Postgres missed, saga replays</td><td>Order exists but saga runs again after crash</td><td><b>Layer 3</b> — <code>PaymentService.findByOrderId</code> short-circuits</td></tr>
+            <tr><td>Payment service crashed after Stripe response, before saving</td><td>Charge succeeded, our record missing</td><td><b>Layer 4</b> — retry with same Idempotency-Key returns same Stripe response; we save it</td></tr>
+          </tbody>
+        </table>
+        <div class="callout tip"><b>Interview mic-drop:</b> "So even if 3 of the 4 layers fail simultaneously — network partition, Redis outage, saga crash — we still don't double-charge the customer, because Stripe itself is idempotent. Correctness > performance."</div>
+      </div>
+    </div>
+  </section>
+
+  <!-- C · CAP SPLIT -->
+  <section>
+    <div class="sec-h"><span class="n">C</span><h2>CAP split — different consistency per subsystem</h2><span class="tag">not one CAP for the whole system</span></div>
+    <table>
+      <thead><tr><th>Subsystem</th><th>Choice</th><th>PACELC</th><th>Why</th></tr></thead>
+      <tbody>
+        <tr><td><b>Catalog / product</b></td><td>AP</td><td>PA / EL</td><td>Read : write ≈ 1 000 : 1. Stale price on browse for 5 min = fine (customer sees real price at checkout).</td></tr>
+        <tr><td><b>Search (ES)</b></td><td>AP</td><td>PA / EL</td><td>New product invisible for 1–5 s = fine. Serving stale search &gt; showing empty results.</td></tr>
+        <tr><td><b>Cart</b></td><td>AP</td><td>PA / EL</td><td>Merge conflicts resolved by union (add all items). Never lose an item — annoyed customer better than lost sale.</td></tr>
+        <tr><td><b>Inventory</b></td><td><b>CP</b></td><td>PC / EC</td><td>Overselling = refund + apology + trust damage. Refuse checkout if unsure.</td></tr>
+        <tr><td><b>Payment</b></td><td><b>CP</b></td><td>PC / EC</td><td>Double-charge is catastrophic. Refuse if idempotency store is unreachable.</td></tr>
+        <tr><td><b>Orders</b></td><td><b>CP</b></td><td>PC / EC</td><td>ACID via Postgres Aurora. UNIQUE constraint enforces exactly-once.</td></tr>
+        <tr><td><b>Kafka event bus</b></td><td>AP (ordering per partition)</td><td>—</td><td>At-least-once delivery. Consumers must be idempotent.</td></tr>
+        <tr><td><b>Notifications</b></td><td>AP</td><td>—</td><td>Late/duplicate email is fine. Blocking checkout on email is not.</td></tr>
+      </tbody>
+    </table>
+    <div class="callout tip"><b>The boundary matters:</b> browse plane (AP — cache-heavy) → checkout plane (CP — DB-authoritative). Crossing at "Place Order" button is the design's most important line. Before that, everything is optimised for latency + hit rate. After that, everything is optimised for correctness — no cache reads on the write path.</div>
+  </section>
+
+  <!-- D · FLASH SALE -->
+  <section>
+    <div class="sec-h"><span class="n">D</span><h2>Flash sale — Redis DECR gate</h2><span class="tag">100 K QPS on 1 SKU without a Postgres row lock</span></div>
+    <div class="grid g2">
+      <div class="card">
+        <div class="kicker">the problem</div>
+        <p>At sale start: 50 K users click "Buy" on a single SKU within 1 second. Without a gate:</p>
+        <ul class="tight">
+          <li><b>50 K concurrent</b> Postgres <code>SELECT FOR UPDATE</code> on the same row.</li>
+          <li><b>Lock queue backs up.</b> p99 goes from 50 ms → 30 s → timeout cascade.</li>
+          <li><b>Overselling risk</b> if you switch to optimistic w/o care.</li>
+          <li><b>Fleet health goes red.</b> One SKU takes down all checkouts.</li>
+        </ul>
+      </div>
+      <div class="card">
+        <div class="kicker">the solution</div>
+        <p>Put a <b>Redis <code>DECR</code></b> counter in front of the DB. Redis is single-threaded per shard → DECR is atomic. Turn 100 K QPS into ≤ 100 QPS of actual DB writes.</p>
+        <pre class="code"><span class="cm">// Pre-warm at sale start</span>
+SET flash:sku-42:stock 1000     <span class="cm">// 1000 units available</span>
+
+<span class="cm">// Every checkout attempt</span>
+result = DECR flash:sku-42:stock
+if (result &lt; 0) {
+  return 503 "Sold out";        <span class="cm">// CDN caches "sold out" for 60 s</span>
+}
+<span class="cm">// Only 1000 requests get past this gate.</span>
+<span class="cm">// Now enter the normal saga — 1000 rows on Postgres is trivial.</span></pre>
+      </div>
+    </div>
+    <div class="grid g2" style="margin-top:14px">
+      <div class="card">
+        <div class="kicker">what if Redis crashes mid-sale?</div>
+        <ul class="tight">
+          <li><b>Redis Cluster + AOF</b> — hardware failure = &lt;100 ms failover to replica.</li>
+          <li><b>Reset from DB</b> — background job re-syncs counter from Postgres <code>reserved_stock</code>.</li>
+          <li><b>Circuit breaker</b> on the DECR path — if Redis unreachable, immediately return 503 "sold out" (better to say sold out than to oversell).</li>
+        </ul>
+      </div>
+      <div class="card">
+        <div class="kicker">why this is CP-safe</div>
+        <ul class="tight">
+          <li><b>DECR is atomic.</b> Only one client sees the value that crossed 0.</li>
+          <li><b>False negatives OK.</b> DECR gate might undercount slightly during a Redis network blip → customer sees "sold out" a few seconds early. Refund-free.</li>
+          <li><b>False positives NOT OK.</b> DECR is the gate; the DB conditional write is the belt-and-braces. Both fail together → we refuse the sale.</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <!-- E · QUEUE-BASED CHECKOUT -->
+  <section>
+    <div class="sec-h"><span class="n">E</span><h2>Queue-based checkout — surviving 35 K QPS</h2><span class="tag">degrade to 202 + poll under spike</span></div>
+    <p>When observed QPS exceeds a per-instance safety threshold (e.g. &gt; 3 000/instance), API Gateway flips a config flag → checkout switches from sync HTTP to <b>SQS FIFO</b>:</p>
+    <pre class="code">Client sends POST /checkout
+   ↓
+Gateway (flag = "queue mode")
+   ↓ enqueue message to SQS FIFO (MessageGroupId = userId)
+   ↓ return 202 Accepted + { orderId, pollUrl: "/orders/{id}" }
+   ↓
+Client polls GET /orders/{id} every 1 s
+                     until status ≠ PROCESSING
+
+Meanwhile:
+Saga worker fleet drains SQS at controlled rate (~3 K/s cluster-wide)
+  ↓ pulls message → SagaOrchestrator.execute(order)
+  ↓ writes final state to Order DB
+  ↓ Gateway serves poll from Order DB (Redis-cached)</pre>
+    <div class="grid g2" style="margin-top:14px">
+      <div class="card"><div class="kicker">why FIFO</div><ul class="tight"><li>Per-user ordering guaranteed via MessageGroupId — no cross-order interleaving for one customer.</li><li>Dedup window 5 min — client retries with same idempotency key don't create duplicate work.</li><li>Max 300 msg/sec per group — a viral customer can't DoS the queue.</li></ul></div>
+      <div class="card"><div class="kicker">what the customer sees</div><ul class="tight"><li>Progress bar: "Your order is being processed... position 1 234 in queue."</li><li>Mobile push when done: "Order confirmed!"</li><li>Poll fallback: web UI polls every 1 s; retries with backoff on 429.</li></ul></div>
+    </div>
+    <div class="callout tip"><b>The Amazon lesson:</b> during the 2018 Prime Day outage, checkout API was down for 60 minutes because sync capacity was saturated. Queue mode = the same fleet survives 10× spike, just slower per-user. Slow &gt; broken.</div>
+  </section>
+
+  <!-- F · BOTTLENECKS -->
+  <section>
+    <div class="sec-h"><span class="n">F</span><h2>Bottlenecks &amp; mitigations</h2><span class="tag">the 8 things that will kill you at scale</span></div>
+    <table>
+      <thead><tr><th>#</th><th>Bottleneck</th><th>Symptom</th><th>Mitigation</th></tr></thead>
+      <tbody>
+        <tr><td>1</td><td><b>Inventory hot-key</b></td><td>1 SKU serializes 50 K reservations</td><td>Redis <code>DECR</code> gate → DDB conditional writes. Shard by product where possible.</td></tr>
+        <tr><td>2</td><td><b>Payment gateway rate-limit</b></td><td>Stripe returns 429 → p99 spikes</td><td>Per-account bucket · exponential backoff · circuit-breaker on 5xx · queue mode</td></tr>
+        <tr><td>3</td><td><b>Catalog cache stampede</b></td><td>TTL expiry → 50 K DB queries for 1 SKU</td><td>Redis mutex (single-flight) · stale-while-revalidate · TTL jitter ±20 %</td></tr>
+        <tr><td>4</td><td><b>Checkout serialization</b></td><td>Long sagas hold a worker for 2 s</td><td>Fixed-size worker pool · Little's Law sizing · async Step 3 (shipping) if allowed</td></tr>
+        <tr><td>5</td><td><b>Cross-service cascading failure</b></td><td>Inventory slow → Payment queues up → Order timeouts</td><td>Per-service circuit breakers (Hystrix / Resilience4j) · bulkheads · timeouts &lt; upstream timeout</td></tr>
+        <tr><td>6</td><td><b>Compensation failure</b></td><td>Stuck reserved stock; DLQ pile-up</td><td>Retry with backoff · DLQ + on-call · <b>idempotent compensations</b> · reservation TTL sweep (15 min)</td></tr>
+        <tr><td>7</td><td><b>Hot shard on Orders DB</b></td><td>Celebrity buyer floods 1 partition</td><td>Sharded by userId + secondary index for order-history · read replicas for GET /orders</td></tr>
+        <tr><td>8</td><td><b>Kafka consumer lag</b></td><td>Notifications 30 min late during spike</td><td>Auto-scale consumers on lag &gt; 10 K · priority topics (order.confirmed &gt; analytics) · SLA per consumer group</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <!-- G · CLOUD MAPPING -->
+  <section>
+    <div class="sec-h"><span class="n">G</span><h2>Cloud service mapping (concise)</h2><span class="tag">the same design on each cloud</span></div>
+    <table class="cloudtable">
+      <thead><tr>
+        <th>Component</th>
+        <th><span class="hdrlogo"><span class="logochip"><img src="../assets/logos/aws.svg" alt="AWS"></span>AWS</span></th>
+        <th><span class="hdrlogo"><span class="logochip"><img src="../assets/logos/gcp.svg" alt="GCP"></span>GCP</span></th>
+        <th><span class="hdrlogo"><span class="logochip"><img src="../assets/logos/azure.svg" alt="Azure"></span>Azure</span></th>
+      </tr></thead>
+      <tbody>
+        <tr><td>Saga Orchestrator</td><td>Step Functions</td><td>Workflows</td><td>Durable Functions</td></tr>
+        <tr><td>Compute (services)</td><td><img class="svcicon" src="../assets/logos/services/aws-ecs.svg" alt="">ECS Fargate / EKS</td><td><img class="svcicon" src="../assets/logos/services/gcp-run.svg" alt="">Cloud Run / GKE</td><td><img class="svcicon" src="../assets/logos/services/azure-aks.svg" alt="">AKS / Container Apps</td></tr>
+        <tr><td>Orders / Payments DB</td><td><img class="svcicon" src="../assets/logos/services/aws-rds.svg" alt="">Aurora PostgreSQL</td><td><img class="svcicon" src="../assets/logos/services/gcp-cloudsql.svg" alt="">Cloud SQL PG</td><td><img class="svcicon" src="../assets/logos/services/azure-sql.svg" alt="">Azure DB for PG</td></tr>
+        <tr><td>Inventory (conditional)</td><td><img class="svcicon" src="../assets/logos/services/aws-dynamodb.svg" alt="">DynamoDB</td><td><img class="svcicon" src="../assets/logos/services/gcp-bigtable.svg" alt="">Bigtable / Firestore</td><td><img class="svcicon" src="../assets/logos/services/azure-cosmos.svg" alt="">Cosmos DB</td></tr>
+        <tr><td>Flash-sale gate · cart</td><td><img class="svcicon" src="../assets/logos/services/aws-elasticache.svg" alt="">ElastiCache Redis</td><td><img class="svcicon" src="../assets/logos/services/gcp-memorystore.svg" alt="">Memorystore Redis</td><td><img class="svcicon" src="../assets/logos/services/azure-redis.svg" alt="">Azure Cache for Redis</td></tr>
+        <tr><td>Queue-mode checkout</td><td><img class="svcicon" src="../assets/logos/services/aws-sqs.svg" alt="">SQS FIFO</td><td><img class="svcicon" src="../assets/logos/services/gcp-pubsub.svg" alt="">Pub/Sub (ordering)</td><td><img class="svcicon" src="../assets/logos/services/azure-servicebus.svg" alt="">Service Bus FIFO</td></tr>
+        <tr><td>Event bus</td><td><img class="svcicon" src="../assets/logos/services/aws-msk.svg" alt="">MSK Kafka</td><td><img class="svcicon" src="../assets/logos/services/gcp-pubsub.svg" alt="">Pub/Sub</td><td><img class="svcicon" src="../assets/logos/services/azure-eventhubs.svg" alt="">Event Hubs</td></tr>
+        <tr><td>Search</td><td><img class="svcicon" src="../assets/logos/services/aws-opensearch.svg" alt="">OpenSearch</td><td>Elastic Cloud on GCP</td><td><img class="svcicon" src="../assets/logos/services/azure-search.svg" alt="">AI Search</td></tr>
+        <tr><td>CDN + images</td><td><img class="svcicon" src="../assets/logos/services/aws-cloudfront.svg" alt="">CloudFront + S3</td><td><img class="svcicon" src="../assets/logos/services/gcp-cloudcdn.svg" alt="">Cloud CDN + Storage</td><td><img class="svcicon" src="../assets/logos/services/azure-cdn.svg" alt="">Azure CDN + Blob</td></tr>
+        <tr><td>Notifications</td><td><img class="svcicon" src="../assets/logos/services/aws-sns.svg" alt="">SNS + SES</td><td><img class="svcicon" src="../assets/logos/services/gcp-pubsub.svg" alt="">Pub/Sub + Cloud Functions</td><td><img class="svcicon" src="../assets/logos/services/azure-notifhub.svg" alt="">Notification Hubs</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <!-- H · TRADE-OFFS -->
+  <section>
+    <div class="sec-h"><span class="n">H</span><h2>Trade-offs — 11 decisions you defend at whiteboard</h2><span class="tag">picks + why</span></div>
+    <table>
+      <thead><tr><th>Decision</th><th>Choice</th><th>Alternative rejected</th><th>Why</th></tr></thead>
+      <tbody>
+        <tr><td>Distributed TX</td><td><b>Saga (orchestration)</b></td><td>2PC · choreography</td><td>2PC doesn't scale + no XA on Stripe. Orchestration beats choreography on debug-ability.</td></tr>
+        <tr><td>Idempotency</td><td><b>3-layer (client + DB UNIQUE + gateway)</b></td><td>gateway only</td><td>Belt + braces. Any one layer's outage doesn't break correctness.</td></tr>
+        <tr><td>Inventory store</td><td><b>DynamoDB conditional write + Redis DECR</b></td><td>Postgres SELECT FOR UPDATE</td><td>Row lock doesn't survive 35 K QPS on hot SKU. DDB scales horizontally on same primary key.</td></tr>
+        <tr><td>Orders / Payments DB</td><td><b>PostgreSQL Aurora (sharded)</b></td><td>DynamoDB</td><td>Complex joins for order history · UNIQUE constraint for idempotency · read replicas.</td></tr>
+        <tr><td>Cart storage</td><td><b>Redis + DynamoDB write-through</b></td><td>Postgres</td><td>500 M ops/day, mostly reads. AP semantics (union merge) suit Redis. DDB gives durability across devices.</td></tr>
+        <tr><td>Search</td><td><b>Elasticsearch/OpenSearch</b></td><td>Postgres full-text</td><td>500 K QPS with faceted filters. PG full-text is fine ≤ 1 K QPS; not at Amazon scale.</td></tr>
+        <tr><td>Event bus</td><td><b>Kafka (transactional outbox)</b></td><td>SNS/SQS only</td><td>Ordering per partition · replay 72 h · exactly-once producer semantics · 500 K events/s.</td></tr>
+        <tr><td>Overload strategy</td><td><b>Queue-mode checkout (SQS FIFO)</b></td><td>reject with 503</td><td>Slow &gt; broken. Customer sees "processing"; better than "try again in 5 minutes".</td></tr>
+        <tr><td>Consistency at checkout</td><td><b>Read DB, never cache</b></td><td>trust Redis</td><td>Stale price/stock at checkout = wrong charge or oversell. Cache is display-only.</td></tr>
+        <tr><td>Compensation retry</td><td><b>3× with backoff · then DLQ + on-call</b></td><td>infinite retry</td><td>Infinite retry = poison-pill Kafka. Finite retry + DLQ + human escalation.</td></tr>
+        <tr><td>Notifications</td><td><b>Kafka consumer group (async)</b></td><td>inline in saga</td><td>Adding 100 ms email delay to saga = 100 ms added to checkout p99. Off critical path.</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <!-- I · INTERVIEW WALKTHROUGH -->
+  <section>
+    <div class="sec-h"><span class="n">I</span><h2>35-minute interview walkthrough</h2><span class="tag">the answer, timed</span></div>
+    <div class="grid g2">
+      <div class="card">
+        <div class="kicker">phase 1 · clarify (2–3 min)</div>
+        <ul class="tight">
+          <li>"How big — mid-scale (Shopify) or Amazon-scale? I'll assume 200 M DAU · 100 M orders/day."</li>
+          <li>"Do we support flash sales / Black Friday? Yes → I'll add Redis DECR + queue mode."</li>
+          <li>"Consistency model — do we ever allow oversell? No → CP checkout with saga."</li>
+        </ul>
+      </div>
+      <div class="card">
+        <div class="kicker">phase 2 · draw architecture (5–7 min)</div>
+        <ul class="tight">
+          <li>Client → CDN + API Gateway → microservices behind ALB.</li>
+          <li>Split into browse (AP: PG + ES + Redis + CDN) and checkout (CP: Saga → Inventory → Payment → Shipping).</li>
+          <li>Kafka as event backbone; SNS/SQS for notifications; S3 + CloudFront for images.</li>
+        </ul>
+      </div>
+      <div class="card">
+        <div class="kicker">phase 3 · saga deep dive (8–10 min)</div>
+        <ul class="tight">
+          <li>Write out the 3 steps + compensation matrix on the board.</li>
+          <li>Show reserve/confirm/release protocol on inventory.</li>
+          <li>Explain 3-layer idempotency (client · DB UNIQUE · Stripe key).</li>
+          <li>Draw the compensate-in-reverse-order argument.</li>
+        </ul>
+      </div>
+      <div class="card">
+        <div class="kicker">phase 4 · scale &amp; failure (5–7 min)</div>
+        <ul class="tight">
+          <li>Redis <code>DECR</code> gate for flash sales — 100 K QPS → 100 QPS at DB.</li>
+          <li>Queue-mode checkout under spike (SQS FIFO + 202 + poll).</li>
+          <li>Circuit breakers between services; per-service bulkheads.</li>
+          <li>Auto-scale Kafka consumers on lag.</li>
+        </ul>
+      </div>
+      <div class="card">
+        <div class="kicker">phase 5 · trade-offs defended (5–8 min)</div>
+        <ul class="tight">
+          <li>Why Saga not 2PC (lock hold-time · no XA on Stripe).</li>
+          <li>Why orchestration not choreography (debug-ability · blast radius).</li>
+          <li>Why DynamoDB for inventory + Postgres for orders (right store per access pattern).</li>
+          <li>Why AP browse + CP checkout (right consistency per subsystem).</li>
+        </ul>
+      </div>
+      <div class="card">
+        <div class="kicker">phase 6 · what would you do differently (2–3 min)</div>
+        <ul class="tight">
+          <li>"At 5× current scale I'd move to Temporal for saga durability."</li>
+          <li>"I'd add CDC to move product catalog to a global multi-region store."</li>
+          <li>"I'd move notifications to a separate ML-based priority queue for A/B testing."</li>
+        </ul>
+      </div>
+    </div>
+    <div class="callout tip"><b>30-second pitch:</b> "Microservices behind an API Gateway. Split into AP browse (CDN + Redis + Postgres + ES) and CP checkout. Checkout runs a <b>Saga</b> with 3 local transactions — reserve inventory, charge payment, create shipment — and reverse-order compensation on failure. <b>3-layer idempotency</b> (client UUID + Postgres UNIQUE + Stripe Idempotency-Key) makes every write effectively exactly-once. At Black Friday scale, we gate hot SKUs with <b>Redis <code>DECR</code></b> and switch checkout to <b>SQS FIFO queue mode</b> when QPS &gt; 3K/instance."</div>
+    <div class="callout warn"><b>Interview red flags to avoid:</b><br>• "I'd use 2PC across all services." (doesn't scale · no Stripe XA)<br>• "Decrement stock directly from checkout." (thundering herd on hot SKUs)<br>• "One DB for everything." (misses the AP/CP split)<br>• "Retry the payment on failure." (double-charge if no idempotency)<br>• "Compensate stock first, then refund." (payment stuck if refund fails)</div>
+  </section>
+
+  <footer>
+    <p>Use case 10 · E-Commerce — Canvas 3 of 3 (Deep-dive &amp; Trade-offs). Grounded in <code>10-ecommerce/docs/</code> and the real Java under <code>10-ecommerce/src/</code>.</p>
+    <p class="run"><a href="hld.html">← Canvas 1 · HLD</a> · <a href="lld.html">Canvas 2 · LLD</a> · Canvas 3 · Deep-dive &amp; Trade-offs &nbsp;|&nbsp; <a href="../index.html">Hub</a></p>
+  </footer>
+
+</div>
+<script src="../assets/canvas.js"></script>
+</body>
+</html>
